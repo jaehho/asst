@@ -134,12 +134,12 @@ impl Service {
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
-    async fn link(&self, list: &str, dir: &str) -> fdo::Result<String> {
-        json(&self.daemon.link(list, dir).map_err(failed)?)
+    async fn link(&self, list: &str, repo: &str) -> fdo::Result<String> {
+        json(&self.daemon.link(list, repo).map_err(failed)?)
     }
 
-    async fn unlink(&self, dir: &str) -> fdo::Result<bool> {
-        self.daemon.unlink(dir).map_err(failed)
+    async fn unlink(&self, repo: &str) -> fdo::Result<bool> {
+        self.daemon.unlink(repo).map_err(failed)
     }
 
     async fn links(&self) -> fdo::Result<String> {

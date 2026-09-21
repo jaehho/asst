@@ -3,7 +3,7 @@
 //! copy), `edits` (what asst changed since), and `ics` (the two combined,
 //! which is what gets shown and sent).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row as SqlRow, params};
 use serde::{Deserialize, Serialize};
 
 use crate::caldav::RemoteList;
+use crate::github::Pair;
 use crate::ical::Ical;
 use crate::task::{self, Edit, EditError, Task};
 
@@ -142,11 +143,16 @@ CREATE INDEX IF NOT EXISTS tasks_list ON tasks(list);
 CREATE INDEX IF NOT EXISTS tasks_source ON tasks(source);
 CREATE TABLE IF NOT EXISTS fired (href TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (href, at));
 CREATE TABLE IF NOT EXISTS snoozed (href TEXT PRIMARY KEY, until INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS links (dir TEXT PRIMARY KEY, list TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS todo_seen (
-  dir TEXT NOT NULL REFERENCES links(dir) ON DELETE CASCADE,
+DROP TABLE IF EXISTS todo_seen;
+DROP TABLE IF EXISTS links;
+CREATE TABLE IF NOT EXISTS gh_links (repo TEXT PRIMARY KEY, list TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS gh_pairs (
+  repo TEXT NOT NULL REFERENCES gh_links(repo) ON DELETE CASCADE,
+  number INTEGER NOT NULL,
   uid TEXT NOT NULL,
-  PRIMARY KEY (dir, uid)
+  title TEXT NOT NULL,
+  open INTEGER NOT NULL,
+  PRIMARY KEY (repo, number)
 );
 ";
 
@@ -894,34 +900,41 @@ impl Store {
             .collect())
     }
 
-    // -- project directories ---------------------------------------------------
+    // -- GitHub repos ---------------------------------------------------------
 
-    pub fn links(&self) -> Result<Vec<(String, String)>> {
+    /// (repo, list href) of every linked repo.
+    pub fn gh_links(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT dir, list FROM links ORDER BY dir")?;
+            .prepare_cached("SELECT repo, list FROM gh_links ORDER BY repo")?;
         Ok(stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn link(&self, dir: &str, list: &str) -> Result<()> {
+    /// Tie a repo to a list, one repo per list. Tied to another list
+    /// before, the repo's pairs go: they name that list's tasks.
+    pub fn gh_link(&self, repo: &str, list: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO links(dir, list) VALUES (?1, ?2) ON CONFLICT(dir) DO UPDATE SET list = excluded.list",
-            [dir, list],
+            "DELETE FROM gh_links WHERE (repo = ?1 OR list = ?2) AND NOT (repo = ?1 AND list = ?2)",
+            [repo, list],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO gh_links(repo, list) VALUES (?1, ?2)",
+            [repo, list],
         )?;
         Ok(())
     }
 
-    pub fn unlink(&self, dir: &str) -> Result<bool> {
+    pub fn gh_unlink(&self, repo: &str) -> Result<bool> {
         Ok(self
             .conn
-            .execute("DELETE FROM links WHERE dir = ?1", [dir])?
+            .execute("DELETE FROM gh_links WHERE repo = ?1", [repo])?
             > 0)
     }
 
     /// Every task of a list, open and completed, in the order they were
-    /// made: the TODO.md sync diffs against both.
+    /// made: the GitHub sync pairs issues with both.
     pub fn list_tasks(&self, list: &str) -> Result<Vec<Row>> {
         let sql = format!(
             "SELECT {TASK_COLS} FROM tasks WHERE list = ?1 AND deleted = 0
@@ -934,25 +947,37 @@ impl Store {
         rows.into_iter().map(to_row).collect()
     }
 
-    /// The uids that have had a line in this dir's `TODO.md`: a line gone
-    /// from one of them completes its task, where a task that never had a
-    /// line just arrived from elsewhere.
-    pub fn seen(&self, dir: &str) -> Result<HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT uid FROM todo_seen WHERE dir = ?1")?;
+    pub fn gh_pairs(&self, repo: &str) -> Result<Vec<Pair>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT number, uid, title, open FROM gh_pairs WHERE repo = ?1 ORDER BY number",
+        )?;
         Ok(stmt
-            .query_map([dir], |r| r.get(0))?
+            .query_map([repo], |r| {
+                Ok(Pair {
+                    number: r.get(0)?,
+                    uid: r.get(1)?,
+                    title: r.get(2)?,
+                    open: r.get(3)?,
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn see(&self, dir: &str, uids: &[String]) -> Result<()> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("INSERT OR IGNORE INTO todo_seen(dir, uid) VALUES (?1, ?2)")?;
-        for uid in uids {
-            stmt.execute(params![dir, uid])?;
-        }
+    /// Pair an issue with a task, or remember what a pair agreed on now.
+    pub fn gh_pair(&self, repo: &str, p: &Pair) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO gh_pairs(repo, number, uid, title, open) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repo, number) DO UPDATE SET uid = excluded.uid, title = excluded.title, open = excluded.open",
+            params![repo, p.number, p.uid, p.title, p.open],
+        )?;
+        Ok(())
+    }
+
+    pub fn gh_unpair(&self, repo: &str, number: u32) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM gh_pairs WHERE repo = ?1 AND number = ?2",
+            params![repo, number],
+        )?;
         Ok(())
     }
 }
@@ -969,7 +994,7 @@ fn remove_list_rows(conn: &Connection, href: &str) -> Result<bool> {
         [href],
     )?;
     conn.execute("DELETE FROM tasks WHERE list = ?1", [href])?;
-    conn.execute("DELETE FROM links WHERE list = ?1", [href])?;
+    conn.execute("DELETE FROM gh_links WHERE list = ?1", [href])?;
     conn.execute("DELETE FROM meta WHERE key = 'full-sync:' || ?1", [href])?;
     Ok(conn.execute("DELETE FROM lists WHERE href = ?1", [href])? > 0)
 }
@@ -1301,7 +1326,7 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             .unwrap();
         s.snooze("/cal/work/a.ics", now()).unwrap();
         s.mark_fired(&fresh.href, now()).unwrap();
-        s.link("/home/me/project", "/cal/work/").unwrap();
+        s.gh_link("jaehho/asst", "/cal/work/").unwrap();
         s.set_meta("full-sync:/cal/work/", "1").unwrap();
         assert_eq!(s.pending().unwrap().len(), 4);
 
@@ -1323,7 +1348,7 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
         assert_eq!(rows, 0);
         assert!(s.snoozed().unwrap().is_empty());
         assert!(!s.fired(&fresh.href, now()).unwrap());
-        assert!(s.links().unwrap().is_empty());
+        assert!(s.gh_links().unwrap().is_empty());
         assert_eq!(s.meta("full-sync:/cal/work/").unwrap(), None);
 
         assert!(s.remove_list("/cal/inbox/").unwrap());
@@ -1332,9 +1357,9 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
     }
 
     #[test]
-    fn seen_uids_follow_their_link() {
+    fn pairs_follow_their_link() {
         let mut s = store();
-        let open = s
+        let one = s
             .create("/cal/work/", &[Edit::Summary("One".into())], now())
             .unwrap();
         let done = s
@@ -1352,19 +1377,34 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
         assert!(titles.contains(&("One".into(), true)));
         assert!(titles.contains(&("Two".into(), false)));
 
-        s.link("/home/me/project", "/cal/work/").unwrap();
-        s.see("/home/me/project", std::slice::from_ref(&open.task.uid))
-            .unwrap();
-        // Seeing twice is nothing new
-        s.see("/home/me/project", std::slice::from_ref(&open.task.uid))
-            .unwrap();
+        let pair = |title: &str, open: bool| Pair {
+            number: 7,
+            uid: one.task.uid.clone(),
+            title: title.into(),
+            open,
+        };
+        s.gh_link("jaehho/asst", "/cal/work/").unwrap();
+        s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
+        // Pairing again updates what was agreed
+        s.gh_pair("jaehho/asst", &pair("Uno", false)).unwrap();
+        assert_eq!(s.gh_pairs("jaehho/asst").unwrap(), [pair("Uno", false)]);
+        // Linking the same list again keeps them; another list drops them
+        s.gh_link("jaehho/asst", "/cal/work/").unwrap();
+        assert_eq!(s.gh_pairs("jaehho/asst").unwrap().len(), 1);
+        s.gh_link("jaehho/asst", "/cal/inbox/").unwrap();
+        assert!(s.gh_pairs("jaehho/asst").unwrap().is_empty());
         assert_eq!(
-            s.seen("/home/me/project").unwrap(),
-            HashSet::from([open.task.uid.clone()])
+            s.gh_links().unwrap(),
+            [("jaehho/asst".to_string(), "/cal/inbox/".to_string())]
         );
-        // Unlinking forgets what was seen
-        s.unlink("/home/me/project").unwrap();
-        assert!(s.seen("/home/me/project").unwrap().is_empty());
+        // Unlinking forgets them too
+        s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
+        s.gh_unpair("jaehho/asst", 7).unwrap();
+        assert!(s.gh_pairs("jaehho/asst").unwrap().is_empty());
+        s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
+        assert!(s.gh_unlink("jaehho/asst").unwrap());
+        assert!(!s.gh_unlink("jaehho/asst").unwrap());
+        assert!(s.gh_pairs("jaehho/asst").unwrap().is_empty());
     }
 
     #[test]

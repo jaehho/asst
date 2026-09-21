@@ -57,11 +57,11 @@ pub trait Asst {
     fn delete_list(&self, href: &str) -> zbus::Result<()>;
     /// A list's href, or `""` for every list → how many completed tasks went.
     fn delete_completed(&self, list: &str) -> zbus::Result<u32>;
-    /// list, a directory → `LinkView`: the list and the directory's
-    /// `TODO.md` are synced both ways.
-    fn link(&self, list: &str, dir: &str) -> zbus::Result<String>;
-    /// directory → whether there was a link to drop.
-    fn unlink(&self, dir: &str) -> zbus::Result<bool>;
+    /// list, `owner/repo` → `LinkView`: the list and the repo's issues
+    /// are synced both ways.
+    fn link(&self, list: &str, repo: &str) -> zbus::Result<String>;
+    /// `owner/repo` → whether there was a link to drop.
+    fn unlink(&self, repo: &str) -> zbus::Result<bool>;
     /// → `[LinkView]`
     fn links(&self) -> zbus::Result<String>;
     /// id, a title (`""`: the task's) → `NewNote`: a note in the notes
@@ -123,10 +123,11 @@ pub struct ListView {
     pub done: usize,
 }
 
-/// A project directory whose `TODO.md` is synced with a list.
+/// A GitHub repo whose issues are synced with a list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkView {
-    pub dir: String,
+    /// `owner/repo`.
+    pub repo: String,
     /// The list's href.
     pub list: String,
     pub name: String,

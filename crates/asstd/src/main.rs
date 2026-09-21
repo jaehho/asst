@@ -2,11 +2,11 @@
 //! serves `dev.jaeho.Asst1` to the CLI, the window and quick add.
 
 mod daemon;
+mod github;
 mod notes;
 mod reminders;
 mod service;
 mod system;
-mod todos;
 
 use anyhow::Context;
 use asst_core::api::{BUS_NAME, OBJECT_PATH};
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(reminders::run(daemon.clone(), conn.clone()));
     tokio::spawn(system::run(daemon.clone()));
     tokio::spawn(notes::run(daemon.clone()));
-    tokio::spawn(todos::run(daemon.clone()));
+    tokio::spawn(github::run(daemon.clone()));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {

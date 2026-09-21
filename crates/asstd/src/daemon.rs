@@ -1,7 +1,6 @@
 //! The daemon's state and everything it does with it. The D-Bus service,
 //! notification buttons, and system events all come through here.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -13,13 +12,13 @@ use asst_core::api::{
 };
 use asst_core::caldav::{self, Account, CalDav, RemoteError};
 use asst_core::config::{self, AccountConfig, Config};
+use asst_core::github;
 use asst_core::note_files;
 use asst_core::quickadd;
 use asst_core::store::{Query, Row, Store, StoreError};
 use asst_core::sync::{self, Report, SyncError};
 use asst_core::task::{Edit, priority_from_level};
 use asst_core::time::{Trigger, When};
-use asst_core::todo_md;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use tokio::sync::{Notify, watch};
@@ -70,12 +69,8 @@ pub struct Daemon {
     pub wake_reminders: Notify,
     /// The notes folder setting changed: watch the new one.
     pub notes_dir_changed: Notify,
-    /// A linked `TODO.md` settled after changing on disk.
-    pub wake_files: Notify,
-    /// Tasks changed, here or on the server: rewrite linked `TODO.md`s.
-    pub wake_todos: Notify,
-    /// The links between directories and lists changed: watch anew.
-    pub links_changed: Notify,
+    /// Tasks changed, here or on the server, or links did: a GitHub pass.
+    pub wake_github: Notify,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
@@ -84,15 +79,6 @@ pub enum Event {
     Changed,
     Status(StatusView),
     LoginDone(bool, String),
-}
-
-/// Which side of a linked `TODO.md` changed: the file's pass takes the
-/// file's changes to the store, the store's writes the store's changes
-/// back. One cause per pass, or the two would undo each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cause {
-    File,
-    Store,
 }
 
 impl Daemon {
@@ -128,9 +114,7 @@ impl Daemon {
             completed: watch::channel((0, Ok(Report::default()))).0,
             wake_reminders: Notify::new(),
             notes_dir_changed: Notify::new(),
-            wake_files: Notify::new(),
-            wake_todos: Notify::new(),
-            links_changed: Notify::new(),
+            wake_github: Notify::new(),
             events,
         };
         (Arc::new(daemon), rx)
@@ -157,10 +141,16 @@ impl Daemon {
 
     /// Tasks changed here: tell clients, rearm reminders, send soon.
     fn changed_locally(&self) {
+        self.changed_from_github();
+        self.wake_github.notify_one();
+    }
+
+    /// Tasks changed by a GitHub pass: all of the above but another pass,
+    /// which would only read back its own writes.
+    pub fn changed_from_github(&self) {
         self.emit(Event::Changed);
         self.wake_reminders.notify_one();
         self.wake_sync.notify_one();
-        self.wake_todos.notify_one();
         self.refresh_pending();
     }
 
@@ -292,10 +282,10 @@ impl Daemon {
                 if report.changed() {
                     self.emit(Event::Changed);
                     self.wake_reminders.notify_one();
-                    self.wake_todos.notify_one();
                 }
-                if report.lists_changed {
-                    self.links_changed.notify_one();
+                // What was pushed changed here, and woke a pass then.
+                if report.fetched + report.removed > 0 || report.lists_changed {
+                    self.wake_github.notify_one();
                 }
                 let problems = (!report.problems.is_empty()).then(|| report.problems.join("; "));
                 for p in &report.problems {
@@ -824,22 +814,21 @@ impl Daemon {
         Ok(())
     }
 
-    // -- linked TODO.md files ---------------------------------------------------
+    // -- linked GitHub repos ---------------------------------------------------
 
-    /// The links between project directories and lists, as `asst link`
-    /// shows them.
+    /// The links between repos and lists, as `asst link` shows them.
     pub fn links(&self) -> Result<Vec<LinkView>> {
         let store = self.store();
         store
-            .links()?
+            .gh_links()?
             .into_iter()
-            .map(|(dir, href)| {
+            .map(|(repo, href)| {
                 let name = store
                     .find_list(&href)
                     .map(|l| l.name)
                     .unwrap_or_else(|_| href.clone());
                 Ok(LinkView {
-                    dir,
+                    repo,
                     list: href,
                     name,
                 })
@@ -847,191 +836,42 @@ impl Daemon {
             .collect()
     }
 
-    /// Tie a list to a project directory: its `TODO.md` is synced both
-    /// ways. The directory has to be there; `list` is taken as `find_list`
-    /// does (an href, a name, an unambiguous prefix).
-    pub fn link(&self, list: &str, dir: &str) -> Result<LinkView> {
-        let full = Self::project_dir(dir)?;
+    /// Tie a list to a GitHub repo (`owner/repo`): its issues are synced
+    /// both ways. `list` is taken as `find_list` does (an href, a name, an
+    /// unambiguous prefix); one repo per list.
+    pub fn link(&self, list: &str, repo: &str) -> Result<LinkView> {
+        if !github::valid_repo(repo) {
+            return Err(Error::Invalid(format!("{repo:?} is not owner/repo")));
+        }
         let store = self.store();
         let l = store.find_list(list)?;
         if !l.writable {
             return Err(StoreError::ReadOnly(l.name).into());
         }
-        store.link(&full, &l.href)?;
+        if let Some((other, _)) = store
+            .gh_links()?
+            .into_iter()
+            .find(|(r, href)| *href == l.href && r != repo)
+        {
+            return Err(Error::Invalid(format!(
+                "{} is linked to {other}; unlink it first",
+                l.name
+            )));
+        }
+        store.gh_link(repo, &l.href)?;
         drop(store);
-        self.links_changed.notify_one();
+        self.wake_github.notify_one();
         Ok(LinkView {
-            dir: full,
+            repo: repo.to_string(),
             list: l.href,
             name: l.name,
         })
     }
 
-    /// Drop the tie; the file is left as it stands. Returns whether there
-    /// was one.
-    pub fn unlink(&self, dir: &str) -> Result<bool> {
-        let full = Self::project_dir(dir)?;
-        let gone = self.store().unlink(&full)?;
-        if gone {
-            self.links_changed.notify_one();
-        }
-        Ok(gone)
-    }
-
-    /// The directory a link names, canonical so two spellings of one
-    /// directory are one link.
-    fn project_dir(dir: &str) -> Result<String> {
-        let full = std::fs::canonicalize(dir)
-            .map_err(|e| Error::Invalid(format!("{}: {e}", Path::new(dir).display())))?;
-        if !full.is_dir() {
-            return Err(Error::Invalid(format!(
-                "{} is not a directory",
-                full.display()
-            )));
-        }
-        Ok(full.to_string_lossy().into_owned())
-    }
-
-    /// Every linked `TODO.md`, one pass. An error on one doesn't stop the
-    /// rest.
-    pub fn reconcile_todos(&self, cause: Cause) {
-        let links = self.store().links().unwrap_or_default();
-        // ponytail: each pass reads every link's tasks; index by list when
-        // there are enough links to notice.
-        for (dir, list) in links {
-            self.reconcile_todo(&dir, &list, cause);
-        }
-    }
-
-    /// One linked `TODO.md` against its list. The file's pass changes only
-    /// the store, the store's only the file, so the two never fight over a
-    /// task; each leaves the pair matched, and the echo of its own write
-    /// finds nothing to do.
-    fn reconcile_todo(&self, dir: &str, list_href: &str, cause: Cause) {
-        let path = Path::new(dir).join("TODO.md");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            // A missing file is not every line gone; the store's pass makes
-            // a new one with what the list holds.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if cause == Cause::Store {
-                    String::new()
-                } else {
-                    return;
-                }
-            }
-            Err(e) => {
-                log::warn!("reading {}: {e}", path.display());
-                return;
-            }
-        };
-        let lines = todo_md::parse(&text);
-        let (edits, changed) = match self.todo_pass(dir, list_href, cause, Utc::now(), &lines) {
-            Ok(out) => out,
-            Err(e) => {
-                log::warn!("syncing {}: {e}", path.display());
-                return;
-            }
-        };
-        if !edits.is_empty()
-            && let Err(e) =
-                todo_md::write_atomic(&path, &todo_md::render(&todo_md::apply(lines, &edits)))
-        {
-            log::warn!("writing {}: {e}", path.display());
-        }
-        if changed {
-            self.changed_locally();
-        }
-    }
-
-    /// One direction of the diff, under the store's lock: the edits for
-    /// the file, and whether the store changed.
-    fn todo_pass(
-        &self,
-        dir: &str,
-        list_href: &str,
-        cause: Cause,
-        now: DateTime<Utc>,
-        lines: &[todo_md::Parsed],
-    ) -> Result<(Vec<todo_md::Edit>, bool)> {
-        let mut store = self.store();
-        let rows = store.list_tasks(list_href)?;
-        let refs: Vec<todo_md::Ref> = rows
-            .iter()
-            .map(|r| todo_md::Ref {
-                uid: r.task.uid.clone(),
-                title: r.task.summary.clone(),
-                open: r.task.is_open(),
-            })
-            .collect();
-        let seen = store.seen(dir)?;
-        let by_uid = |uid: &str| rows.iter().find(|r| r.task.uid == uid);
-        let mut edits = Vec::new();
-        let changed;
-        match cause {
-            Cause::File => {
-                let ops = todo_md::file_ops(lines, &refs, &seen);
-                changed = !ops.is_empty();
-                for op in ops {
-                    match op {
-                        todo_md::FileOp::Add {
-                            line,
-                            title,
-                            checked,
-                        } => {
-                            let row =
-                                store.create(list_href, &[Edit::Summary(title.clone())], now)?;
-                            if checked {
-                                store.complete(&row.href, now)?;
-                                store.unsnooze(&row.href)?;
-                            }
-                            edits.push(todo_md::Edit::Set {
-                                line,
-                                uid: row.task.uid.clone(),
-                                checked,
-                                title,
-                            });
-                        }
-                        todo_md::FileOp::Complete { uid } => {
-                            let row = by_uid(&uid).expect("file_ops names a task");
-                            store.complete(&row.href, now)?;
-                            store.unsnooze(&row.href)?;
-                        }
-                        todo_md::FileOp::Reopen { uid } => {
-                            let row = by_uid(&uid).expect("file_ops names a task");
-                            store.edit(&row.href, &[Edit::Reopen], now)?;
-                        }
-                        todo_md::FileOp::Retitle { uid, title } => {
-                            let row = by_uid(&uid).expect("file_ops names a task");
-                            store.edit(&row.href, &[Edit::Summary(title)], now)?;
-                        }
-                    }
-                }
-            }
-            Cause::Store => {
-                edits = todo_md::store_edits(lines, &refs, &seen);
-                changed = false;
-            }
-        }
-        // The uids that have a line after this pass — only tasks', so a
-        // foreign marker is never taken for a line gone from here.
-        let known: HashSet<&str> = refs.iter().map(|r| r.uid.as_str()).collect();
-        let mut present: HashSet<String> = lines
-            .iter()
-            .filter_map(|p| match &p.line {
-                todo_md::Line::Task { uid, .. } => Some(uid.clone()),
-                _ => None,
-            })
-            .filter(|uid| known.contains(uid.as_str()))
-            .collect();
-        for uid in edits.iter().filter_map(|e| match e {
-            todo_md::Edit::Set { uid, .. } | todo_md::Edit::Append { uid, .. } => Some(uid),
-            todo_md::Edit::Remove { .. } => None,
-        }) {
-            present.insert(uid.clone());
-        }
-        store.see(dir, &present.into_iter().collect::<Vec<_>>())?;
-        Ok((edits, changed))
+    /// Drop the tie; issues and tasks are left as they stand. Returns
+    /// whether there was one.
+    pub fn unlink(&self, repo: &str) -> Result<bool> {
+        Ok(self.store().gh_unlink(repo)?)
     }
 
     // -- lists ------------------------------------------------------------------
@@ -1138,7 +978,7 @@ impl Daemon {
             Err(e) => return Err(remote_error(e)),
         }
         self.store().remove_list(&list.href)?;
-        self.links_changed.notify_one();
+        self.wake_github.notify_one();
         if let Err(e) = self.lists_changed(&remote).await {
             // It is gone on the server; the next sync brings the rest.
             log::warn!("reading lists after deleting {}: {e}", list.name);
@@ -1219,7 +1059,7 @@ impl Daemon {
         let mut store = self.store();
         store.apply_lists(&[])?;
         drop(store);
-        self.links_changed.notify_one();
+        self.wake_github.notify_one();
         self.emit(Event::Changed);
         Ok(())
     }
@@ -1433,143 +1273,48 @@ mod tests {
         assert_eq!(cfg.notes_dir(), note_files::default_dir());
     }
 
-    /// The checkbox lines a file holds: (uid, checked, title).
-    fn marked(text: &str) -> Vec<(String, bool, String)> {
-        todo_md::parse(text)
-            .into_iter()
-            .filter_map(|p| match p.line {
-                todo_md::Line::Task {
-                    uid,
-                    checked,
-                    title,
-                } => Some((uid, checked, title)),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
-    fn a_linked_todo_md_round_trips() {
+    fn a_list_links_to_one_repo() {
         let zone: Tz = "America/New_York".parse().unwrap();
         let mut store = Store::in_memory(zone).unwrap();
+        let list = |href: &str, name: &str| caldav::RemoteList {
+            href: href.into(),
+            name: name.into(),
+            color: None,
+            order: None,
+            sync_token: Some("t1".into()),
+            ctag: None,
+            writable: true,
+        };
         store
-            .apply_lists(&[caldav::RemoteList {
-                href: "/cal/work/".into(),
-                name: "Work".into(),
-                color: None,
-                order: None,
-                sync_token: Some("t1".into()),
-                ctag: None,
-                writable: true,
-            }])
+            .apply_lists(&[list("/cal/work/", "Work"), list("/cal/home/", "Home")])
             .unwrap();
         let (daemon, _events) = Daemon::new(Config::default(), store, zone);
-        let dir = std::env::temp_dir().join(format!("asst-daemon-todos-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("TODO.md");
-        let open_tasks = |seen: bool| {
-            daemon
-                .store()
-                .list_tasks("/cal/work/")
-                .unwrap()
-                .into_iter()
-                .filter(|r| r.task.is_open() == seen)
-                .map(|r| (r.task.summary.clone(), r.task.uid.clone()))
-                .collect::<Vec<_>>()
-        };
 
-        daemon.link("work", dir.to_str().unwrap()).unwrap();
-        // An empty list has nothing to write: no file is made
-        daemon.reconcile_todos(Cause::Store);
-        assert!(!file.exists());
-
-        // A new line becomes a task, marked in the file
-        std::fs::write(&file, "# Plan\n- [ ] from the file\n").unwrap();
-        daemon.reconcile_todos(Cause::File);
-        let text = std::fs::read_to_string(&file).unwrap();
-        let [(uid, false, title)] = &marked(&text)[..] else {
-            panic!("one marked line: {text}");
-        };
-        assert_eq!(title, "from the file");
-        assert_eq!(open_tasks(true), [(title.clone(), uid.clone())]);
-
-        // The pass echoes onto itself: nothing changes
-        daemon.reconcile_todos(Cause::File);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
-        daemon.reconcile_todos(Cause::Store);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
-        assert_eq!(open_tasks(true).len(), 1);
-
-        // A box checked in the file completes the task
-        std::fs::write(&file, format!("- [x] from the file <!-- asst:{uid} -->\n")).unwrap();
-        daemon.reconcile_todos(Cause::File);
-        assert_eq!(open_tasks(true), vec![]);
-
-        // The task comes back open in the file: the store's pass reopens…
-        std::fs::write(&file, format!("- [ ] from the file <!-- asst:{uid} -->\n")).unwrap();
-        daemon.reconcile_todos(Cause::File);
-        // …and a task made elsewhere is appended under the inbox
-        let made = daemon
-            .store()
-            .create(
-                "/cal/work/",
-                &[Edit::Summary("from the cli".into())],
-                Utc::now(),
-            )
-            .unwrap();
-        daemon.reconcile_todos(Cause::Store);
-        let text = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(marked(&text).len(), 2);
-        assert!(text.contains("## Inbox"));
-        assert!(text.contains("from the cli"));
-
-        // Completing it elsewhere flips its box
-        {
-            let mut s = daemon.store();
-            s.complete(&made.href, Utc::now()).unwrap();
+        for bad in ["asst", "jaehho/asst/x", "../x", "a b/c"] {
+            assert!(daemon.link("work", bad).is_err(), "{bad}");
         }
-        daemon.reconcile_todos(Cause::Store);
-        let text = std::fs::read_to_string(&file).unwrap();
-        assert!(
-            marked(&text)
-                .iter()
-                .any(|(u, c, _)| *u == made.task.uid && *c)
-        );
-
-        // Deleting it removes its line; deleting a line completes its task
-        daemon.store().delete(&made.href).unwrap();
-        daemon.reconcile_todos(Cause::Store);
-        let text = std::fs::read_to_string(&file).unwrap();
+        let l = daemon.link("work", "jaehho/asst").unwrap();
+        assert_eq!((l.repo.as_str(), l.name.as_str()), ("jaehho/asst", "Work"));
+        // Again is nothing new; another repo for the same list is refused
+        daemon.link("work", "jaehho/asst").unwrap();
+        assert!(daemon.link("work", "jaehho/other").is_err());
+        daemon.link("home", "jaehho/other").unwrap();
+        let names: Vec<(String, String)> = daemon
+            .links()
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.name, l.repo))
+            .collect();
         assert_eq!(
-            marked(&text),
-            [(uid.clone(), false, "from the file".into())]
+            names,
+            [
+                ("Work".to_string(), "jaehho/asst".to_string()),
+                ("Home".to_string(), "jaehho/other".to_string())
+            ]
         );
-        std::fs::write(&file, "# Plan\n").unwrap();
-        daemon.reconcile_todos(Cause::File);
-        assert_eq!(open_tasks(true), vec![]);
-
-        // An unmarked line that names an open task takes it over
-        daemon
-            .store()
-            .create(
-                "/cal/work/",
-                &[Edit::Summary("adopt me".into())],
-                Utc::now(),
-            )
-            .unwrap();
-        std::fs::write(&file, "# Plan\n- [ ] adopt me\n").unwrap();
-        daemon.reconcile_todos(Cause::Store);
-        daemon.reconcile_todos(Cause::File);
-        let text = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(marked(&text)[0].2, "adopt me");
-        assert!(
-            marked(&text)[0]
-                .0
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() || c == '-')
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(daemon.unlink("jaehho/asst").unwrap());
+        assert!(!daemon.unlink("jaehho/asst").unwrap());
+        assert_eq!(daemon.links().unwrap().len(), 1);
     }
 }

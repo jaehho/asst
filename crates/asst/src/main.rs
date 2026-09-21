@@ -112,15 +112,18 @@ enum Cmd {
         #[arg(required = true)]
         notes: Vec<String>,
     },
-    /// Tie a list to a project directory: its TODO.md is synced both ways;
+    /// Tie a list to a GitHub repo: its issues are synced both ways;
     /// without arguments, show the ties
     Link {
         list: Option<String>,
-        #[arg(requires = "list", value_name = "DIR")]
-        dir: Option<PathBuf>,
+        #[arg(requires = "list", value_name = "OWNER/REPO")]
+        repo: Option<String>,
     },
-    /// Drop the tie to a directory; the TODO.md is left as it stands
-    Unlink { dir: PathBuf },
+    /// Drop the tie to a repo; its issues and the list are left as they stand
+    Unlink {
+        #[arg(value_name = "OWNER/REPO")]
+        repo: String,
+    },
     /// Show a task in the window
     Open { id: String },
     /// Show one task
@@ -636,14 +639,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", out::task_line(&style, &t, now, true));
             print_links(&style, &dir, &t);
         }
-        Cmd::Link { list, dir } => match (list, dir) {
-            (Some(list), Some(dir)) => {
-                let raw = proxy.link(list.trim(), &full_path(&dir)?).await?;
+        Cmd::Link { list, repo } => match (list, repo) {
+            (Some(list), Some(repo)) => {
+                let raw = proxy.link(list.trim(), repo.trim()).await?;
                 if json {
                     return show_json(&raw);
                 }
                 let l: LinkView = serde_json::from_str(&raw)?;
-                println!("{} {} ⇄ {}/TODO.md", style.dim("Linked:"), l.name, l.dir);
+                println!("{} {} ⇄ {}", style.dim("Linked:"), l.name, l.repo);
             }
             _ => {
                 let raw = proxy.links().await?;
@@ -654,20 +657,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 if links.is_empty() {
                     println!(
                         "{}",
-                        style.dim("no list is linked; `asst link <list> <dir>`")
+                        style.dim("no list is linked; `asst link <list> <owner/repo>`")
                     );
                 }
                 for l in links {
-                    println!("{} ⇄ {}/TODO.md", l.name, l.dir);
+                    println!("{} ⇄ {}", l.name, l.repo);
                 }
             }
         },
-        Cmd::Unlink { dir } => {
-            if !proxy.unlink(&full_path(&dir)?).await? {
-                bail!("{} isn't linked", dir.display());
+        Cmd::Unlink { repo } => {
+            if !proxy.unlink(repo.trim()).await? {
+                bail!("{repo} isn't linked");
             }
             if !json {
-                println!("{} {}", style.dim("Unlinked:"), dir.display());
+                println!("{} {repo}", style.dim("Unlinked:"));
             }
         }
         Cmd::Open { id } => {
