@@ -101,8 +101,8 @@ From decompiled iOS 18/26 ReminderKit (via research, not a device test):
   - Without asst running, steno falls back to its own `todos.json`.
   - This is a change in steno, not a file asst watches: two programs writing `todos.json` would race.
 - **mail-digest:** same client pattern; an action item becomes a task from the viewer or the ask session, linking back to the thread.
-- **Project `TODO.md` (two-way):** `asst link <list> <dir>` ties a list to a project directory; nothing is linked implicitly.
-  - Synced: top-level `- [ ]` / `- [x]` lines anywhere in the file, each ending in `<!-- asst:<uid> -->`. Headings, prose and nested bullets are never touched.
-  - File → server: `asstd` watches the file (inotify). A new checkbox line gets a task and a marker, `[x]` completes, a removed line **completes** the task rather than deleting it (Claude and people delete finished items). Each direction runs only on its own side's change, so the file and the server never fight.
-  - Server → file: a task added elsewhere is appended under `## Inbox` (created if missing), a completion flips the box, a deletion removes the line. On linking, a line that already names a task is adopted (marked) rather than duplicated.
-  - Writes change only the affected lines and replace the file atomically; nvim's autoread picks them up.
+- **GitHub issues (two-way):** `asst link <list> <owner/repo>` ties a list to a repo's issues, one repo per list; nothing is linked implicitly. Project tasks live in issues; the list keeps them in the window, quick add and on the phone.
+  - Synced: the title and open/closed, nothing else. Pull requests are left out. An open issue with no task gets one, an open task with no issue gets one; on linking, an open issue and an open task with the same title are paired instead of duplicated. Closed issues and completed tasks nobody paired are left alone.
+  - Which issue is which task lives in the cache (`gh_pairs`), not as markers in issue bodies, along with the title and state the two last agreed on. Each pass is a three-way merge against that base, field by field: the side that moved wins, the issue when both did. A push that fails leaves the base, so the next pass finds the same difference and retries.
+  - A task deleted, or moved to another list, closes its issue as not planned; an issue deleted or transferred completes its task (asked for by number first, since a listing right after a write can lag).
+  - asstd polls at the sync interval, and after a change to tasks or links. The first page's ETag is kept, so a quiet repo costs one uncounted 304. The token is `$GITHUB_TOKEN`, or `gh auth token`; without one, linked repos wait.

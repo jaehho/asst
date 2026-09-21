@@ -31,6 +31,8 @@ IDs are the shortest unambiguous UID prefix shown in listings. `--json` works ev
 
 **Linked notes:** a task can link to notes in Nextcloud Notes' folder on this computer (`~/Nextcloud/Notes`, or Preferences → Notes). `asst attach` links files in it, `--new` makes a note named after the task and prints its path, `asst add … --attach NOTE` links one to a new task, and `asst ls --attached NOTE` lists the tasks linking a note. Links follow a note that is renamed or moved within the folder while asstd runs.
 
+**GitHub issues:** `asst link <list> <owner/repo>` keeps a list and a repo's issues in step, titles and open/closed both ways; `asst link` shows the links, `asst unlink <owner/repo>` drops one. asstd uses `$GITHUB_TOKEN`, or the token `gh auth login` stored.
+
 **Quick-add syntax** (CLI, popup and window): `#list`, `p1`…`p4`, dates (`today`, `tomorrow`, `fri`, `next week`, `in 3 days`, `sep 20`, `9/20`, `5pm`, `at 9`, `in 2h`, `tonight`, `this evening`, `tomorrow morning`, `midnight`), repeats (`every day`, `every weekday`, `every mon, thu`, `every 2 weeks`, `every 15th`), reminders (`!` at the due time, `!30m` before, `!9am` at a time). Preferences → New Tasks → Read dates in titles off leaves dates and repeats in the title.
 
 **Window** (`asst-gtk`), laid out after Planify:
