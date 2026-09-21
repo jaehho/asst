@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=asst
+GenericName=Tasks
+Comment=Tasks and reminders on your CalDAV server
+Exec=asst-gtk
+Icon=dev.jaeho.Asst
+Terminal=false
+Categories=Office;ProjectManagement;GTK;
+Keywords=todo;tasks;reminders;caldav;nextcloud;
+StartupNotify=true
+Actions=quick-add;
+
+[Desktop Action quick-add]
+Name=Add a Task
+Exec=asst-gtk quick-add

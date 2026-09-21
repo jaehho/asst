@@ -1,0 +1,21 @@
+[package]
+name = "asstd"
+description = "asst's daemon: CalDAV sync, reminders, and the D-Bus service its clients use"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+asst-core = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+env_logger = { workspace = true }
+futures-util = "0.3"
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+zbus = { workspace = true }
+notify = "8"

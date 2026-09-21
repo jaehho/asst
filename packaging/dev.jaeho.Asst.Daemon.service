@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=dev.jaeho.Asst.Daemon
+Exec=/usr/bin/asstd
+SystemdService=asstd.service

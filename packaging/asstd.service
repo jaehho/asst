@@ -1,0 +1,17 @@
+[Unit]
+Description=asst: task sync and reminders
+Documentation=https://github.com/jaehho/asst
+
+[Service]
+# Ready once it owns its bus name, so clients never race its start.
+Type=dbus
+BusName=dev.jaeho.Asst.Daemon
+ExecStart=/usr/bin/asstd
+# Creates and owns ~/.local/state/asst (the task cache).
+StateDirectory=asst
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

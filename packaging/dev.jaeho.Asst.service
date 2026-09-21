@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=dev.jaeho.Asst
+Exec=/usr/bin/asst-gtk --gapplication-service

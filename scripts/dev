@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# An asst to try changes on, cut off from the real one: a private session bus
+# that cannot start the installed asstd, a dev asstd on it, and a local
+# Radicale as the server. The real config, cache, keyring and Nextcloud are
+# never touched.
+#
+#   scripts/dev up [--signed-out]  Radicale, the bus and asstd (idempotent)
+#   scripts/dev run CMD...         a command on the private bus
+#   scripts/dev asst ARGS...       the dev CLI on it
+#   scripts/dev window [ARGS...]   the window, on a hidden Hyprland workspace, unfocused
+#   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
+#   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
+#   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
+#   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
+#   scripts/dev down               stop the window, the tray, asstd and the bus (Radicale stays up)
+#
+# ASST_DEV (default ~/.cache/asst-dev/<name>, name from ASST_DEV_NAME or
+# "gui") holds the bus address, config, cache and notes folder; the name is also the
+# Radicale user, so instances don't share lists. The bus has a stand-in
+# notification server (scripts/notify-host.py, printing to notify.log), and
+# starts the dev window when a notification opens a task in it.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+DEV="${ASST_DEV:-${XDG_CACHE_HOME:-$HOME/.cache}/asst-dev/${ASST_DEV_NAME:-gui}}"
+RADICALE="${XDG_CACHE_HOME:-$HOME/.cache}/asst-dev/radicale"
+BIN="$REPO/target/debug"
+
+has_name() {
+  gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner "$1" 2>/dev/null | grep -q true
+}
+
+on_bus() {
+  [ -f "$DEV/bus" ] || { echo "not up; run scripts/dev up" >&2; exit 1; }
+  export DBUS_SESSION_BUS_ADDRESS
+  DBUS_SESSION_BUS_ADDRESS="$(cat "$DEV/bus")"
+  unset DBUS_SESSION_BUS_PID
+  export XDG_CONFIG_HOME="$DEV/config" XDG_STATE_HOME="$DEV/state"
+  has_name dev.jaeho.Asst.Daemon || { echo "the dev asstd is not on the private bus" >&2; exit 1; }
+}
+
+action() {
+  on_bus
+  gdbus call --session --dest dev.jaeho.Asst.Devel --object-path /dev/jaeho/Asst/Devel \
+    --method org.gtk.Actions.Activate "$1" "[<'${2//\'/\\\'}'>]" "{}" > /dev/null
+}
+
+radicale_up() {
+  curl -s -o /dev/null http://127.0.0.1:5232/ && return
+  mkdir -p "$RADICALE/data"
+  cat > "$RADICALE/config" <<CONF
+[server]
+hosts = 127.0.0.1:5232
+[auth]
+type = none
+[storage]
+filesystem_folder = $RADICALE/data
+[logging]
+level = warning
+CONF
+  (setsid nohup uvx --from radicale radicale --config "$RADICALE/config" > "$RADICALE/log" 2>&1 &)
+  for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:5232/ && return; sleep 0.2; done
+  echo "Radicale did not start; see $RADICALE/log" >&2
+  exit 1
+}
+
+hide_window() {
+  if command -v hyprctl > /dev/null; then
+    hyprctl eval 'hl.window_rule({ name = "asst-devel", match = { class = "^(dev.jaeho.Asst.Devel)$" }, workspace = "name:asstdev silent", no_initial_focus = true, render_unfocused = true, float = true, size = "1280 820" })' > /dev/null
+  fi
+}
+
+# The part that runs inside dbus-run-session.
+inside() {
+  echo "$DBUS_SESSION_BUS_ADDRESS" > "$DEV/bus"
+  if gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.ListActivatableNames | grep -Eq "'dev\.jaeho\.Asst(\.Daemon)?'"; then
+    echo "refusing: this bus can start the installed asst" >&2
+    exit 1
+  fi
+  /usr/bin/python3 "$REPO/scripts/notify-host.py" > "$DEV/notify.log" 2>&1 &
+  for _ in $(seq 40); do has_name org.freedesktop.Notifications && break; sleep 0.1; done
+  export XDG_CONFIG_HOME="$DEV/config" XDG_STATE_HOME="$DEV/state" ASST_PASSWORD=x ASST_DEVEL=1
+  "$BIN/asstd" > "$DEV/asstd.log" 2>&1 &
+  wait
+}
+
+case "${1:-}" in
+  up)
+    if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then exit 0; fi
+    cargo build --manifest-path "$REPO/Cargo.toml" -p asstd -p asst -p asst-gtk
+    radicale_up
+    mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data" "$DEV/notes"
+    # Never the default, which is the real ~/Nextcloud/Notes.
+    if [ "${2:-}" = "--signed-out" ]; then
+      echo "notes = \"$DEV/notes\"" > "$DEV/config/asst/config.toml"
+    else
+      cat > "$DEV/config/asst/config.toml" <<CONF
+notes = "$DEV/notes"
+
+[account]
+server = "http://127.0.0.1:5232"
+dav_url = "http://127.0.0.1:5232/"
+username = "$(basename "$DEV")"
+home = "/$(basename "$DEV")/"
+CONF
+    fi
+    rm -f "$DEV/bus"
+    # What a click on a reminder starts when the dev window isn't running.
+    mkdir -p "$DEV/data/dbus-1/services"
+    cat > "$DEV/data/dbus-1/services/dev.jaeho.Asst.Devel.service" <<SERVICE
+[D-BUS Service]
+Name=dev.jaeho.Asst.Devel
+Exec=/usr/bin/env -u XDG_DATA_HOME XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_HOME=$DEV/config XDG_STATE_HOME=$DEV/state ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals $BIN/asst-gtk --gapplication-service
+SERVICE
+    hide_window
+    # XDG_DATA_HOME and XDG_DATA_DIRS decide which services the bus can
+    # start: pointed away, it cannot find the installed asstd.
+    (setsid nohup env XDG_DATA_HOME="$DEV/data" XDG_DATA_DIRS=/nonexistent \
+      dbus-run-session -- "$0" inside > "$DEV/session.log" 2>&1 &)
+    for _ in $(seq 50); do
+      if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then echo "up: $DEV"; exit 0; fi
+      sleep 0.2
+    done
+    echo "did not come up; see $DEV/session.log and $DEV/asstd.log" >&2
+    exit 1
+    ;;
+  inside) inside ;;
+  run) shift; on_bus; exec "$@" ;;
+  asst) shift; on_bus; exec "$BIN/asst" "$@" ;;
+  window)
+    shift
+    on_bus
+    pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
+    hide_window
+    # Popovers stay open without keyboard focus (ASST_NO_AUTOHIDE).
+    (env ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals \
+      setsid "$BIN/asst-gtk" "$@" > "$DEV/window.log" 2>&1 &)
+    for _ in $(seq 60); do has_name dev.jaeho.Asst.Devel && { sleep 1; exit 0; }; sleep 0.25; done
+    echo "the window did not come up; see $DEV/window.log" >&2
+    exit 1
+    ;;
+  tray)
+    on_bus
+    has_name org.kde.StatusNotifierWatcher && exit 0
+    (setsid /usr/bin/python3 "$REPO/scripts/sni-host.py" > "$DEV/tray.log" 2>&1 &)
+    for _ in $(seq 40); do has_name org.kde.StatusNotifierWatcher && exit 0; sleep 0.1; done
+    echo "the stand-in tray did not come up; see $DEV/tray.log" >&2
+    exit 1
+    ;;
+  drive) action drive "$2" ;;
+  click)
+    on_bus
+    gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+      --method dev.jaeho.Test.Click "$2" "$3" > /dev/null
+    ;;
+  snap) action snapshot "$(realpath -m "$2")" ;;
+  snap-popover) action snapshot-popover "$(realpath -m "$2")" ;;
+  down)
+    pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
+    pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
+    if [ -f "$DEV/bus" ]; then
+      # The reply reads `(uint32 12345,)`.
+      pid="$( (on_bus && gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetConnectionUnixProcessID dev.jaeho.Asst.Daemon) 2>/dev/null \
+        | sed -n 's/^(uint32 \([0-9][0-9]*\),)$/\1/p')" || true
+      if [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid")" = asstd ]; then
+        kill "$pid"
+      fi
+      rm -f "$DEV/bus"
+    fi
+    ;;
+  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

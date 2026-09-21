@@ -1,0 +1,34 @@
+[package]
+name = "asst-core"
+description = "asst's task model, iCalendar handling, SQLite cache and CalDAV sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+http = "1"
+hyper = "1"
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# rustls with the system trust store: no OpenSSL soname to break the binary
+# across an Arch upgrade.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "native-tokio", "tls12", "logging"] }
+# The zone name, not just the offset: a due time is written with its TZID.
+iana-time-zone = "0.1"
+libdav = "0.11"
+# The Secret Service (gnome-keyring, KeePassXC) holds the app password.
+oo7 = "0.6"
+roxmltree = "0.21"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rrule = "0.14"
+toml = "1"
+tower-service = "0.3"
+uuid = { version = "1", features = ["v4"] }
+zbus = { workspace = true }

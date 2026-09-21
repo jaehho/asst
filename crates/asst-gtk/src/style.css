@@ -1,0 +1,787 @@
+/* asst: libadwaita, dressed after Planify. */
+
+window {
+  --view-blue: #3584e4;
+  --view-green: #2ec27e;
+  --view-purple: #9141ac;
+  --view-orange: #ff7800;
+  --due-today: #16af54;
+  --due-overdue: #fa1955;
+  --done: #ff7800;
+  --p1: #ff7066;
+  --p2: #ff9a14;
+  --p3: #5297ff;
+}
+
+window.dark {
+  --view-blue: #99c1f1;
+  --view-green: #8ff0a4;
+  --view-purple: #dc8add;
+  --view-orange: #ffbe6f;
+  --due-today: #57e389;
+  --due-overdue: #ff6a8c;
+  --done: #ffa348;
+}
+
+@keyframes spin {
+  from { -gtk-icon-transform: rotate(0deg); }
+  to { -gtk-icon-transform: rotate(360deg); }
+}
+
+@keyframes fancy-turn {
+  0% { -gtk-icon-transform: rotate(0deg); }
+  25% { -gtk-icon-transform: rotate(-30deg); }
+  50% { -gtk-icon-transform: rotate(0deg); }
+  75% { -gtk-icon-transform: rotate(30deg); }
+  100% { -gtk-icon-transform: rotate(0deg); }
+}
+
+/* Rows opening as they arrive and folding as they go (motion.rs slides
+   them; these fade), and a view coming in. */
+@keyframes arrive {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes leave {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes view-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Planify's check: the box pops, the row lights up and the title dims. */
+@keyframes check-pop {
+  0% { transform: scale(0.7); }
+  55% { transform: scale(1.25); }
+  100% { transform: scale(1); }
+}
+
+@keyframes light-up {
+  from { background-color: alpha(var(--accent-color), 0.28); }
+  to { background-color: alpha(var(--accent-color), 0.10); }
+}
+
+@keyframes dim-done {
+  from { opacity: 1; }
+  to { opacity: 0.55; }
+}
+
+/* Planify's focus on the task open in place: the rest steps back. */
+@keyframes step-back {
+  from { opacity: 1; }
+  to { opacity: 0.45; }
+}
+
+@keyframes step-forward {
+  from { opacity: 0.45; }
+  to { opacity: 1; }
+}
+
+/* A checked repeating task's next date, lit up as Planify does. */
+@keyframes rolled {
+  0%, 50% { background-color: alpha(var(--accent-color), 0.3); color: var(--accent-color); }
+}
+
+/* -- sidebar ------------------------------------------------------------- */
+
+.sidebar-content {
+  margin: 6px 12px 12px 12px;
+}
+
+.filter-tiles {
+  margin: 3px;
+}
+
+flowboxchild.filter-tile {
+  padding: 6px;
+  border-radius: 9px;
+  transition: box-shadow 225ms ease-in-out, background-color 225ms ease-in-out;
+}
+
+flowboxchild.filter-tile.selected image {
+  animation: fancy-turn 0.7s ease-in-out;
+}
+
+.filter-tile .tile-title,
+.filter-tile .tile-count {
+  font-weight: bold;
+}
+
+.tint-blue { color: var(--view-blue); }
+.tint-green { color: var(--view-green); }
+.tint-purple { color: var(--view-purple); }
+.tint-orange { color: var(--view-orange); }
+
+flowboxchild.filter-tile.tint-blue { background-color: alpha(var(--view-blue), 0.15); }
+flowboxchild.filter-tile.tint-green { background-color: alpha(var(--view-green), 0.15); }
+flowboxchild.filter-tile.tint-purple { background-color: alpha(var(--view-purple), 0.15); }
+flowboxchild.filter-tile.tint-orange { background-color: alpha(var(--view-orange), 0.15); }
+
+flowboxchild.filter-tile.tint-blue:hover,
+flowboxchild.filter-tile.tint-blue.selected { box-shadow: 0 0 3px 1px var(--view-blue); }
+flowboxchild.filter-tile.tint-green:hover,
+flowboxchild.filter-tile.tint-green.selected { box-shadow: 0 0 3px 1px var(--view-green); }
+flowboxchild.filter-tile.tint-purple:hover,
+flowboxchild.filter-tile.tint-purple.selected { box-shadow: 0 0 3px 1px var(--view-purple); }
+flowboxchild.filter-tile.tint-orange:hover,
+flowboxchild.filter-tile.tint-orange.selected { box-shadow: 0 0 3px 1px var(--view-orange); }
+
+flowboxchild.filter-tile:drop(active) {
+  box-shadow: 0 0 0 2px var(--accent-color);
+}
+
+.overdue-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+  background-color: #f66151;
+  margin-right: 3px;
+}
+
+.source-header {
+  margin: 18px 3px 6px 6px;
+}
+
+.source-rule {
+  margin: 0 3px 6px 3px;
+}
+
+list.sidebar-lists {
+  background: transparent;
+}
+
+list.sidebar-lists > row.list-row {
+  padding: 0;
+  margin-bottom: 1px;
+  border-radius: 9px;
+  transition: background-color 150ms ease-in-out;
+}
+
+list.sidebar-lists > row.list-row:hover {
+  background-color: alpha(currentColor, 0.06);
+}
+
+list.sidebar-lists > row.list-row.selected {
+  background-color: alpha(var(--accent-color), 0.16);
+}
+
+list.sidebar-lists > row.list-row:drop(active) {
+  box-shadow: inset 0 0 0 2px var(--accent-color);
+}
+
+/* A list dragged among lists: a line where it will go. */
+list.sidebar-lists > row.list-row.drop-above:drop(active) {
+  box-shadow: inset 0 2px 0 0 var(--accent-color);
+}
+
+list.sidebar-lists > row.list-row.drop-below:drop(active) {
+  box-shadow: inset 0 -2px 0 0 var(--accent-color);
+}
+
+.list-line {
+  padding: 6px 9px;
+}
+
+.sync-button.spinning image {
+  animation: spin 1s linear infinite;
+}
+
+.sync-button.warning {
+  color: var(--warning-color);
+}
+
+/* -- the column of tasks ------------------------------------------------- */
+
+.view-clamp {
+  margin: 0 18px 0 18px;
+}
+
+.view-column {
+  margin-bottom: 64px;
+}
+
+.view-column.view-enter {
+  animation: view-enter 200ms ease-out;
+}
+
+.view-column.focusing list.task-list > row.task-row:not(.editing),
+.view-column.focusing .section-header,
+.view-column.focusing .add-button {
+  opacity: 0.45;
+  transition: opacity 150ms ease-out;
+}
+
+.view-column.focusing list.task-list > row.task-row:not(.editing):hover {
+  opacity: 0.8;
+}
+
+.view-column.focus-enter list.task-list > row.task-row:not(.editing),
+.view-column.focus-enter .section-header,
+.view-column.focus-enter .add-button {
+  animation: step-back 200ms ease-out;
+}
+
+.view-column.focus-leave list.task-list > row.task-row,
+.view-column.focus-leave .section-header,
+.view-column.focus-leave .add-button {
+  animation: step-forward 200ms ease-out;
+}
+
+.arriving {
+  animation: arrive 220ms ease-out;
+}
+
+.leaving {
+  animation: leave 180ms ease-in forwards;
+}
+
+.view-title {
+  margin: 12px 6px 6px 6px;
+}
+
+.view-icon {
+  padding: 6px;
+  border-radius: 9px;
+}
+
+.view-icon.tint-blue { background-color: alpha(var(--view-blue), 0.15); }
+.view-icon.tint-green { background-color: alpha(var(--view-green), 0.15); }
+.view-icon.tint-purple { background-color: alpha(var(--view-purple), 0.15); }
+.view-icon.tint-orange { background-color: alpha(var(--view-orange), 0.15); }
+
+.task-section {
+  margin-top: 6px;
+}
+
+.section-header {
+  margin: 12px 6px 0 6px;
+  min-height: 32px;
+}
+
+.section-title {
+  font-weight: bold;
+}
+
+.section-title.day-number {
+  font-size: 1.15em;
+}
+
+.section-rule {
+  margin: 2px 3px 4px 3px;
+}
+
+.section-add,
+.reschedule {
+  min-height: 26px;
+  padding: 2px 8px;
+}
+
+list.task-list {
+  background: transparent;
+}
+
+list.task-list > row.task-row {
+  padding: 0;
+  margin: 1px 0;
+  border-radius: 9px;
+  background: transparent;
+  transition: background-color 150ms ease-in-out;
+}
+
+list.task-list > row.task-row:hover {
+  background-color: alpha(currentColor, 0.05);
+}
+
+list.task-list > row.task-row.drop-above {
+  box-shadow: inset 0 2px 0 0 var(--accent-color);
+}
+
+list.task-list > row.task-row.drop-below {
+  box-shadow: inset 0 -2px 0 0 var(--accent-color);
+}
+
+list.task-list > row.task-row.cursor:focus-visible {
+  outline: 2px solid alpha(var(--accent-color), 0.6);
+  outline-offset: -2px;
+}
+
+.task-item {
+  padding: 0 8px;
+  border-radius: 9px;
+  transition: background-color 200ms ease-in-out;
+}
+
+.task-item.completing {
+  background-color: alpha(var(--accent-color), 0.10);
+}
+
+.task-item.selected {
+  background-color: alpha(var(--accent-color), 0.18);
+}
+
+.task-item.done .task-title {
+  text-decoration-line: line-through;
+  opacity: 0.55;
+}
+
+.task-item.just-checked {
+  animation: light-up 450ms ease-out;
+}
+
+.task-item.just-checked checkbutton.task-check check {
+  animation: check-pop 320ms ease-out;
+}
+
+.task-item.just-checked .task-title {
+  animation: dim-done 350ms ease-out;
+}
+
+.task-body {
+  margin: 6px 0 6px 10px;
+}
+
+/* Planify's checkbox: a small rounded square in the priority's color. */
+checkbutton.task-check {
+  padding: 0;
+}
+
+checkbutton.task-check check {
+  min-width: 14px;
+  min-height: 14px;
+  -gtk-icon-size: 12px;
+  padding: 1px;
+  border-radius: 6px;
+}
+
+checkbutton.task-check.priority-1 check:not(:checked) {
+  box-shadow: inset 0 0 0 2px var(--p1);
+  background-color: alpha(var(--p1), 0.1);
+}
+
+checkbutton.task-check.priority-2 check:not(:checked) {
+  box-shadow: inset 0 0 0 2px var(--p2);
+  background-color: alpha(var(--p2), 0.1);
+}
+
+checkbutton.task-check.priority-3 check:not(:checked) {
+  box-shadow: inset 0 0 0 2px var(--p3);
+  background-color: alpha(var(--p3), 0.1);
+}
+
+checkbutton.task-check.priority-4 check:not(:checked) {
+  box-shadow: inset 0 0 0 2px alpha(currentColor, 0.32);
+  background-color: transparent;
+}
+
+checkbutton.task-check check:checked {
+  background-color: var(--done);
+  color: white;
+  box-shadow: none;
+}
+
+.due-chip {
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 0.8em;
+  font-weight: 600;
+}
+
+.due-chip image {
+  -gtk-icon-size: 10px;
+}
+
+.due-chip.today {
+  background-color: alpha(var(--due-today), 0.15);
+  color: var(--due-today);
+}
+
+.due-chip.overdue {
+  background-color: alpha(var(--due-overdue), 0.13);
+  color: var(--due-overdue);
+}
+
+.due-chip.upcoming {
+  background-color: alpha(currentColor, 0.08);
+}
+
+.due-chip.done {
+  background-color: alpha(var(--done), 0.15);
+  color: var(--done);
+}
+
+.due-chip.rolled {
+  animation: rolled 1200ms ease-out;
+}
+
+.add-button {
+  margin: 2px 0 0 2px;
+  padding: 4px 10px;
+  opacity: 0.7;
+  font-weight: 500;
+}
+
+.add-button:hover {
+  opacity: 1;
+}
+
+.add-button image {
+  transition: -gtk-icon-transform 200ms ease-in-out;
+}
+
+.add-button:hover image {
+  -gtk-icon-transform: rotate(90deg);
+}
+
+.accent {
+  color: var(--accent-color);
+}
+
+.add-card {
+  margin: 10px 2px 6px 2px;
+  padding: 6px 8px;
+}
+
+entry.add-entry {
+  font-size: 1.05em;
+  min-height: 38px;
+  background: none;
+  box-shadow: none;
+  outline: none;
+}
+
+textview.add-notes,
+textview.add-notes > text {
+  background: none;
+}
+
+textview.add-notes {
+  margin: 0 6px 4px 12px;
+  min-height: 22px;
+  font-size: 0.95em;
+}
+
+.find-excerpt {
+  font-style: italic;
+}
+
+.snooze-lengths {
+  margin-top: 3px;
+}
+
+.view-empty {
+  margin-top: 36px;
+}
+
+.select-bar {
+  padding: 3px 6px;
+}
+
+/* -- a task open in place ------------------------------------------------ */
+
+/* Planify's card: lifted off the list, with room above and below. */
+list.task-list > row.task-row.editing,
+list.task-list > row.task-row.editing:hover {
+  background: none;
+}
+
+/* It starts as the row it replaces and grows into the card (editor.rs adds
+   .expanded a frame later); both shadows are always there, so they can fade. */
+.task-editor {
+  margin: 0;
+  padding: 0 4px 0 8px;
+  border-radius: 12px;
+  background-color: alpha(var(--card-bg-color), 0);
+  box-shadow: 0 2px 6px alpha(black, 0), 0 1px 3px alpha(black, 0);
+  transition: margin 220ms ease-out, padding 220ms ease-out,
+    background-color 220ms ease-out, box-shadow 220ms ease-out;
+}
+
+.task-editor.expanded {
+  margin: 10px 2px 12px 0;
+  padding: 4px 4px 6px 8px;
+  background-color: var(--card-bg-color);
+  box-shadow: 0 2px 6px alpha(black, 0.12), 0 1px 3px alpha(black, 0.08);
+}
+
+window.dark .task-editor {
+  box-shadow: 0 0 0 1px alpha(white, 0), 0 2px 4px alpha(black, 0);
+}
+
+window.dark .task-editor.expanded {
+  box-shadow: 0 0 0 1px alpha(white, 0.07), 0 2px 4px alpha(black, 0.25);
+}
+
+.editor-check {
+  margin-top: 8px;
+  transition: margin 220ms ease-out;
+}
+
+.task-editor.expanded .editor-check {
+  margin-top: 9px;
+}
+
+textview.editor-title,
+textview.editor-notes {
+  background: none;
+}
+
+textview.editor-title > text,
+textview.editor-notes > text {
+  background: none;
+}
+
+textview.editor-title {
+  margin: 6px 0 2px 10px;
+  font-weight: bold;
+}
+
+textview.editor-notes {
+  margin: 2px 6px 6px 24px;
+  min-height: 44px;
+}
+
+/* Linked notes, under the task's own notes. */
+.task-editor .note-pills {
+  margin: 0 6px 6px 22px;
+}
+
+.add-card .note-pills {
+  margin: 0 6px 4px 10px;
+}
+
+.note-pill {
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.07);
+}
+
+.note-pill > button {
+  min-height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 0.9em;
+  font-weight: normal;
+}
+
+.note-pill > button.note-pill-unlink {
+  min-width: 22px;
+  min-height: 22px;
+  margin-right: 2px;
+  padding: 0;
+  -gtk-icon-size: 12px;
+}
+
+.note-pill > button.with-unlink {
+  padding-right: 2px;
+}
+
+.note-pill.missing > button:first-child {
+  opacity: 0.6;
+}
+
+.note-pill.missing > button:first-child label {
+  text-decoration: line-through;
+}
+
+.editor-collapse {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  opacity: 0;
+  transition: opacity 220ms ease-out;
+}
+
+.task-editor.expanded .editor-collapse {
+  opacity: 1;
+}
+
+.editor-actions {
+  margin: 0 0 0 16px;
+}
+
+.editor-actions button {
+  min-height: 30px;
+  padding: 2px 8px;
+  font-weight: normal;
+}
+
+button.editor-clear {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+}
+
+.indicator {
+  min-width: 7px;
+  min-height: 7px;
+  margin: 4px 4px 0 0;
+  border-radius: 999px;
+  background-color: var(--accent-color);
+}
+
+.menu-info {
+  margin: 3px 9px 6px 9px;
+}
+
+/* -- preferences --------------------------------------------------------- */
+
+list.sidebar-views > row.drop-above {
+  box-shadow: inset 0 2px 0 0 var(--accent-color);
+}
+
+list.sidebar-views > row.drop-below {
+  box-shadow: inset 0 -2px 0 0 var(--accent-color);
+}
+
+/* -- menus and pickers --------------------------------------------------- */
+
+popover.menu-popover > contents {
+  padding: 3px;
+}
+
+button.menu-item {
+  padding: 6px 9px;
+  border-radius: 6px;
+  font-weight: normal;
+  min-height: 0;
+}
+
+button.menu-item-danger {
+  color: var(--destructive-color);
+}
+
+button.menu-item-danger:hover {
+  background-color: alpha(var(--destructive-color), 0.15);
+}
+
+.menu-heading {
+  margin: 6px 9px 3px 9px;
+}
+
+.priority-1-icon,
+.priority-1-button image { color: var(--p1); }
+.priority-2-icon,
+.priority-2-button image { color: var(--p2); }
+.priority-3-icon,
+.priority-3-button image { color: var(--p3); }
+
+button.current {
+  background-color: alpha(currentColor, 0.1);
+}
+
+button.suggestion-chip {
+  border-radius: 9px;
+  padding: 3px 9px;
+  border: 1px solid alpha(currentColor, 0.15);
+  background: transparent;
+  font-weight: normal;
+}
+
+button.suggestion-chip:hover {
+  background-color: alpha(currentColor, 0.08);
+}
+
+button.calendar-day {
+  padding: 2px 0;
+  min-height: 28px;
+  border-radius: 9px;
+  font-weight: normal;
+}
+
+button.calendar-day.today {
+  color: var(--due-today);
+  font-weight: bold;
+}
+
+button.calendar-day.selected {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+}
+
+.option-label {
+  font-weight: 500;
+}
+
+togglebutton.day-toggle {
+  padding: 0;
+  min-width: 30px;
+  min-height: 30px;
+  font-size: 0.85em;
+}
+
+list.picker-list,
+list.quick-find-list {
+  background: transparent;
+}
+
+list.picker-list > row,
+list.quick-find-list > row {
+  border-radius: 6px;
+  margin: 0 6px;
+}
+
+button.color-swatch {
+  padding: 4px;
+}
+
+button.color-swatch:checked {
+  box-shadow: inset 0 0 0 2px var(--accent-color);
+}
+
+/* -- quick add ------------------------------------------------------------ */
+
+window.asst-quick-add {
+  background: transparent;
+}
+
+.add-card.quick-add-card {
+  padding: 8px 12px;
+  border-radius: 14px;
+  margin: 16px;
+  /* libadwaita's dark card is 8% white over an opaque window; this one
+     floats on a transparent layer surface, so it needs a solid backing. */
+  background-color: var(--window-bg-color);
+  box-shadow: 0 4px 14px alpha(black, 0.35);
+}
+
+.quick-add-card entry.add-entry {
+  font-size: 1.2em;
+  min-height: 44px;
+}
+
+.quick-add-status {
+  margin: 0 28px 16px 28px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  background-color: var(--window-bg-color);
+  color: var(--window-fg-color);
+  box-shadow: 0 1px 3px alpha(black, 0.2);
+}
+
+.chip {
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.9em;
+  background: alpha(currentColor, 0.08);
+}
+
+.chip.due {
+  background: alpha(var(--accent-bg-color), 0.22);
+}
+
+.chip.p1 {
+  background: alpha(var(--error-bg-color), 0.28);
+}
+
+.chip.repeat,
+.chip.alarm {
+  background: alpha(var(--success-bg-color), 0.22);
+}
+
+menubutton.filtered > button {
+  color: var(--accent-color);
+  background-color: alpha(var(--accent-color), 0.12);
+}

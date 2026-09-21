@@ -1,0 +1,25 @@
+[package]
+name = "asst-gtk"
+description = "asst's window and quick-add popup (GTK4, libadwaita, layer shell)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+asst-core = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = "1"
+zbus = { workspace = true }
+# relm4 runs a tokio runtime next to the GTK main loop, which zbus needs.
+relm4 = { version = "0.11", features = ["libadwaita", "gnome_49"] }
+gtk4-layer-shell = "0.8"
+# The tray icon: StatusNotifierItem and its menu over zbus, on relm4's runtime.
+ksni = "0.3"
+
+[build-dependencies]
+glib-build-tools = "0.22"

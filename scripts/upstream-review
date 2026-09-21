@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# List Planify commits not yet reviewed, grouped by top-level area.
+#
+# asst is a Rust rewrite that uses Planify as a reference, so fixes to CalDAV,
+# recurrence and reminder edge cases are re-implemented, not merged.
+# UPSTREAM.md's "Last reviewed" line is where the previous review stopped;
+# after triaging, record each relevant commit in its table and move the line
+# forward with --mark.
+#
+#   scripts/upstream-review          fetch, list unreviewed commits
+#   scripts/upstream-review --mark   set "Last reviewed" to upstream main
+#
+# PLANIFY_REF is the reference clone (default ~/projects/forks/planify).
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+ledger=$PWD/UPSTREAM.md
+ref=${PLANIFY_REF:-$HOME/projects/forks/planify}
+branch=upstream/main
+g() { git -C "$ref" "$@"; }
+
+g fetch -q upstream main
+
+last=$(sed -n 's/^Last reviewed: `\([0-9a-f]*\)`.*/\1/p' "$ledger")
+[ -n "$last" ] || { echo "No 'Last reviewed' line in $ledger" >&2; exit 1; }
+
+if [ "${1:-}" = --mark ]; then
+    head=$(g rev-parse --short=10 "$branch")
+    sed -i "s/^Last reviewed: .*/Last reviewed: \`$head\` ($(date +%F))/" "$ledger"
+    echo "Marked $head"
+    exit 0
+fi
+
+# Translations and release bumps never need porting.
+bots='^(Planify Bot|Weblate \(bot\)|Hosted Weblate|actions-user|dependabot\[bot\])$'
+
+count=0
+while read -r sha; do
+    author=$(g log -1 --format=%an "$sha")
+    [[ $author =~ $bots ]] && continue
+    areas=$(g diff-tree --no-commit-id --name-only -r "$sha" \
+        | grep -v '^po/' | cut -d/ -f1-2 | sort -u | paste -sd' ')
+    [ -n "$areas" ] || continue
+    printf '%s  %s  [%s]\n    %s\n' \
+        "$(g log -1 --format='%h %ad' --date=short "$sha")" \
+        "$(g log -1 --format=%s "$sha")" "$author" "$areas"
+    count=$((count + 1))
+done < <(g rev-list --no-merges --reverse "$last..$branch")
+
+echo
+echo "$count unreviewed commit(s) since $last. Closed bugs since then:"
+since=$(g log -1 --format=%cI "$last")
+gh issue list -R alainm23/planify --state closed --label 'Type: Bug' \
+    --search "closed:>=${since%%T*}" --limit 50 2>/dev/null || echo "  (gh unavailable)"

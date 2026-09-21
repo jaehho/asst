@@ -1,0 +1,6 @@
+/target
+*.pkg.tar.zst
+packaging/src/
+packaging/pkg/
+packaging/asst/
+.claude/
