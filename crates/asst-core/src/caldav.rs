@@ -128,27 +128,36 @@ fn https_client() -> Result<HttpsClient, RemoteError> {
 
 /// A plain form POST, for the Nextcloud login flow. Returns status and body.
 pub async fn post_form(url: &str, body: &str) -> Result<(u16, Vec<u8>), RemoteError> {
-    use http_body_util::BodyExt;
-    let client = https_client()?;
     let req = Request::builder()
         .method(Method::POST)
         .uri(url)
-        .header(USER_AGENT, USER_AGENT_VALUE)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body.to_string())
         .map_err(|e| RemoteError::Protocol(e.to_string()))?;
+    let (status, _, body) = send(req).await?;
+    Ok((status.as_u16(), body))
+}
+
+/// One request with the user agent and the timeout, read to the end: the
+/// status, the headers and the body.
+pub async fn send(
+    mut req: Request<String>,
+) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
+    use http_body_util::BodyExt;
+    let client = https_client()?;
+    req.headers_mut()
+        .insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
     let resp = tokio::time::timeout(TIMEOUT, client.request(req))
         .await
         .map_err(|_| RemoteError::Network("timed out".into()))?
         .map_err(|e| RemoteError::Network(chain(&e)))?;
-    let status = resp.status().as_u16();
-    let bytes = resp
-        .into_body()
+    let (parts, body) = resp.into_parts();
+    let bytes = body
         .collect()
         .await
         .map_err(|e| RemoteError::Network(chain(&e)))?
         .to_bytes();
-    Ok((status, bytes.to_vec()))
+    Ok((parts.status, parts.headers, bytes.to_vec()))
 }
 
 #[derive(Clone)]
@@ -253,7 +262,7 @@ fn map_err(e: WebDavError<HttpError>) -> RemoteError {
     }
 }
 
-fn status_error(s: StatusCode) -> RemoteError {
+pub fn status_error(s: StatusCode) -> RemoteError {
     match s.as_u16() {
         401 => RemoteError::Unauthorized,
         404 | 410 => RemoteError::NotFound,
