@@ -64,9 +64,6 @@ pub trait Asst {
     fn unlink(&self, repo: &str) -> zbus::Result<bool>;
     /// → `[LinkView]`
     fn links(&self) -> zbus::Result<String>;
-    /// id, a title (`""`: the task's) → `NewNote`: a note in the notes
-    /// folder, linked to the task.
-    fn new_note(&self, id: &str, title: &str) -> zbus::Result<String>;
     /// → `Settings`
     fn settings(&self) -> zbus::Result<String>;
     /// `SettingsChange` → `Settings`, saved to `config.toml`.
@@ -133,6 +130,13 @@ pub struct LinkView {
     pub name: String,
 }
 
+/// The GitHub issue a task is paired with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueLink {
+    pub number: u32,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskView {
     /// Shortest unambiguous UID prefix (at least 4 characters).
@@ -141,6 +145,9 @@ pub struct TaskView {
     pub list: String,
     pub list_name: String,
     pub pending: bool,
+    /// The paired GitHub issue, when the list is linked to a repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<IssueLink>,
     #[serde(flatten)]
     pub task: Task,
 }
@@ -153,6 +160,7 @@ impl TaskView {
             list: row.list,
             list_name,
             pending: row.pending,
+            issue: None,
             task: row.task,
         }
     }
@@ -187,14 +195,9 @@ pub struct AddSpec {
     pub rrule: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alarms: Option<Vec<Trigger>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
     /// `kind:id`. Adding the same source twice returns the first task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Notes to link: paths in the notes folder, or full paths of files in it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub linked_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,12 +242,8 @@ pub struct Change {
     pub rrule: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alarms: Option<Vec<Trigger>>,
-    #[serde(
-        default,
-        deserialize_with = "double",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub url: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_alarms: Option<Vec<crate::task::LocationAlarm>>,
     #[serde(
         default,
         deserialize_with = "double",
@@ -258,19 +257,6 @@ pub struct Change {
         skip_serializing_if = "Option::is_none"
     )]
     pub sort_order: Option<Option<i64>>,
-    /// Exactly these linked notes, as `AddSpec` takes them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub linked_notes: Option<Vec<String>>,
-}
-
-/// A note made for a task and linked to it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NewNote {
-    /// Within the notes folder.
-    pub path: String,
-    /// The file on this disk.
-    pub file: String,
-    pub task: TaskView,
 }
 
 /// A new list.
@@ -307,13 +293,9 @@ pub struct Settings {
     /// Minutes before the due time that reminder rings.
     #[serde(default)]
     pub alarm_before: u32,
-    /// The notes folder tasks link notes in, as a full path.
-    #[serde(default)]
-    pub notes: String,
 }
 
-/// Absent means unchanged; `inbox: null` and `notes: null` go back to the
-/// default.
+/// Absent means unchanged; `inbox: null` goes back to the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsChange {
     #[serde(
@@ -330,12 +312,6 @@ pub struct SettingsChange {
     pub alarm_at_due: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alarm_before: Option<u32>,
-    #[serde(
-        default,
-        deserialize_with = "double",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub notes: Option<Option<String>>,
 }
 
 fn double<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -350,7 +326,6 @@ pub fn query(view: crate::store::View) -> Query {
         list: None,
         text: None,
         limit: None,
-        linked_note: None,
     }
 }
 

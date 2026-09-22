@@ -3,19 +3,18 @@
 //! which views the sidebar shows in what order.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
 use asst_core::api::{ListView, Settings, SettingsChange, StatusView, SyncState};
 use relm4::adw;
 use relm4::adw::prelude::*;
-use relm4::gtk::{self, gdk, gio, glib};
+use relm4::gtk::{self, gdk, glib};
 
 use crate::model::{self, Nav};
 use crate::prefs::Prefs;
 use crate::window::{Msg, Tx};
-use crate::{autostart, linked, pickers};
+use crate::{autostart, pickers};
 
 pub struct Ctx {
     pub settings: Option<Settings>,
@@ -232,8 +231,7 @@ fn general_page(
         }
         tasks.add(&interval);
         page.add(&tasks);
-        page.add(&snooze_group(&settings, send.clone()));
-        page.add(&notes_group(&settings, send));
+        page.add(&snooze_group(&settings, send));
     } else {
         tasks.set_description(Some(
             "asstd isn't answering, so its settings can't be shown.",
@@ -417,60 +415,6 @@ fn snooze_group(
     }
     limit();
     group.add(&chips);
-    group
-}
-
-/// The folder of notes tasks link to.
-fn notes_group(
-    settings: &Settings,
-    send: impl Fn(SettingsChange) + 'static,
-) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Notes")
-        .description("A task can link to notes in the folder Nextcloud Notes keeps, as the Nextcloud client puts it on this computer.")
-        .build();
-    let dir = PathBuf::from(&settings.notes);
-    let row = adw::ActionRow::builder().title("Notes folder").build();
-    row.set_subtitle(&if dir.is_dir() {
-        linked::pretty(&dir)
-    } else {
-        format!("{} doesn't exist", linked::pretty(&dir))
-    });
-    let choose = gtk::Button::with_label("Choose…");
-    choose.set_valign(gtk::Align::Center);
-    let send = Rc::new(send);
-    {
-        let weak = row.downgrade();
-        choose.connect_clicked(move |b| {
-            let picker = gtk::FileDialog::builder()
-                .title("Notes Folder")
-                .modal(true)
-                .build();
-            if dir.is_dir() {
-                picker.set_initial_folder(Some(&gio::File::for_path(&dir)));
-            }
-            let (send, weak) = (send.clone(), weak.clone());
-            picker.select_folder(
-                b.root().and_downcast::<gtk::Window>().as_ref(),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let Some(path) = result.ok().and_then(|f| f.path()) else {
-                        return;
-                    };
-                    if let Some(row) = weak.upgrade() {
-                        row.set_subtitle(&linked::pretty(&path));
-                    }
-                    send(SettingsChange {
-                        notes: Some(Some(path.to_string_lossy().into_owned())),
-                        ..SettingsChange::default()
-                    });
-                },
-            );
-        });
-    }
-    row.add_suffix(&choose);
-    row.set_activatable_widget(Some(&choose));
-    group.add(&row);
     group
 }
 

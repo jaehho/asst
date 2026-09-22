@@ -111,6 +111,9 @@ async fn pass(
                 id: r.task.uid.clone(),
                 title: r.task.summary.clone(),
                 open: r.task.is_open(),
+                body: r.task.description.clone(),
+                priority: r.task.priority,
+                labels: Vec::new(),
             })
             .collect();
         let hrefs: HashMap<String, String> =
@@ -165,6 +168,8 @@ async fn apply(
             issue,
             title,
             open,
+            body,
+            priority,
         } => {
             if !task.is_empty() {
                 edit_task(&mut daemon.store(), &href(&uid)?, &task)?;
@@ -178,13 +183,15 @@ async fn apply(
                 uid,
                 title,
                 open,
+                body,
+                priority,
             };
             daemon.store().gh_pair(repo, &pair)?;
         }
         Op::CloseIssue { number } => {
             let close = Change {
-                title: None,
                 open: Some(false),
+                ..Change::default()
             };
             match gh.update(repo, number, &close, true).await {
                 Ok(()) | Err(RemoteError::NotFound) => {}
@@ -199,8 +206,8 @@ async fn apply(
                 return Ok(());
             }
             let done = Change {
-                title: None,
                 open: Some(false),
+                ..Change::default()
             };
             let mut store = daemon.store();
             edit_task(&mut store, &href(&uid)?, &done)?;
@@ -210,34 +217,63 @@ async fn apply(
         Op::Unpair { number } => {
             daemon.store().gh_unpair(repo, number)?;
         }
-        Op::Adopt { number, uid, title } => {
+        Op::Adopt {
+            number,
+            uid,
+            title,
+            body,
+            priority,
+        } => {
             let pair = Pair {
                 number,
                 uid,
                 title,
                 open: true,
+                body,
+                priority,
             };
             daemon.store().gh_pair(repo, &pair)?;
         }
-        Op::NewTask { number, title } => {
+        Op::NewTask {
+            number,
+            title,
+            body,
+            priority,
+        } => {
+            let mut edits = vec![Edit::Summary(title.clone())];
+            if let Some(b) = &body {
+                edits.push(Edit::Description(Some(b.clone())));
+            }
+            if priority > 0 {
+                edits.push(Edit::Priority(priority));
+            }
             let mut store = daemon.store();
-            let row = store.create(list, &[Edit::Summary(title.clone())], Utc::now())?;
+            let row = store.create(list, &edits, Utc::now())?;
             *changed = true;
             let pair = Pair {
                 number,
                 uid: row.task.uid,
                 title,
                 open: true,
+                body,
+                priority,
             };
             store.gh_pair(repo, &pair)?;
         }
-        Op::NewIssue { uid, title } => {
-            let issue = gh.create(repo, &title).await?;
+        Op::NewIssue {
+            uid,
+            title,
+            body,
+            priority,
+        } => {
+            let issue = gh.create(repo, &title, body.as_deref(), priority).await?;
             let pair = Pair {
                 number: issue.id,
                 uid,
                 title: issue.title,
                 open: true,
+                body,
+                priority,
             };
             daemon.store().gh_pair(repo, &pair)?;
         }
@@ -249,6 +285,12 @@ fn edit_task(store: &mut Store, href: &str, change: &Change) -> Result<()> {
     let now = Utc::now();
     if let Some(t) = &change.title {
         store.edit(href, &[Edit::Summary(t.clone())], now)?;
+    }
+    if let Some(b) = &change.body {
+        store.edit(href, &[Edit::Description(b.clone())], now)?;
+    }
+    if let Some(p) = change.priority {
+        store.edit(href, &[Edit::Priority(p)], now)?;
     }
     match change.open {
         Some(true) => {

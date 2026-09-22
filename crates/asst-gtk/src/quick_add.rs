@@ -1,8 +1,7 @@
 //! `asst-gtk quick-add`: a layer-shell popup with the window's add card.
 //! Type with quick-add syntax or use the buttons; Enter adds and closes,
 //! Shift+Enter (or Keep adding, Ctrl+K) adds and stays, Esc closes. Run it
-//! again while open to close it. `--attach NOTE` links what it adds to a
-//! note, for an editor to start it from the note open in it.
+//! again while open to close it.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -18,13 +17,12 @@ use crate::addcard::{AddCard, Target};
 use crate::client;
 use crate::prefs::Prefs;
 
-/// `linked`: full paths of notes the tasks link to.
-pub fn run(linked: Vec<String>) {
+pub fn run() {
     let app = RelmApp::new("dev.jaeho.Asst.QuickAdd")
         .with_args(Vec::new())
         .visible_on_activate(false);
     relm4::set_global_css(crate::CSS);
-    app.run::<QuickAdd>(linked);
+    app.run::<QuickAdd>(());
 }
 
 /// The list quick add added to last: a file of its own, since the window
@@ -56,7 +54,7 @@ pub enum Cmd {
 }
 
 impl Component for QuickAdd {
-    type Init = Vec<String>;
+    type Init = ();
     type Input = Msg;
     type Output = ();
     type CommandOutput = Cmd;
@@ -87,7 +85,7 @@ impl Component for QuickAdd {
     }
 
     fn init(
-        linked: Vec<String>,
+        _: (),
         root: gtk::Window,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
@@ -100,7 +98,6 @@ impl Component for QuickAdd {
         };
         card.root.add_css_class("quick-add-card");
         card.open(Target::Anywhere);
-        card.set_linked(linked);
         card.show_keep();
         let prefs = Prefs::load();
         card.set_defaults(prefs.default_priority, prefs.read_dates);

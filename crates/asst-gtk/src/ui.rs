@@ -3,7 +3,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::f64::consts::PI;
-use std::rc::Rc;
 
 use relm4::gtk::prelude::*;
 use relm4::gtk::{self, gdk, glib, pango};
@@ -303,15 +302,9 @@ pub fn chip(text: &str, class: &str, repeat: bool) -> gtk::Box {
     b
 }
 
-/// A list's color as Planify draws a project: a ring around a dot.
+/// A list's color as Planify draws a project: a ring around a dot. Not a
+/// progress meter — these lists are long-term projects.
 pub fn ring(color: Option<&str>, size: i32) -> gtk::DrawingArea {
-    progress_ring(color, size, Rc::new(Cell::new(1.0)))
-}
-
-/// The ring with its dot filled like a pie, as far as `done` (0 to 1) says:
-/// Planify's picture of how much of a list is done. Queue a draw after
-/// changing it.
-pub fn progress_ring(color: Option<&str>, size: i32, done: Rc<Cell<f64>>) -> gtk::DrawingArea {
     let rgba = color
         .and_then(|c| gdk::RGBA::parse(c).ok())
         .unwrap_or(gdk::RGBA::new(0.6, 0.6, 0.6, 1.0));
@@ -333,16 +326,7 @@ pub fn progress_ring(color: Option<&str>, size: i32, done: Rc<Cell<f64>>) -> gtk
         cr.set_line_width(2.0);
         cr.arc(cx, cy, r, 0.0, 2.0 * PI);
         let _ = cr.stroke();
-        let done = done.get().clamp(0.0, 1.0);
-        let inner = (r - 3.0).max(1.0);
-        if done >= 1.0 {
-            cr.arc(cx, cy, inner, 0.0, 2.0 * PI);
-        } else if done > 0.0 {
-            // From twelve o'clock, clockwise.
-            cr.move_to(cx, cy);
-            cr.arc(cx, cy, inner, -PI / 2.0, -PI / 2.0 + 2.0 * PI * done);
-            cr.close_path();
-        }
+        cr.arc(cx, cy, (r - 3.0).max(1.0), 0.0, 2.0 * PI);
         let _ = cr.fill();
     });
     area

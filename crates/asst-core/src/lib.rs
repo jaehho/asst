@@ -5,7 +5,7 @@ pub mod fmt;
 pub mod github;
 pub mod ical;
 pub mod login;
-pub mod note_files;
+pub mod nominatim;
 pub mod quickadd;
 pub mod recur;
 pub mod store;

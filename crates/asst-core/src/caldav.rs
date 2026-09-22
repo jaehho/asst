@@ -141,12 +141,19 @@ pub async fn post_form(url: &str, body: &str) -> Result<(u16, Vec<u8>), RemoteEr
 /// One request with the user agent and the timeout, read to the end: the
 /// status, the headers and the body.
 pub async fn send(
+    req: Request<String>,
+) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
+    send_as(req, USER_AGENT_VALUE).await
+}
+
+/// The same, with another user agent: Nominatim asks for one that names us.
+pub async fn send_as(
     mut req: Request<String>,
+    agent: &'static str,
 ) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
     use http_body_util::BodyExt;
     let client = https_client()?;
-    req.headers_mut()
-        .insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+    req.headers_mut().insert(USER_AGENT, HeaderValue::from_static(agent));
     let resp = tokio::time::timeout(TIMEOUT, client.request(req))
         .await
         .map_err(|_| RemoteError::Network("timed out".into()))?

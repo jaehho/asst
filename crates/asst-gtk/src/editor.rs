@@ -1,25 +1,23 @@
 //! A task opened in place, as Planify opens one: its row grows into a card
-//! with the title to edit, notes under it, the notes it links to, and a bar
-//! of buttons for the date, list, link, linked notes, priority and
-//! reminders. There is one editor, and each rebuild of the view moves it
-//! into the open task's row, so what is being typed survives. Typing saves
-//! after a pause; buttons save as you pick. It starts out the size of the
-//! row it replaces, then grows (`expand`), and shrinks back before the row
-//! returns (`collapse`).
+//! with the title to edit, notes under it, and a bar of buttons for the
+//! date, list, priority and reminders. There is one editor, and each rebuild
+//! of the view moves it into the open task's row, so what is being typed
+//! survives. Typing saves after a pause; buttons save as you pick. It starts
+//! out the size of the row it replaces, then grows (`expand`), and shrinks
+//! back before the row returns (`collapse`).
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
 use asst_core::api::{Change, ListView, TaskView};
+use asst_core::nominatim::Place;
 use asst_core::task::priority_level;
-use asst_core::{fmt, note_files};
-use relm4::adw;
+use asst_core::task::LocationAlarm;
+use asst_core::fmt;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{self, gdk, glib, pango};
 
-use crate::linked::{self, Pick};
 use crate::model::{self, capitalize};
 use crate::motion;
 use crate::pickers::{self, DateOpts, Schedule};
@@ -48,34 +46,20 @@ pub struct Editor {
     list: gtk::MenuButton,
     list_ring: gtk::Box,
     list_label: gtk::Label,
-    link: gtk::MenuButton,
-    link_dot: gtk::Widget,
-    /// The notes the task links to, under its own.
-    pills: adw::WrapBox,
-    linked: gtk::MenuButton,
-    linked_dot: gtk::Widget,
-    /// Where linked notes are, once the daemon's settings are in.
-    notes_dir: RefCell<Option<PathBuf>>,
-    /// Takes one link off the task shown.
-    unlink: RefCell<Option<Unlink>>,
-    /// What the pills were last built from.
-    links_shown: RefCell<Option<LinksShown>>,
     priority: gtk::MenuButton,
     priority_icon: gtk::Image,
     reminders: gtk::MenuButton,
     reminder_dot: gtk::Widget,
     menu: gtk::MenuButton,
+    /// The place picker's shared state: its results list, and the places
+    /// found so far.
+    place_results: pickers::PlaceSlot,
+    places: Rc<RefCell<Vec<Place>>>,
     /// Setting fields from the task, not the user changing them.
     loading: Cell<bool>,
     title_timer: RefCell<Option<glib::SourceId>>,
     notes_timer: RefCell<Option<glib::SourceId>>,
 }
-
-/// A task's href, its links, the notes folder, whether it is open, and which
-/// notes are there.
-type LinksShown = (String, Vec<String>, Option<PathBuf>, bool, Vec<bool>);
-
-type Unlink = Rc<dyn Fn(String)>;
 
 fn text_of(view: &gtk::TextView) -> String {
     let b = view.buffer();
@@ -136,13 +120,6 @@ impl Editor {
         notes.add_css_class("editor-notes");
         crate::notes::enhance(&notes);
         below.append(&notes);
-        let pills = adw::WrapBox::builder()
-            .child_spacing(6)
-            .line_spacing(6)
-            .visible(false)
-            .build();
-        pills.add_css_class("note-pills");
-        below.append(&pills);
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         actions.add_css_class("editor-actions");
@@ -193,10 +170,6 @@ impl Editor {
         right.set_hexpand(true);
         right.set_halign(gtk::Align::End);
         right.append(&list);
-        let (link, link_box, link_dot) = dotted("chain-link-loose-symbolic", "Link");
-        right.append(&link_box);
-        let (linked, linked_box, linked_dot) = dotted("mail-attachment-symbolic", "Linked notes");
-        right.append(&linked_box);
         let priority_icon = gtk::Image::from_icon_name("flag-outline-thick-symbolic");
         let priority = gtk::MenuButton::builder()
             .child(&priority_icon)
@@ -233,19 +206,13 @@ impl Editor {
             list,
             list_ring,
             list_label,
-            link,
-            link_dot,
-            pills,
-            linked,
-            linked_dot,
-            notes_dir: RefCell::default(),
-            unlink: RefCell::default(),
-            links_shown: RefCell::default(),
             priority,
             priority_icon,
             reminders,
             reminder_dot,
             menu,
+            place_results: Rc::default(),
+            places: Rc::default(),
             loading: Cell::new(false),
             title_timer: RefCell::default(),
             notes_timer: RefCell::default(),
@@ -262,51 +229,6 @@ impl Editor {
                 f(&e);
             }
         }
-    }
-
-    /// `with`, for a callback that takes something.
-    fn with_arg<T: 'static>(
-        self: &Rc<Self>,
-        f: impl Fn(&Rc<Editor>, T) + 'static,
-    ) -> Rc<dyn Fn(T)> {
-        let weak = Rc::downgrade(self);
-        Rc::new(move |arg| {
-            if let Some(e) = weak.upgrade() {
-                f(&e, arg);
-            }
-        })
-    }
-
-    /// Where linked notes are: the daemon's notes folder.
-    pub fn set_notes_dir(&self, dir: Option<PathBuf>) {
-        *self.notes_dir.borrow_mut() = dir;
-        if let Some(t) = self.task.borrow().as_ref() {
-            self.show_links(t);
-        }
-    }
-
-    fn show_links(&self, t: &TaskView) {
-        let links = &t.task.linked_notes;
-        let dir = self.notes_dir.borrow().clone();
-        let open = t.task.is_open();
-        let found = links
-            .iter()
-            .map(|l| dir.as_ref().is_some_and(|d| d.join(l).exists()))
-            .collect();
-        let key = (t.href.clone(), links.clone(), dir.clone(), open, found);
-        // Built again only when something changed, so a click isn't lost
-        // to a rebuild under the pointer.
-        if self.links_shown.borrow().as_ref() != Some(&key) {
-            let unlink = self.unlink.borrow().clone().filter(|_| open);
-            linked::fill(&self.pills, dir.as_deref(), links, unlink);
-            *self.links_shown.borrow_mut() = Some(key);
-        }
-        self.linked_dot.set_visible(!links.is_empty());
-        let names: Vec<&str> = links.iter().map(|l| note_files::name(l)).collect();
-        self.linked.set_tooltip_text(Some(&match names.as_slice() {
-            [] => "Linked notes".to_string(),
-            names => names.join(", "),
-        }));
     }
 
     fn connect(self: &Rc<Self>, collapse: &gtk::Button, clear: &gtk::Button, date_box: &gtk::Box) {
@@ -493,85 +415,6 @@ impl Editor {
         }
         {
             let weak = Rc::downgrade(self);
-            self.link.set_create_popup_func(move |mb| {
-                let Some(e) = weak.upgrade() else { return };
-                let Some(t) = e.task.borrow().clone() else {
-                    return;
-                };
-                let tx = e.tx.clone();
-                let href = t.href.clone();
-                mb.set_popover(Some(&pickers::link_popover(
-                    t.task.url.as_deref(),
-                    move |url| {
-                        tx.emit(Msg::Edit(
-                            href.clone(),
-                            Box::new(Change {
-                                url: Some(url),
-                                ..Change::default()
-                            }),
-                        ))
-                    },
-                )));
-            });
-        }
-        {
-            let unlink = self.with_arg(|e, link: String| {
-                if let Some(t) = e.task.borrow().clone() {
-                    let links = t
-                        .task
-                        .linked_notes
-                        .into_iter()
-                        .filter(|l| *l != link)
-                        .collect();
-                    e.tx.emit(Msg::Edit(
-                        t.href,
-                        Box::new(Change {
-                            linked_notes: Some(links),
-                            ..Change::default()
-                        }),
-                    ));
-                }
-            });
-            *self.unlink.borrow_mut() = Some(unlink);
-        }
-        {
-            let weak = Rc::downgrade(self);
-            self.linked.set_create_popup_func(move |mb| {
-                let Some(e) = weak.upgrade() else { return };
-                let Some(t) = e.task.borrow().clone() else {
-                    return;
-                };
-                let (tx, href) = (e.tx.clone(), t.href.clone());
-                let links = t.task.linked_notes;
-                let dir = e.notes_dir.borrow().clone();
-                let shown = links.clone();
-                mb.set_popover(Some(&linked::popover(
-                    dir.as_deref(),
-                    &shown,
-                    move |pick| {
-                        let links = match pick {
-                            Pick::New(title) => {
-                                tx.emit(Msg::NewNote(href.clone(), title.unwrap_or_default()));
-                                return;
-                            }
-                            Pick::Attach(path) => links.iter().cloned().chain([path]).collect(),
-                            Pick::Detach(path) => {
-                                links.iter().filter(|l| **l != path).cloned().collect()
-                            }
-                        };
-                        tx.emit(Msg::Edit(
-                            href.clone(),
-                            Box::new(Change {
-                                linked_notes: Some(links),
-                                ..Change::default()
-                            }),
-                        ));
-                    },
-                )));
-            });
-        }
-        {
-            let weak = Rc::downgrade(self);
             self.priority.set_create_popup_func(move |mb| {
                 let Some(e) = weak.upgrade() else { return };
                 let Some(t) = e.task.borrow().clone() else {
@@ -601,15 +444,53 @@ impl Editor {
                 };
                 let tx = e.tx.clone();
                 let href = t.href.clone();
-                mb.set_popover(Some(&pickers::reminder_popover(&t.task, move |triggers| {
-                    tx.emit(Msg::Edit(
-                        href.clone(),
-                        Box::new(Change {
-                            alarms: Some(triggers),
-                            ..Change::default()
-                        }),
-                    ))
-                })));
+                mb.set_popover(Some(&pickers::reminder_popover(
+                    &t.task,
+                    {
+                        let tx = tx.clone();
+                        move |triggers, locations| {
+                            tx.emit(Msg::Edit(
+                                href.clone(),
+                                Box::new(Change {
+                                    alarms: Some(triggers),
+                                    location_alarms: locations,
+                                    ..Change::default()
+                                }),
+                            ))
+                        }
+                    },
+                    Some(pickers::PlaceSearch {
+                        search: {
+                            let tx = tx.clone();
+                            Rc::new(move |query: String| tx.emit(Msg::PlaceSearch(query)))
+                        },
+                        picked: {
+                            let weak = weak.clone();
+                            Rc::new(move |place: Place| {
+                                let Some(e) = weak.upgrade() else { return };
+                                let Some(t) = e.task.borrow().clone() else { return };
+                                let mut list = t.task.location_alarms.clone();
+                                list.push(LocationAlarm {
+                                    uid: String::new(),
+                                    title: place.name,
+                                    address: place.display_name,
+                                    lat: place.lat,
+                                    lon: place.lon,
+                                    radius: 100,
+                                });
+                                e.tx.emit(Msg::Edit(
+                                    t.href,
+                                    Box::new(Change {
+                                        location_alarms: Some(list),
+                                        ..Change::default()
+                                    }),
+                                ));
+                            })
+                        },
+                        results: e.place_results.clone(),
+                        places: e.places.clone(),
+                    }),
+                )));
             });
         }
         {
@@ -929,26 +810,27 @@ impl Editor {
             .append(&ui::ring(list.and_then(|l| l.color.as_deref()), 14));
         self.list_label.set_text(&t.list_name);
 
-        self.link_dot.set_visible(t.task.url.is_some());
-        self.link
-            .set_tooltip_text(Some(t.task.url.as_deref().unwrap_or("Link")));
-        self.show_links(t);
-        self.reminder_dot.set_visible(!t.task.alarms.is_empty());
-        let reminders = match t.task.alarms.as_slice() {
+        self.reminder_dot
+            .set_visible(!t.task.alarms.is_empty() || !t.task.location_alarms.is_empty());
+        let mut reminders = match t.task.alarms.as_slice() {
             [] => "Reminders".to_string(),
             [one] => model::reminder_label(&one.trigger, &t.task, now),
             many => format!("{} reminders", many.len()),
         };
+        let places = t.task.location_alarms.len();
+        if places > 0 {
+            reminders = if reminders == "Reminders" {
+                match places {
+                    1 => format!("On arrival at {}", t.task.location_alarms[0].title),
+                    n => format!("{n} location reminders"),
+                }
+            } else {
+                format!("{reminders}, {places} location")
+            };
+        }
         self.reminders.set_tooltip_text(Some(&reminders));
 
-        for w in [
-            &self.date,
-            &self.list,
-            &self.link,
-            &self.linked,
-            &self.priority,
-            &self.reminders,
-        ] {
+        for w in [&self.date, &self.list, &self.priority, &self.reminders] {
             w.set_sensitive(open);
         }
     }
@@ -969,13 +851,19 @@ impl Editor {
         buffer.insert_at_cursor("\n");
     }
 
+    /// Place search results arrived: show them in the picker, if it is open.
+    pub fn show_places(&self, places: Vec<Place>) {
+        *self.places.borrow_mut() = places;
+        if let Some((list, picked)) = self.place_results.borrow().as_ref() {
+            pickers::fill_places(list, &self.places.borrow(), picked);
+        }
+    }
+
     /// Open a button's picker, for scripted checks.
     pub fn popup(&self, which: &str) -> bool {
         let button = match which {
             "date" => &self.date,
             "list" => &self.list,
-            "link" => &self.link,
-            "notes" => &self.linked,
             "priority" => &self.priority,
             "reminders" => &self.reminders,
             "menu" => &self.menu,

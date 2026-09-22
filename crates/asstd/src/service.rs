@@ -146,10 +146,6 @@ impl Service {
         json(&self.daemon.links().map_err(failed)?)
     }
 
-    async fn new_note(&self, id: &str, title: &str) -> fdo::Result<String> {
-        json(&self.daemon.new_note(id, title).map_err(failed)?)
-    }
-
     async fn settings(&self) -> fdo::Result<String> {
         json(&self.daemon.settings())
     }

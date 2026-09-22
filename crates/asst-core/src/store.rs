@@ -96,9 +96,6 @@ pub struct Query {
     pub text: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Only tasks linking this note (a path in the notes folder).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub linked_note: Option<String>,
 }
 
 pub struct Store {
@@ -152,6 +149,8 @@ CREATE TABLE IF NOT EXISTS gh_pairs (
   uid TEXT NOT NULL,
   title TEXT NOT NULL,
   open INTEGER NOT NULL,
+  body TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (repo, number)
 );
 ";
@@ -188,6 +187,19 @@ impl Store {
     fn init(conn: Connection, zone: Tz) -> Result<Store> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // A store made before the GitHub merge carried body and priority:
+        // CREATE TABLE IF NOT EXISTS leaves the old columns as they are.
+        let has_body: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('gh_pairs') WHERE name = 'body'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_body == 0 {
+            conn.execute_batch(
+                "ALTER TABLE gh_pairs ADD COLUMN body TEXT;
+                 ALTER TABLE gh_pairs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         let mut store = Store { conn, zone };
         let stored: Option<String> = store.meta("zone")?;
         if stored.as_deref() != Some(zone.name()) {
@@ -770,10 +782,6 @@ impl Store {
         }
         sql.push_str(" AND (?2 IS NULL OR list = ?2)");
         sql.push_str(" AND (?3 IS NULL OR summary LIKE '%' || ?3 || '%' ESCAPE '\\' OR description LIKE '%' || ?3 || '%' ESCAPE '\\')");
-        if q.linked_note.is_some() {
-            // Narrowed here, matched exactly below.
-            sql.push_str(" AND json LIKE '%\"linked_notes\":%'");
-        }
         sql.push_str(match q.view {
             View::Completed => " ORDER BY completed_at DESC",
             _ => {
@@ -796,35 +804,11 @@ impl Store {
             View::Completed => 200,
             _ => 10_000,
         });
-        // The exact match comes after the query, so the limit does too.
-        let sql_limit = match q.linked_note {
-            Some(_) => i64::MAX,
-            None => i64::from(limit),
-        };
         let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<_> = stmt
-            .query_map(params![today, list, text, sql_limit], row_from_sql)?
+            .query_map(params![today, list, text, i64::from(limit)], row_from_sql)?
             .collect::<rusqlite::Result<_>>()?;
-        let mut rows = rows.into_iter().map(to_row).collect::<Result<Vec<Row>>>()?;
-        if let Some(note) = &q.linked_note {
-            rows.retain(|r| r.task.linked_notes.contains(note));
-            rows.truncate(limit as usize);
-        }
-        Ok(rows)
-    }
-
-    /// Every task with a linked note, open or not.
-    pub fn with_linked_notes(&self) -> Result<Vec<Row>> {
-        let sql = format!(
-            "SELECT {TASK_COLS} FROM tasks WHERE deleted = 0 AND json LIKE '%\"linked_notes\":%'"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows: Vec<_> = stmt
-            .query_map([], row_from_sql)?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut rows = rows.into_iter().map(to_row).collect::<Result<Vec<Row>>>()?;
-        rows.retain(|r| !r.task.linked_notes.is_empty());
-        Ok(rows)
+        rows.into_iter().map(to_row).collect()
     }
 
     pub fn uids(&self) -> Result<Vec<String>> {
@@ -834,6 +818,23 @@ impl Store {
         Ok(stmt
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Open tasks with at least one location alarm.
+    pub fn with_location_alarms(&self) -> Result<Vec<Row>> {
+        let sql = format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE deleted = 0 AND status IN ('needs-action', 'in-process')
+             AND json LIKE '%\"location_alarms\":%'"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<_> = stmt
+            .query_map([], row_from_sql)?
+            .collect::<rusqlite::Result<_>>()?;
+        let rows = rows.into_iter().map(to_row).collect::<Result<Vec<Row>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| !r.task.location_alarms.is_empty())
+            .collect())
     }
 
     /// Open tasks with at least one alarm.
@@ -949,7 +950,7 @@ impl Store {
 
     pub fn gh_pairs(&self, repo: &str) -> Result<Vec<Pair>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT number, uid, title, open FROM gh_pairs WHERE repo = ?1 ORDER BY number",
+            "SELECT number, uid, title, open, body, priority FROM gh_pairs WHERE repo = ?1 ORDER BY number",
         )?;
         Ok(stmt
             .query_map([repo], |r| {
@@ -958,6 +959,8 @@ impl Store {
                     uid: r.get(1)?,
                     title: r.get(2)?,
                     open: r.get(3)?,
+                    body: r.get(4)?,
+                    priority: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -966,9 +969,11 @@ impl Store {
     /// Pair an issue with a task, or remember what a pair agreed on now.
     pub fn gh_pair(&self, repo: &str, p: &Pair) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO gh_pairs(repo, number, uid, title, open) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(repo, number) DO UPDATE SET uid = excluded.uid, title = excluded.title, open = excluded.open",
-            params![repo, p.number, p.uid, p.title, p.open],
+            "INSERT INTO gh_pairs(repo, number, uid, title, open, body, priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(repo, number) DO UPDATE SET uid = excluded.uid, title = excluded.title,
+               open = excluded.open, body = excluded.body, priority = excluded.priority",
+            params![repo, p.number, p.uid, p.title, p.open, p.body, p.priority],
         )?;
         Ok(())
     }
@@ -1047,8 +1052,7 @@ fn already_applied(expected: &Task, server: &Task, edits: &[Edit]) -> bool {
     edits.iter().all(|e| match e {
         Edit::Summary(_) => expected.summary == server.summary,
         Edit::Description(_) => expected.description == server.description,
-        Edit::Due(_) => expected.due == server.due && expected.start == server.start,
-        Edit::Start(_) => expected.start == server.start,
+        Edit::Due(_) => expected.due == server.due,
         Edit::Priority(_) => expected.priority == server.priority,
         Edit::Complete(_) | Edit::Reopen => {
             expected.status == server.status
@@ -1065,13 +1069,10 @@ fn already_applied(expected: &Task, server: &Task, edits: &[Edit]) -> bool {
             };
             triggers(expected) == triggers(server)
         }
-        Edit::Acknowledge(_) => true,
-        Edit::Categories(_) => expected.categories == server.categories,
+        Edit::LocationAlarms(_) => expected.location_alarms == server.location_alarms,
         Edit::Parent(_) => expected.parent == server.parent,
-        Edit::Url(_) => expected.url == server.url,
         Edit::Source(_) => expected.source == server.source,
         Edit::SortOrder(_) => expected.sort_order == server.sort_order,
-        Edit::LinkedNotes(_) => expected.linked_notes == server.linked_notes,
     })
 }
 
@@ -1249,10 +1250,7 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             .unwrap();
         s.create(
             "work",
-            &[
-                Edit::Summary("Someday".into()),
-                Edit::LinkedNotes(vec!["Trips/Japan.md".into()]),
-            ],
+            &[Edit::Summary("Someday".into())],
             now(),
         )
         .unwrap();
@@ -1265,7 +1263,6 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             list: list.map(str::to_string),
             text: text.map(str::to_string),
             limit: None,
-            linked_note: None,
         };
         let names = |rows: Vec<Row>| rows.into_iter().map(|r| r.task.summary).collect::<Vec<_>>();
         assert_eq!(
@@ -1280,16 +1277,6 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             names(s.query(&q(View::Open, None, Some("mil")), today).unwrap()),
             vec!["Buy milk"]
         );
-        let linking = |note: &str| Query {
-            linked_note: Some(note.into()),
-            ..q(View::Open, None, None)
-        };
-        assert_eq!(
-            names(s.query(&linking("Trips/Japan.md"), today).unwrap()),
-            vec!["Someday"]
-        );
-        assert!(s.query(&linking("Trips"), today).unwrap().is_empty());
-        assert_eq!(s.with_linked_notes().unwrap().len(), 1);
         assert_eq!(s.find(&row.task.uid[..6]).unwrap().href, row.href);
         assert_eq!(s.find("abc-1").unwrap().task.summary, "Buy milk");
         assert!(matches!(s.find("zzz"), Err(StoreError::NotFound(_))));
@@ -1382,6 +1369,8 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             uid: one.task.uid.clone(),
             title: title.into(),
             open,
+            body: None,
+            priority: 0,
         };
         s.gh_link("jaehho/asst", "/cal/work/").unwrap();
         s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();

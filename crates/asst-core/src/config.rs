@@ -37,8 +37,6 @@ pub struct Config {
     pub alarm_at_due: bool,
     /// Minutes before the due time that reminder rings.
     pub alarm_before: u32,
-    /// The folder of notes a task can link to; `~/Nextcloud/Notes` if unset.
-    pub notes: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -50,7 +48,6 @@ impl Default for Config {
             snooze: DEFAULT_SNOOZE.to_vec(),
             alarm_at_due: true,
             alarm_before: 0,
-            notes: None,
         }
     }
 }
@@ -121,17 +118,6 @@ pub fn state_dir() -> PathBuf {
 }
 
 impl Config {
-    /// The notes folder, with a leading `~` read as the home folder.
-    pub fn notes_dir(&self) -> PathBuf {
-        match &self.notes {
-            Some(path) => match path.strip_prefix("~") {
-                Ok(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
-                Err(_) => path.clone(),
-            },
-            None => crate::note_files::default_dir(),
-        }
-    }
-
     pub fn load() -> Result<Config, ConfigError> {
         let path = config_path();
         match std::fs::read_to_string(&path) {

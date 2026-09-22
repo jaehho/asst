@@ -43,6 +43,22 @@ pub struct Alarm {
     pub acknowledged: Option<DateTime<Utc>>,
 }
 
+/// A reminder that fires on arrival at a place, the way iOS writes it: a
+/// VALARM with `X-APPLE-PROXIMITY` and an `X-APPLE-STRUCTURED-LOCATION`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationAlarm {
+    /// The VALARM's UID, the key the reminder state is kept under.
+    pub uid: String,
+    /// The place's name, from `X-TITLE`.
+    pub title: String,
+    /// The address as written, from `X-ADDRESS` (often the same as the title).
+    pub address: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// How close counts as arrived, in metres (Apple's default: 100).
+    pub radius: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub uid: String,
@@ -57,23 +73,16 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<When>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start: Option<When>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rrule: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alarms: Vec<Alarm>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub categories: Vec<String>,
+    pub location_alarms: Vec<LocationAlarm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
     /// Where the task came from (`steno:<session>/<key>`), asst's own X- property.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Notes linked to it: paths in the notes folder (see `note_files`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub linked_notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,10 +92,10 @@ pub struct Task {
 }
 
 pub const SOURCE: &str = "X-ASST-SOURCE";
-/// A linked note, one property each.
-pub const NOTE: &str = "X-ASST-NOTE";
 /// The manual order iOS keeps within a list.
 const SORT_ORDER: &str = "X-APPLE-SORT-ORDER";
+/// A location alarm's place, on a VALARM.
+const STRUCTURED_LOCATION: &str = "X-APPLE-STRUCTURED-LOCATION";
 
 /// 1976-04-01T00:55:45Z, Apple's founding: iOS's placeholder trigger.
 const IOS_NO_ALARM: DateTime<Utc> = match DateTime::from_timestamp(197_168_145, 0) {
@@ -154,7 +163,6 @@ impl Task {
                 .filter(|p| *p <= 9)
                 .unwrap_or(0),
             due: todo.property("DUE").and_then(When::from_property),
-            start: todo.property("DTSTART").and_then(When::from_property),
             rrule: todo.property("RRULE").map(|p| p.value().trim().to_string()),
             alarms: todo
                 .components()
@@ -169,19 +177,13 @@ impl Task {
                     })
                 })
                 .collect(),
-            categories: todo
-                .properties_named("CATEGORIES")
-                .flat_map(Property::text_values)
-                .filter(|c| !c.is_empty())
+            location_alarms: todo
+                .components()
+                .filter(|c| c.is("VALARM"))
+                .filter_map(location_alarm)
                 .collect(),
             parent,
-            url: todo.property("URL").map(|p| p.value().trim().to_string()),
             source: text(SOURCE),
-            linked_notes: todo
-                .properties_named(NOTE)
-                .map(Property::text_value)
-                .filter(|n| !n.trim().is_empty())
-                .collect(),
             sort_order: todo
                 .property(SORT_ORDER)
                 .and_then(|p| p.value().trim().parse().ok()),
@@ -215,12 +217,12 @@ impl Task {
     }
 
     fn alarm_instant(&self, a: &Alarm, local: Tz) -> Option<DateTime<Utc>> {
-        trigger_instant(&a.trigger, self.due.as_ref(), self.start.as_ref(), local)
+        trigger_instant(&a.trigger, self.due.as_ref(), local)
     }
 }
 
 /// A VALARM's trigger, when it goes off at a time: location alarms fire on
-/// arrival, and iOS parks a relative alarm on a dateless reminder at
+/// arrival instead, and iOS parks a relative alarm on a dateless reminder at
 /// `IOS_NO_ALARM`, meaning "no alarm".
 fn timed_trigger(alarm: &Component) -> Option<Trigger> {
     if alarm.property("X-APPLE-PROXIMITY").is_some() {
@@ -230,19 +232,83 @@ fn timed_trigger(alarm: &Component) -> Option<Trigger> {
         .filter(|t| *t != (Trigger::Absolute { at: IOS_NO_ALARM }))
 }
 
-/// When a trigger goes off, given the dates a relative one hangs on.
-fn trigger_instant(
-    trigger: &Trigger,
-    due: Option<&When>,
-    start: Option<&When>,
-    local: Tz,
-) -> Option<DateTime<Utc>> {
+/// A VALARM's place: `X-APPLE-PROXIMITY:ARRIVE` and an
+/// `X-APPLE-STRUCTURED-LOCATION` holding `geo:lat,lon?u=radius`.
+fn location_alarm(alarm: &Component) -> Option<LocationAlarm> {
+    if !alarm
+        .property("X-APPLE-PROXIMITY")?
+        .value()
+        .trim()
+        .eq_ignore_ascii_case("ARRIVE")
+    {
+        return None;
+    }
+    let loc = alarm.property(STRUCTURED_LOCATION)?;
+    let (lat, lon, radius) = {
+        let geo = loc.value().trim().strip_prefix("geo:")?;
+        let (xy, query) = geo.split_once('?').unwrap_or((geo, ""));
+        let (lat, lon) = xy.split_once(',')?;
+        let radius = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("u="))
+            .and_then(|u| u.trim_end_matches('m').parse::<u32>().ok())
+            .unwrap_or(100);
+        (
+            lat.trim().parse().ok()?,
+            lon.trim().parse().ok()?,
+            radius,
+        )
+    };
+    Some(LocationAlarm {
+        uid: alarm
+            .property("UID")
+            .map(|p| p.value().trim().to_string())
+            .unwrap_or_default(),
+        title: loc.param("X-TITLE").unwrap_or_default().to_string(),
+        address: loc.param("X-ADDRESS").unwrap_or_default().to_string(),
+        lat,
+        lon,
+        radius,
+    })
+}
+
+/// A location alarm as a VALARM iOS reads back: it matches on the UID.
+fn location_valarm(a: &LocationAlarm) -> Component {
+    let uid = if a.uid.is_empty() {
+        uuid::Uuid::new_v4().to_string().to_uppercase()
+    } else {
+        a.uid.clone()
+    };
+    let mut alarm = Component::new("VALARM");
+    alarm.set(Property::new("ACTION", "DISPLAY"));
+    alarm.set(Property::text(
+        "DESCRIPTION",
+        if a.title.is_empty() {
+            "Reminder"
+        } else {
+            &a.title
+        },
+    ));
+    alarm.set(Trigger::Absolute { at: IOS_NO_ALARM }.to_property());
+    alarm.set(Property::new("UID", uid.as_str()));
+    alarm.set(Property::new("X-WR-ALARMUID", uid.as_str()));
+    alarm.set(Property::new("X-APPLE-PROXIMITY", "ARRIVE"));
+    let loc = Property::new(
+        STRUCTURED_LOCATION,
+        format!("geo:{},{}?u={}", a.lat, a.lon, a.radius),
+    )
+    .with_param("VALUE", "URI")
+    .with_param("X-ADDRESS", if a.address.is_empty() { &a.title } else { &a.address })
+    .with_param("X-TITLE", if a.title.is_empty() { "Location" } else { &a.title });
+    alarm.set(loc);
+    alarm
+}
+
+/// When a trigger goes off, given the date a relative one hangs on.
+fn trigger_instant(trigger: &Trigger, due: Option<&When>, local: Tz) -> Option<DateTime<Utc>> {
     match trigger {
         Trigger::Absolute { at } => Some(*at),
-        Trigger::Relative { offset, from_due } => {
-            let base = if *from_due { due } else { start.or(due) };
-            base.map(|w| alarm_base(w, local) + *offset)
-        }
+        Trigger::Relative { offset, .. } => due.map(|w| alarm_base(w, local) + *offset),
     }
 }
 
@@ -266,7 +332,6 @@ pub enum Edit {
     Summary(String),
     Description(Option<String>),
     Due(Option<When>),
-    Start(Option<When>),
     Priority(u8),
     /// Complete it; a recurring task moves to its next occurrence instead.
     Complete(DateTime<Utc>),
@@ -274,16 +339,12 @@ pub enum Edit {
     Rrule(Option<String>),
     /// Exactly these alarms: matching VALARMs are kept as they are.
     Alarms(Vec<Trigger>),
-    /// Dismissed: every alarm up to now is done with.
-    Acknowledge(DateTime<Utc>),
-    Categories(Vec<String>),
+    /// Exactly these location alarms, in this order.
+    LocationAlarms(Vec<LocationAlarm>),
     Parent(Option<String>),
-    Url(Option<String>),
     Source(Option<String>),
     /// X-APPLE-SORT-ORDER: the manual order within a list, ascending.
     SortOrder(Option<i64>),
-    /// Exactly these linked notes, in this order.
-    LinkedNotes(Vec<String>),
 }
 
 /// A new, empty task object.
@@ -376,7 +437,7 @@ pub fn apply(
 }
 
 fn apply_one(ical: &mut Ical, edit: &Edit, local: Tz) -> Result<(), EditError> {
-    if let Edit::Due(Some(w)) | Edit::Start(Some(w)) = edit {
+    if let Edit::Due(Some(w)) = edit {
         ensure_vtimezone(ical, w);
     }
     let todo = ical.todo_mut().ok_or(EditError::NoTodo)?;
@@ -384,12 +445,6 @@ fn apply_one(ical: &mut Ical, edit: &Edit, local: Tz) -> Result<(), EditError> {
         Edit::Summary(s) => todo.set(Property::text("SUMMARY", s)),
         Edit::Description(d) => set_text(todo, "DESCRIPTION", d.as_deref()),
         Edit::Due(due) => set_due(todo, due.as_ref(), local),
-        Edit::Start(start) => match start {
-            Some(w) => todo.set(w.to_property("DTSTART")),
-            None => {
-                todo.remove("DTSTART");
-            }
-        },
         // iOS writes 1/5/9 and leaves the property out for "none".
         Edit::Priority(0) => {
             todo.remove("PRIORITY");
@@ -411,20 +466,20 @@ fn apply_one(ical: &mut Ical, edit: &Edit, local: Tz) -> Result<(), EditError> {
             }
         },
         Edit::Alarms(triggers) => set_alarms(todo, triggers),
-        Edit::Acknowledge(at) => {
-            for alarm in todo.components_mut().filter(|c| c.is("VALARM")) {
-                alarm.set(Property::new("ACKNOWLEDGED", format_utc(at)));
-            }
-        }
-        Edit::Categories(cats) => {
-            todo.remove("CATEGORIES");
-            if !cats.is_empty() {
-                let value = cats
-                    .iter()
-                    .map(|c| crate::ical::escape_text(c))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                todo.set(Property::new("CATEGORIES", value));
+        Edit::LocationAlarms(alarms) => {
+            let now: Vec<LocationAlarm> = todo
+                .components()
+                .filter(|c| c.is("VALARM"))
+                .filter_map(location_alarm)
+                .collect();
+            if now != *alarms {
+                // The others stay: matching is by UID, so iOS keeps its own.
+                todo.retain_components(|c| {
+                    !(c.is("VALARM") && c.property("X-APPLE-PROXIMITY").is_some())
+                });
+                for a in alarms {
+                    todo.push(location_valarm(a));
+                }
             }
         }
         Edit::Parent(parent) => {
@@ -444,12 +499,6 @@ fn apply_one(ical: &mut Ical, edit: &Edit, local: Tz) -> Result<(), EditError> {
                 todo.add(Property::new("RELATED-TO", uid.as_str()));
             }
         }
-        Edit::Url(url) => match url {
-            Some(u) => todo.set(Property::new("URL", u.as_str()).with_param("VALUE", "URI")),
-            None => {
-                todo.remove("URL");
-            }
-        },
         Edit::Source(s) => set_text(todo, SOURCE, s.as_deref()),
         Edit::SortOrder(order) => match order {
             Some(n) => todo.set(Property::new(SORT_ORDER, n.to_string())),
@@ -457,18 +506,6 @@ fn apply_one(ical: &mut Ical, edit: &Edit, local: Tz) -> Result<(), EditError> {
                 todo.remove(SORT_ORDER);
             }
         },
-        Edit::LinkedNotes(notes) => {
-            let now: Vec<String> = todo
-                .properties_named(NOTE)
-                .map(Property::text_value)
-                .collect();
-            if now != *notes {
-                todo.remove(NOTE);
-                for note in notes {
-                    todo.add(Property::text(NOTE, note));
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -511,14 +548,10 @@ fn ensure_vtimezone(ical: &mut Ical, w: &When) {
     }
 }
 
-/// DUE, keeping DTSTART consistent. iOS always writes DTSTART equal to DUE
-/// (and ignores DTSTART otherwise); RFC 5545 wants the same value type on
-/// both, DTSTART not after DUE, and DTSTART to anchor any RRULE. So DTSTART
-/// follows DUE unless another client set a genuinely earlier start.
+/// DUE. DTSTART is other clients' business: iOS keeps it equal to DUE and
+/// ignores it otherwise, so asst never reads or writes it and it rides along.
 fn set_due(todo: &mut Component, due: Option<&When>, local: Tz) {
     let old_due = todo.property("DUE").and_then(When::from_property);
-    let old_start = todo.property("DTSTART").and_then(When::from_property);
-    let start_tracks_due = old_start.is_none() || old_start == old_due;
     let at_old_due = |t: &Option<Trigger>, old: &Option<When>| match (t, old) {
         (Some(Trigger::Absolute { at }), Some(old)) => *at == old.instant(local),
         _ => false,
@@ -526,21 +559,10 @@ fn set_due(todo: &mut Component, due: Option<&When>, local: Tz) {
     match due {
         None => {
             todo.remove("DUE");
-            if start_tracks_due {
-                todo.remove("DTSTART");
-            }
             retain_alarms(todo, |t| !at_old_due(&t, &old_due));
         }
         Some(new) => {
             todo.set(new.to_property("DUE"));
-            let keep_start = old_start.as_ref().is_some_and(|start| {
-                !start_tracks_due
-                    && start.has_time() == new.has_time()
-                    && start.instant(local) <= new.instant(local)
-            });
-            if !keep_start {
-                todo.set(new.to_property("DTSTART"));
-            }
             if !new.has_time() {
                 // "Remind me when it's due" has no time to go off at any more.
                 retain_alarms(todo, |t| !at_old_due(&t, &old_due));
@@ -567,7 +589,9 @@ fn set_due(todo: &mut Component, due: Option<&When>, local: Tz) {
 
 fn retain_alarms(todo: &mut Component, mut keep: impl FnMut(Option<Trigger>) -> bool) {
     todo.retain_components(|c| {
-        !c.is("VALARM") || keep(c.property("TRIGGER").and_then(Trigger::from_property))
+        !c.is("VALARM")
+            || c.property("X-APPLE-PROXIMITY").is_some()
+            || keep(c.property("TRIGGER").and_then(Trigger::from_property))
     });
 }
 
@@ -596,12 +620,7 @@ fn set_alarms(todo: &mut Component, triggers: &[Trigger]) {
 
 fn complete(todo: &mut Component, at: DateTime<Utc>, local: Tz) -> Result<(), EditError> {
     let rule = todo.property("RRULE").map(|p| p.value().trim().to_string());
-    let anchor_name = if todo.property("DTSTART").is_some() {
-        "DTSTART"
-    } else {
-        "DUE"
-    };
-    let anchor = todo.property(anchor_name).and_then(When::from_property);
+    let anchor = todo.property("DUE").and_then(When::from_property);
     if let (Some(rule), Some(anchor)) = (rule, anchor) {
         // The occurrence after this one, even when its date has gone by too:
         // as on iOS, each missed date is its own completion.
@@ -627,18 +646,15 @@ fn complete(todo: &mut Component, at: DateTime<Utc>, local: Tz) -> Result<(), Ed
     Ok(())
 }
 
-/// Move DTSTART, DUE and absolute alarms by the same amount. The moved
+/// Move DUE and absolute alarms by the same amount. The moved
 /// alarms ring again, except those already past at `now`: an occurrence
 /// that was missed has nothing left to remind of.
 fn shift(todo: &mut Component, delta: Duration, now: DateTime<Utc>, local: Tz) {
-    for name in ["DTSTART", "DUE"] {
-        if let Some(w) = todo.property(name).and_then(When::from_property) {
-            let moved = w.with_instant(w.instant(local) + delta, local);
-            todo.set(moved.to_property(name));
-        }
+    if let Some(w) = todo.property("DUE").and_then(When::from_property) {
+        let moved = w.with_instant(w.instant(local) + delta, local);
+        todo.set(moved.to_property("DUE"));
     }
     let due = todo.property("DUE").and_then(When::from_property);
-    let start = todo.property("DTSTART").and_then(When::from_property);
     for alarm in todo.components_mut().filter(|c| c.is("VALARM")) {
         let Some(mut trigger) = timed_trigger(alarm) else {
             continue;
@@ -647,7 +663,7 @@ fn shift(todo: &mut Component, delta: Duration, now: DateTime<Utc>, local: Tz) {
             *at += delta;
             alarm.set(trigger.to_property());
         }
-        match trigger_instant(&trigger, due.as_ref(), start.as_ref(), local) {
+        match trigger_instant(&trigger, due.as_ref(), local) {
             Some(rings) if rings <= now => {
                 alarm.set(Property::new("ACKNOWLEDGED", format_utc(&now)));
             }
@@ -721,7 +737,7 @@ UID:6C2F3A0B\r\nX-WR-ALARMUID:6C2F3A0B\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALEND
     }
 
     #[test]
-    fn moving_the_due_date_carries_dtstart_and_the_due_alarm() {
+    fn moving_the_due_date_leaves_dtstart_alone_and_carries_the_due_alarm() {
         let new_due = When::Zoned {
             at: NaiveDate::from_ymd_opt(2026, 9, 16)
                 .unwrap()
@@ -730,13 +746,14 @@ UID:6C2F3A0B\r\nX-WR-ALARMUID:6C2F3A0B\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALEND
             tzid: "America/New_York".into(),
         };
         let (ical, t) = edited(IOS, &[Edit::Due(Some(new_due.clone()))]);
-        assert_eq!(t.due, Some(new_due.clone()));
-        assert_eq!(t.start, Some(new_due));
+        assert_eq!(t.due, Some(new_due));
         assert_eq!(
             t.alarm_instants(ny()),
             vec![Utc.with_ymd_and_hms(2026, 9, 16, 21, 30, 0).unwrap()]
         );
         let out = ical.to_string();
+        assert!(out.contains("DTSTART;TZID=America/New_York:20260915T090000\r\n"));
+        assert!(out.contains("DUE;TZID=America/New_York:20260916T173000\r\n"));
         assert!(
             out.contains("UID:6C2F3A0B\r\nX-WR-ALARMUID:6C2F3A0B\r\n"),
             "alarm identity kept: {out}"
@@ -745,20 +762,28 @@ UID:6C2F3A0B\r\nX-WR-ALARMUID:6C2F3A0B\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALEND
     }
 
     #[test]
-    fn clearing_the_due_date_drops_dtstart_and_the_due_alarm() {
+    fn clearing_the_due_date_drops_the_due_alarm_only() {
         let (ical, t) = edited(IOS, &[Edit::Due(None)]);
-        assert_eq!((t.due, t.start), (None, None));
+        assert_eq!(t.due, None);
         assert!(t.alarms.is_empty());
-        assert!(!ical.to_string().contains("VALARM"));
+        let out = ical.to_string();
+        assert!(!out.contains("VALARM"));
+        assert!(out.contains("DTSTART;TZID=America/New_York:20260915T090000\r\n"));
     }
 
     #[test]
-    fn date_only_due_rewrites_a_timed_dtstart() {
+    fn a_date_only_due_leaves_dtstart_as_it_was() {
         let date = When::Date {
             date: NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
         };
-        let (_, t) = edited(IOS, &[Edit::Due(Some(date.clone()))]);
-        assert_eq!(t.start, Some(date));
+        let (ical, t) = edited(IOS, &[Edit::Due(Some(date))]);
+        assert_eq!(
+            t.due,
+            Some(When::Date {
+                date: NaiveDate::from_ymd_opt(2026, 9, 20).unwrap()
+            })
+        );
+        assert!(ical.to_string().contains("DTSTART;TZID=America/New_York:20260915T090000\r\n"));
     }
 
     #[test]
@@ -829,8 +854,7 @@ UID:6C2F3A0B\r\nX-WR-ALARMUID:6C2F3A0B\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALEND
                 .unwrap(),
             tzid: "America/New_York".into(),
         };
-        assert_eq!(t.due, Some(next.clone()));
-        assert_eq!(t.start, Some(next));
+        assert_eq!(t.due, Some(next));
         assert_eq!(
             t.alarm_instants(ny()),
             vec![Utc.with_ymd_and_hms(2026, 9, 22, 13, 0, 0).unwrap()]
@@ -948,19 +972,100 @@ DUE;VALUE=DATE:20260910\r\nRRULE:FREQ=DAILY;INTERVAL=2\r\nEND:VTODO\r\nEND:VCALE
     }
 
     #[test]
-    fn ios_placeholder_and_location_alarms_are_not_alarms() {
-        let src = IOS
-            .replace("TRIGGER;VALUE=DATE-TIME:20260915T130000Z", "TRIGGER;VALUE=DATE-TIME:19760401T005545Z")
-            .replace(
-                "END:VALARM\r\n",
-                "END:VALARM\r\nBEGIN:VALARM\r\nX-APPLE-PROXIMITY:ARRIVE\r\nTRIGGER;VALUE=DATE-TIME:20260915T130000Z\r\nEND:VALARM\r\n",
-            );
-        assert!(
-            Task::from_ical(&Ical::parse(&src))
-                .unwrap()
-                .alarms
-                .is_empty()
+    fn a_location_alarm_is_parsed_but_not_timed() {
+        let src = IOS.replace(
+            "END:VALARM\r\n",
+            "END:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Home\r\n\
+TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nUID:LOC-1\r\nX-WR-ALARMUID:LOC-1\r\n\
+X-APPLE-PROXIMITY:ARRIVE\r\n\
+X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS=\"1 Main St, Springfield\";X-TITLE=Home:geo:40.7,-74.0?u=50\r\n\
+END:VALARM\r\n",
         );
+        let t = Task::from_ical(&Ical::parse(&src)).unwrap();
+        assert_eq!(t.alarms.len(), 1, "the timed alarm stays timed");
+        assert_eq!(t.alarm_instants(ny()).len(), 1);
+        assert_eq!(
+            t.location_alarms,
+            vec![LocationAlarm {
+                uid: "LOC-1".into(),
+                title: "Home".into(),
+                address: "1 Main St, Springfield".into(),
+                lat: 40.7,
+                lon: -74.0,
+                radius: 50,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_location_alarm_without_a_radius_reads_100_m() {
+        let src = IOS.replace(
+            "END:VALARM\r\n",
+            "END:VALARM\r\nBEGIN:VALARM\r\nX-APPLE-PROXIMITY:ARRIVE\r\n\
+TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nUID:LOC-2\r\n\
+X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Home:geo:40.7,-74.0\r\nEND:VALARM\r\n",
+        );
+        let t = Task::from_ical(&Ical::parse(&src)).unwrap();
+        assert_eq!(t.location_alarms[0].radius, 100);
+        assert_eq!(t.location_alarms[0].address, "");
+    }
+
+    #[test]
+    fn saving_timed_reminders_keeps_location_alarms() {
+        let src = IOS.replace(
+            "END:VALARM\r\n",
+            "END:VALARM\r\nBEGIN:VALARM\r\nX-APPLE-PROXIMITY:ARRIVE\r\n\
+TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nUID:LOC-2\r\n\
+X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Home:geo:40.7,-74.0\r\nEND:VALARM\r\n",
+        );
+        let (ical, t) = edited(&src, &[Edit::Alarms(Vec::new())]);
+        assert!(t.alarms.is_empty());
+        assert_eq!(t.location_alarms.len(), 1);
+        let out = ical.to_string();
+        assert!(out.contains("X-APPLE-PROXIMITY:ARRIVE\r\n"), "{out}");
+        assert!(out.contains("X-APPLE-STRUCTURED-LOCATION"));
+    }
+
+    #[test]
+    fn location_alarms_are_replaced_in_place_and_new_ones_get_uids() {
+        let src = IOS.replace(
+            "END:VALARM\r\n",
+            "END:VALARM\r\nBEGIN:VALARM\r\nX-APPLE-PROXIMITY:ARRIVE\r\n\
+TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nUID:LOC-2\r\n\
+X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Home:geo:40.7,-74.0\r\nEND:VALARM\r\n",
+        );
+        let keep = LocationAlarm {
+            uid: "LOC-2".into(),
+            title: "Home".into(),
+            address: "".into(),
+            lat: 40.7,
+            lon: -74.0,
+            radius: 100,
+        };
+        let (ical, t) = edited(
+            &src,
+            &[Edit::LocationAlarms(vec![
+                keep,
+                LocationAlarm {
+                    uid: String::new(),
+                    title: "Store".into(),
+                    address: "2 Elm St".into(),
+                    lat: 41.0,
+                    lon: -73.5,
+                    radius: 250,
+                },
+            ])],
+        );
+        assert_eq!(t.location_alarms.len(), 2);
+        assert_eq!(t.location_alarms[0].uid, "LOC-2");
+        assert!(t.location_alarms[1].uid.len() == 36, "a new UID");
+        let out = ical.to_string();
+        assert!(out.contains("u=250"), "{out}");
+        assert!(out.contains("UID:6C2F3A0B\r\n"), "the timed alarm stays: {out}");
+        assert_eq!(out.matches("X-APPLE-PROXIMITY:ARRIVE\r\n").count(), 2);
+        // Saving the same list again changes nothing.
+        let (again, _) = edited(&out, &[Edit::LocationAlarms(t.location_alarms)]);
+        assert_eq!(again.to_string(), out);
     }
 
     #[test]
@@ -981,29 +1086,6 @@ DUE;VALUE=DATE:20260910\r\nRRULE:FREQ=DAILY;INTERVAL=2\r\nEND:VTODO\r\nEND:VCALE
         );
         assert_eq!(t.source.as_deref(), Some("steno:2026-09-14/abc"));
         assert_eq!(t.parent.as_deref(), Some("P1"));
-    }
-
-    #[test]
-    fn linked_notes_are_their_own_lines() {
-        let notes = vec!["Trips/Japan, 2027.md".to_string(), "Visa.md".to_string()];
-        let (ical, t) = edited(IOS, &[Edit::LinkedNotes(notes.clone())]);
-        assert_eq!(t.linked_notes, notes);
-        let out = ical.to_string();
-        assert!(out.contains("X-ASST-NOTE:Trips/Japan\\, 2027.md\r\nX-ASST-NOTE:Visa.md\r\n"));
-        assert!(
-            out.contains("X-APPLE-SORT-ORDER:28\r\n"),
-            "the rest stays: {out}"
-        );
-
-        let (again, _) = edited(&out, &[Edit::LinkedNotes(notes)]);
-        assert_eq!(
-            again.to_string().matches("X-ASST-NOTE").count(),
-            2,
-            "the same links again change nothing"
-        );
-        let (ical, t) = edited(&out, &[Edit::LinkedNotes(Vec::new())]);
-        assert!(t.linked_notes.is_empty());
-        assert!(!ical.to_string().contains("X-ASST-NOTE"));
     }
 
     #[test]

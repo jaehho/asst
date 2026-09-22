@@ -1,9 +1,9 @@
 //! The sidebar, after Planify's: colored tiles for the views chosen in
-//! Preferences, then the account's lists with their colors and counts, each
-//! ring filled as far as the list is done. Tasks dragged onto a tile or a
-//! list land there; lists dragged among themselves take a new order.
+//! Preferences, then the account's lists with their color rings and counts.
+//! Tasks dragged onto a tile or a list land there; lists dragged among
+//! themselves take a new order.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use asst_core::api::{ListView, StatusView, SyncState};
@@ -29,8 +29,6 @@ struct ListRow {
     href: String,
     row: gtk::ListBoxRow,
     count: gtk::Label,
-    ring: gtk::DrawingArea,
-    done: Rc<Cell<f64>>,
 }
 
 /// What a dragged list carries.
@@ -369,23 +367,6 @@ impl Sidebar {
             } else {
                 r.row.remove_css_class("selected");
             }
-            if let Some(l) = st.lists.iter().find(|l| l.href == r.href) {
-                let all = l.open + l.done;
-                let done = if all == 0 {
-                    0.0
-                } else {
-                    l.done as f64 / all as f64
-                };
-                if (done - r.done.get()).abs() > f64::EPSILON {
-                    r.done.set(done);
-                    r.ring.queue_draw();
-                }
-                let tip = match (l.open, l.done) {
-                    (0, 0) => "No tasks".to_string(),
-                    (open, done) => format!("{open} open, {done} completed"),
-                };
-                r.ring.set_tooltip_text(Some(&tip));
-            }
         }
 
         match st.status {
@@ -542,9 +523,7 @@ impl Sidebar {
         for l in lists {
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             line.add_css_class("list-line");
-            let done = Rc::new(Cell::new(-1.0));
-            let ring = ui::progress_ring(l.color.as_deref(), 18, done.clone());
-            line.append(&ring);
+            line.append(&ui::ring(l.color.as_deref(), 18));
             let name = ui::label(&l.name, &[]);
             name.set_hexpand(true);
             line.append(&name);
@@ -596,8 +575,6 @@ impl Sidebar {
                 href: l.href.clone(),
                 row,
                 count,
-                ring,
-                done,
             });
         }
         *self.rows.borrow_mut() = rows;

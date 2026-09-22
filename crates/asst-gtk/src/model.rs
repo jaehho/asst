@@ -1036,17 +1036,14 @@ pub fn reminder_label(trigger: &Trigger, task: &Task, now: DateTime<Tz>) -> Stri
                 .as_ref()
                 .is_some_and(|d| d.has_time() && d.instant(zone) == *at) =>
         {
-            "At due time".into()
+            "At the due time".into()
         }
         Trigger::Absolute { at } => capitalize(&fmt::due_label(&When::Utc { at: *at }, now)),
-        Trigger::Relative { offset, from_due } => {
-            let what = if *from_due { "due time" } else { "start" };
-            match offset.num_seconds() {
-                0 => format!("At {what}"),
-                s if s < 0 => format!("{} before", span(*offset)),
-                _ => format!("{} after", span(*offset)),
-            }
-        }
+        Trigger::Relative { offset, .. } => match offset.num_seconds() {
+            0 => "At the due time".to_string(),
+            s if s < 0 => format!("{} before", span(*offset)),
+            _ => format!("{} after", span(*offset)),
+        },
     }
 }
 
@@ -1054,12 +1051,8 @@ pub fn reminder_label(trigger: &Trigger, task: &Task, now: DateTime<Tz>) -> Stri
 pub fn trigger_at(trigger: &Trigger, task: &Task, zone: Tz) -> Option<DateTime<Utc>> {
     match trigger {
         Trigger::Absolute { at } => Some(*at),
-        Trigger::Relative { offset, from_due } => {
-            let base = if *from_due {
-                task.due.as_ref()
-            } else {
-                task.start.as_ref().or(task.due.as_ref())
-            }?;
+        Trigger::Relative { offset, .. } => {
+            let base = task.due.as_ref()?;
             let at = match base {
                 // iOS rings an all-day reminder's relative alarms from 9:00.
                 When::Date { date } => {
@@ -1108,6 +1101,7 @@ mod tests {
             list: list.into(),
             list_name: list.trim_matches('/').into(),
             pending: false,
+            issue: None,
             task: Task {
                 uid: uid.into(),
                 summary: uid.into(),
@@ -1116,14 +1110,11 @@ mod tests {
                 completed: None,
                 priority: 0,
                 due,
-                start: None,
                 rrule: None,
                 alarms: Vec::new(),
-                categories: Vec::new(),
+                location_alarms: Vec::new(),
                 parent: None,
-                url: None,
                 source: None,
-                linked_notes: Vec::new(),
                 sort_order: None,
                 created: None,
                 modified: None,
@@ -1355,7 +1346,7 @@ mod tests {
             offset: Duration::zero(),
             from_due: true,
         };
-        assert_eq!(reminder_label(&at, &t, now()), "At due time");
+        assert_eq!(reminder_label(&at, &t, now()), "At the due time");
         let day = Trigger::Relative {
             offset: Duration::days(-1),
             from_due: true,
@@ -1367,7 +1358,7 @@ mod tests {
         };
         assert_eq!(reminder_label(&absolute, &t, now()), "Tomorrow 5pm");
         t.due = Some(due);
-        assert_eq!(reminder_label(&absolute, &t, now()), "At due time");
+        assert_eq!(reminder_label(&absolute, &t, now()), "At the due time");
     }
 
     #[test]

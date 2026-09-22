@@ -20,7 +20,7 @@ use relm4::gtk::{self, gdk, glib, pango};
 use crate::model::{self, capitalize};
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::window::{Msg, Tx};
-use crate::{linked, notes, ui};
+use crate::{notes, ui};
 
 /// Where a task added from the card goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +44,6 @@ pub struct AddCard {
     entry: gtk::Entry,
     notes: gtk::TextView,
     /// Notes the next tasks link to.
-    pills: adw::WrapBox,
-    linked: RefCell<Vec<String>>,
     chips: adw::WrapBox,
     date_button: gtk::MenuButton,
     date_label: gtk::Label,
@@ -104,13 +102,6 @@ impl AddCard {
         notes.add_css_class("add-notes");
         notes::enhance(&notes);
         root.append(&notes);
-        let pills = adw::WrapBox::builder()
-            .child_spacing(6)
-            .line_spacing(6)
-            .visible(false)
-            .build();
-        pills.add_css_class("note-pills");
-        root.append(&pills);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 3);
@@ -204,8 +195,6 @@ impl AddCard {
             root,
             entry: entry.clone(),
             notes,
-            pills,
-            linked: RefCell::default(),
             chips,
             date_button: date_button.clone(),
             date_label,
@@ -391,12 +380,13 @@ impl AddCard {
                 let weak = Rc::downgrade(&c);
                 mb.set_popover(Some(&pickers::reminder_popover(
                     &c.draft(),
-                    move |triggers| {
+                    move |triggers, _| {
                         if let Some(c) = weak.upgrade() {
                             c.chosen.borrow_mut().alarms = Some(triggers);
                             c.refresh();
                         }
                     },
+                    None,
                 )));
             });
         }
@@ -451,26 +441,6 @@ impl AddCard {
         self.refresh();
     }
 
-    /// Notes for the tasks added next to link, shown under the notes, each
-    /// with a cross to leave it out: full paths, or paths in the notes folder.
-    pub fn set_linked(self: &Rc<Self>, links: Vec<String>) {
-        *self.linked.borrow_mut() = links;
-        let weak = Rc::downgrade(self);
-        let unlink: Rc<dyn Fn(String)> = Rc::new(move |link| {
-            if let Some(c) = weak.upgrade() {
-                let rest: Vec<String> = c
-                    .linked
-                    .borrow()
-                    .iter()
-                    .filter(|l| **l != link)
-                    .cloned()
-                    .collect();
-                c.set_linked(rest);
-            }
-        });
-        linked::fill(&self.pills, None, &self.linked.borrow(), Some(unlink));
-    }
-
     /// Quick add's "Keep adding" button.
     pub fn show_keep(&self) {
         self.keep.set_visible(true);
@@ -486,8 +456,6 @@ impl AddCard {
         *self.chosen.borrow_mut() = Chosen::default();
         self.entry.set_text("");
         self.notes.buffer().set_text("");
-        self.linked.borrow_mut().clear();
-        linked::fill(&self.pills, None, &[], None);
         self.refresh();
     }
 
@@ -555,8 +523,8 @@ impl AddCard {
             completed: None,
             priority: 0,
             due,
-            start: None,
             rrule: None,
+            location_alarms: Vec::new(),
             alarms: chosen
                 .alarms
                 .iter()
@@ -566,11 +534,8 @@ impl AddCard {
                     acknowledged: None,
                 })
                 .collect(),
-            categories: Vec::new(),
             parent: None,
-            url: None,
             source: None,
-            linked_notes: Vec::new(),
             sort_order: None,
             created: None,
             modified: None,
@@ -747,8 +712,6 @@ impl AddCard {
             keep_dates: !self.read_dates.get(),
             description: Some(notes).filter(|n| !n.trim().is_empty()),
             alarms: chosen.alarms.clone(),
-            // They stay for the next task: several can come from one note.
-            linked_notes: self.linked.borrow().clone(),
             ..AddSpec::default()
         };
         match &chosen.schedule {

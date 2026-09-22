@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use asst_core::api::{
-    AddSpec, Added, Change, ListChange, ListSpec, ListView, NewNote, Settings, SettingsChange,
+    AddSpec, Added, Change, ListChange, ListSpec, ListView, Settings, SettingsChange,
     StatusView, SyncState, TaskView, query,
 };
 use asst_core::fmt;
@@ -170,9 +170,8 @@ pub enum Msg {
     CopyList(String),
     /// A task's iCalendar object, to a file.
     SaveIcs(String),
-    /// A new note linked to a task (href, title: empty for the task's), then
-    /// open it.
-    NewNote(String, String),
+    /// Search Nominatim for a place for a location reminder.
+    PlaceSearch(String),
     /// Ctrl+V: a task from the clipboard's text.
     Paste,
     /// The add card with this text in it.
@@ -284,7 +283,8 @@ pub enum Cmd {
     ListSaved(client::Result<ListView>),
     /// A task's iCalendar object, to save.
     Ics(String, client::Result<String>),
-    NoteMade(client::Result<NewNote>),
+    /// Places found for a location reminder's search.
+    Places(Result<Vec<asst_core::nominatim::Place>, String>),
     Closed,
 }
 
@@ -1354,9 +1354,13 @@ impl Component for Window {
                     Cmd::Ics(href, ics)
                 });
             }
-            Msg::NewNote(href, title) => {
+            Msg::PlaceSearch(query) => {
                 sender.oneshot_command(async move {
-                    Cmd::NoteMade(client::new_note(&href, &title).await)
+                    Cmd::Places(
+                        asst_core::nominatim::search(&query)
+                            .await
+                            .map_err(|e| e.to_string()),
+                    )
                 });
             }
             Msg::OpenTask(id) => {
@@ -1369,7 +1373,6 @@ impl Component for Window {
                 // the closed editor's notes would be: build it again instead.
                 if self.editing.is_none() {
                     w.editor = Editor::new(tx.clone());
-                    w.editor.set_notes_dir(self.notes_dir());
                     self.shown = 0;
                 }
             }
@@ -1594,7 +1597,6 @@ impl Component for Window {
             Cmd::Settings(result) => match result {
                 Ok(s) => {
                     self.settings = Some(s);
-                    w.editor.set_notes_dir(self.notes_dir());
                 }
                 Err(e) => {
                     if self.settings.is_some() {
@@ -1712,29 +1714,8 @@ impl Component for Window {
                 }
                 Err(e) => toast(w, &e),
             },
-            Cmd::NoteMade(result) => match result {
-                Ok(made) => {
-                    if let Some(t) = self
-                        .open
-                        .iter_mut()
-                        .chain(self.completed.iter_mut().flatten())
-                        .find(|t| t.href == made.task.href)
-                    {
-                        *t = made.task.clone();
-                        self.shown = 0;
-                    }
-                    crate::linked::open(
-                        std::path::Path::new(&made.file),
-                        Some(w.window.upcast_ref()),
-                    );
-                    toast(
-                        w,
-                        &format!(
-                            "Made “{}” in the notes folder",
-                            asst_core::note_files::name(&made.path)
-                        ),
-                    );
-                }
+            Cmd::Places(result) => match result {
+                Ok(places) => w.editor.show_places(places),
                 Err(e) => toast(w, &e),
             },
             Cmd::Ics(href, result) => match result {
@@ -2048,20 +2029,6 @@ impl Window {
         if let Some(d) = &change.description {
             t.task.description = d.clone();
         }
-        if let Some(u) = &change.url {
-            t.task.url = u.clone();
-        }
-        if let Some(links) = &change.linked_notes {
-            t.task.linked_notes = links.clone();
-        }
-    }
-
-    /// The daemon's notes folder, once its settings are in.
-    fn notes_dir(&self) -> Option<std::path::PathBuf> {
-        self.settings
-            .as_ref()
-            .map(|s| std::path::PathBuf::from(&s.notes))
-            .filter(|d| !d.as_os_str().is_empty())
     }
 
     fn toggle_selected(&mut self, href: &str) {
@@ -2847,30 +2814,6 @@ impl Window {
                 }
             }
             "add" => sender.input(Msg::ShowAdd(None)),
-            // Linked notes: `attach PATH` and `detach PATH` on the open task,
-            // `newnote [TITLE]` for it, `addattach PATH` in the add card.
-            "attach" | "detach" => {
-                let Some(t) = self.editing.as_deref().and_then(|h| self.find(h)).cloned() else {
-                    return;
-                };
-                let mut links = t.task.linked_notes.clone();
-                links.retain(|l| l != arg);
-                if verb == "attach" {
-                    links.push(arg.to_string());
-                }
-                sender.input(Msg::Edit(
-                    t.href,
-                    Box::new(Change {
-                        linked_notes: Some(links),
-                        ..Change::default()
-                    }),
-                ));
-            }
-            "newnote" => {
-                if let Some(h) = self.editing.clone() {
-                    sender.input(Msg::NewNote(h, arg.to_string()));
-                }
-            }
             // Choose a row or a button in the open popover by its words.
             "pick" => {
                 let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
@@ -2916,7 +2859,6 @@ impl Window {
                 }
                 eprintln!("drive: nothing in the popover says {arg:?}");
             }
-            "addattach" => w.add_card.set_linked(vec![arg.to_string()]),
             "type" => w.add_card.set_text(arg),
             "submit" => w.add_card.submit(),
             "title" => w.editor.type_title(arg),

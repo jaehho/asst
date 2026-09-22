@@ -3,7 +3,7 @@
 
 mod daemon;
 mod github;
-mod notes;
+mod location;
 mod reminders;
 mod service;
 mod system;
@@ -51,8 +51,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(service::pump(conn.clone(), events));
     tokio::spawn(daemon.clone().sync_loop());
     tokio::spawn(reminders::run(daemon.clone(), conn.clone()));
+    tokio::spawn(location::run(daemon.clone(), conn.clone()));
     tokio::spawn(system::run(daemon.clone()));
-    tokio::spawn(notes::run(daemon.clone()));
     tokio::spawn(github::run(daemon.clone()));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

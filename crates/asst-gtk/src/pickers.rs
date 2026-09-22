@@ -8,8 +8,9 @@ use std::sync::OnceLock;
 
 use asst_core::api::ListView;
 use asst_core::fmt;
+use asst_core::nominatim::Place;
 use asst_core::quickadd;
-use asst_core::task::Task;
+use asst_core::task::{LocationAlarm, Task};
 use asst_core::time::{Trigger, When};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
@@ -1074,97 +1075,31 @@ pub fn list_popover(
 
 /// The task's link: type or paste one, open it, or take it off. What is
 /// typed is kept when the popover closes.
-pub fn link_popover(
-    current: Option<&str>,
-    on_change: impl Fn(Option<String>) + 'static,
-) -> gtk::Popover {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 9);
-    root.set_margin_top(9);
-    root.set_margin_bottom(9);
-    root.set_margin_start(9);
-    root.set_margin_end(9);
-    let entry = gtk::Entry::builder()
-        .placeholder_text("https://…")
-        .text(current.unwrap_or(""))
-        .input_purpose(gtk::InputPurpose::Url)
-        .hexpand(true)
-        .build();
-    entry.set_icon_from_icon_name(
-        gtk::EntryIconPosition::Primary,
-        Some("chain-link-loose-symbolic"),
-    );
-    root.append(&entry);
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let open = gtk::Button::with_label("Open");
-    let remove = gtk::Button::with_label("Remove");
-    remove.add_css_class("flat");
-    remove.set_hexpand(true);
-    remove.set_halign(gtk::Align::End);
-    buttons.append(&open);
-    buttons.append(&remove);
-    root.append(&buttons);
+/// The place picker, for location reminders: the window runs the search and
+/// drops the results into `results`.
+/// The results list, and the way a picked place comes back.
+pub type PlaceSlot = Rc<RefCell<Option<(gtk::ListBox, Rc<dyn Fn(Place)>)>>>;
 
-    let popover = ui::popover(&root);
-    popover.set_width_request(300);
-    let has_text = {
-        let (open, remove) = (open.clone(), remove.clone());
-        move |e: &gtk::Entry| {
-            let some = !e.text().trim().is_empty();
-            open.set_sensitive(some);
-            remove.set_sensitive(some);
-        }
-    };
-    has_text(&entry);
-    entry.connect_changed(has_text);
-    {
-        let popover = popover.clone();
-        entry.connect_activate(move |_| popover.popdown());
-    }
-    {
-        let (entry, popover) = (entry.clone(), popover.clone());
-        remove.connect_clicked(move |_| {
-            entry.set_text("");
-            popover.popdown();
-        });
-    }
-    {
-        let (entry, popover) = (entry.clone(), popover.clone());
-        open.connect_clicked(move |b| {
-            let text = entry.text().trim().to_string();
-            let url = if text.contains("://") || text.starts_with("mailto:") {
-                text
-            } else {
-                format!("https://{text}")
-            };
-            let parent = b.root().and_downcast::<gtk::Window>();
-            gtk::UriLauncher::new(&url).launch(
-                parent.as_ref(),
-                None::<&gtk::gio::Cancellable>,
-                |_| {},
-            );
-            popover.popdown();
-        });
-    }
-    {
-        let entry = entry.clone();
-        let current = current.map(str::to_string);
-        popover.connect_closed(move |_| {
-            let new = Some(entry.text().trim().to_string()).filter(|s| !s.is_empty());
-            if new != current {
-                on_change(new);
-            }
-        });
-    }
-    {
-        let entry = entry.clone();
-        popover.connect_map(move |p| focus_in(p, &entry));
-    }
-    popover
+/// A reminder change: the timed alarms, and the location ones when the user
+/// touched those.
+pub type OnAlarms = Rc<dyn Fn(Vec<Trigger>, Option<Vec<LocationAlarm>>)>;
+
+pub struct PlaceSearch {
+    /// Run a search for these words.
+    pub search: Rc<dyn Fn(String)>,
+    /// A place was picked.
+    pub picked: Rc<dyn Fn(Place)>,
+    /// The results list, and the found places, filled from outside.
+    pub results: PlaceSlot,
+    /// What the last search found, ready to show.
+    pub places: Rc<RefCell<Vec<Place>>>,
 }
 
-// -- reminders --------------------------------------------------------------
-
-pub fn reminder_popover(task: &Task, on_change: impl Fn(Vec<Trigger>) + 'static) -> gtk::Popover {
+pub fn reminder_popover(
+    task: &Task,
+    on_change: impl Fn(Vec<Trigger>, Option<Vec<LocationAlarm>>) + 'static,
+    places: Option<PlaceSearch>,
+) -> gtk::Popover {
     let now = now();
     let zone = now.timezone();
     let today = now.date_naive();
@@ -1172,7 +1107,7 @@ pub fn reminder_popover(task: &Task, on_change: impl Fn(Vec<Trigger>) + 'static)
     let triggers: Rc<RefCell<Vec<Trigger>>> = Rc::new(RefCell::new(
         task.alarms.iter().map(|a| a.trigger.clone()).collect(),
     ));
-    let on_change: Rc<dyn Fn(Vec<Trigger>)> = Rc::new(on_change);
+    let on_change: OnAlarms = Rc::new(on_change);
 
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::SlideLeftRight)
@@ -1203,7 +1138,7 @@ pub fn reminder_popover(task: &Task, on_change: impl Fn(Vec<Trigger>) + 'static)
         let rebuild = rebuild.clone();
         Rc::new(move |v| {
             *triggers.borrow_mut() = v.clone();
-            on_change(v);
+            on_change(v, None);
             if let Some(r) = rebuild.borrow().as_ref() {
                 r();
             }
@@ -1241,6 +1176,32 @@ pub fn reminder_popover(task: &Task, on_change: impl Fn(Vec<Trigger>) + 'static)
                     let mut v = triggers.borrow().clone();
                     v.retain(|x| *x != t);
                     set(v);
+                });
+                line.append(&remove);
+                current.append(&line);
+            }
+            for a in &task.location_alarms {
+                let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                line.set_margin_start(6);
+                line.append(&gtk::Image::from_icon_name("location-symbolic"));
+                let text = ui::label(&format!("On arrival at {}", a.title), &[]);
+                text.set_hexpand(true);
+                line.append(&text);
+                let remove = gtk::Button::from_icon_name("cross-large-circle-filled-symbolic");
+                remove.add_css_class("flat");
+                remove.add_css_class("circular");
+                remove.set_tooltip_text(Some("Remove"));
+                let (on_change, task, triggers) =
+                    (on_change.clone(), task.clone(), triggers.clone());
+                let was = a.clone();
+                remove.connect_clicked(move |_| {
+                    let rest: Vec<LocationAlarm> = task
+                        .location_alarms
+                        .iter()
+                        .filter(|x| *x != &was)
+                        .cloned()
+                        .collect();
+                    on_change(triggers.borrow().clone(), Some(rest));
                 });
                 line.append(&remove);
                 current.append(&line);
@@ -1412,5 +1373,62 @@ pub fn reminder_popover(task: &Task, on_change: impl Fn(Vec<Trigger>) + 'static)
         let stack = stack.clone();
         popover.connect_map(move |_| stack.set_visible_child_name("main"));
     }
+
+    // On arrival at a place: a search box and, once results land, the list
+    // of them. The window does the searching; it fills `results`.
+    if let Some(places) = places {
+        main.append(&ui::separator());
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bar.set_margin_start(6);
+        bar.set_margin_end(6);
+        let entry = gtk::Entry::builder()
+            .placeholder_text("On arrival at a place…")
+            .hexpand(true)
+            .build();
+        bar.append(&entry);
+        let go = gtk::Button::from_icon_name("magnifier-symbolic");
+        go.add_css_class("flat");
+        go.set_tooltip_text(Some("Search"));
+        bar.append(&go);
+        main.append(&bar);
+        let results = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        main.append(&results);
+        *places.results.borrow_mut() = Some((results, places.picked.clone()));
+        let search = {
+            let search = places.search.clone();
+            let entry = entry.clone();
+            move || {
+                let q = entry.text().trim().to_string();
+                if !q.is_empty() {
+                    search(q);
+                }
+            }
+        };
+        {
+            let search = search.clone();
+            go.connect_clicked(move |_| search());
+        }
+        entry.connect_activate(move |_| search());
+        if let Some((list, picked)) = places.results.borrow().as_ref() {
+            fill_places(list, &places.places.borrow(), picked);
+        }
+    }
     popover
+}
+
+/// The found places in a results list; refilled when new ones arrive.
+pub fn fill_places(list: &gtk::ListBox, places: &[Place], picked: &Rc<dyn Fn(Place)>) {
+    while let Some(c) = list.first_child() {
+        list.remove(&c);
+    }
+    for place in places {
+        let button = gtk::Button::with_label(&format!("{} · {}", place.name, place.display_name));
+        button.add_css_class("flat");
+        let (picked, place) = (picked.clone(), place.clone());
+        button.connect_clicked(move |_| picked(place.clone()));
+        list.append(&gtk::ListBoxRow::builder().child(&button).build());
+    }
 }

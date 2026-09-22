@@ -13,16 +13,54 @@ use serde::Deserialize;
 use crate::caldav::{self, RemoteError};
 
 /// An issue or a task as the sync sees it: `id` is the issue's number or the
-/// task's uid.
+/// task's uid. A task's `body` is its description and its `labels` are empty;
+/// an issue's `priority` is read off its `P1`–`P3` labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item<Id> {
     pub id: Id,
     pub title: String,
     pub open: bool,
+    pub body: Option<String>,
+    pub priority: u8,
+    pub labels: Vec<String>,
 }
 
 pub type Issue = Item<u32>;
 pub type Ref = Item<String>;
+
+/// The issue label of a raw priority; "none" has none.
+fn label_of(priority: u8) -> Option<&'static str> {
+    match priority {
+        1 => Some("P1"),
+        5 => Some("P2"),
+        9 => Some("P3"),
+        _ => None,
+    }
+}
+
+/// The raw priority an issue's labels carry; the strongest wins if several do.
+fn priority_of(labels: &[String]) -> u8 {
+    for (p, label) in [(1, "P1"), (5, "P2"), (9, "P3")] {
+        if labels.iter().any(|l| l == label) {
+            return p;
+        }
+    }
+    0
+}
+
+/// The labels an issue should carry for `priority`: its other labels kept,
+/// the P1–P3 ones replaced.
+fn labels_for(labels: &[String], priority: u8) -> Vec<String> {
+    let mut out: Vec<String> = labels
+        .iter()
+        .filter(|l| !matches!(l.as_str(), "P1" | "P2" | "P3"))
+        .cloned()
+        .collect();
+    if let Some(p) = label_of(priority) {
+        out.push(p.to_string());
+    }
+    out
+}
 
 /// An issue and its task, with what the two last agreed on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,25 +69,35 @@ pub struct Pair {
     pub uid: String,
     pub title: String,
     pub open: bool,
+    pub body: Option<String>,
+    pub priority: u8,
 }
 
-/// What to change on one side; `None` leaves that field.
+/// What to change on one side; `None` leaves that field. The issue's labels
+/// are given whole, its other labels already kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Change {
     pub title: Option<String>,
     pub open: Option<bool>,
+    pub body: Option<Option<String>>,
+    pub priority: Option<u8>,
+    pub labels: Option<Vec<String>>,
 }
 
 impl Change {
     pub fn is_empty(&self) -> bool {
-        self.title.is_none() && self.open.is_none()
+        self.title.is_none()
+            && self.open.is_none()
+            && self.body.is_none()
+            && self.priority.is_none()
+            && self.labels.is_none()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// A pair where a side moved: change the task and the issue, then
-    /// remember `title` and `open` as agreed.
+    /// remember the agreed fields.
     Merge {
         number: u32,
         uid: String,
@@ -57,6 +105,8 @@ pub enum Op {
         issue: Change,
         title: String,
         open: bool,
+        body: Option<String>,
+        priority: u8,
     },
     /// The task left the list: close the issue as not planned, unpair.
     CloseIssue { number: u32 },
@@ -70,11 +120,23 @@ pub enum Op {
         number: u32,
         uid: String,
         title: String,
+        body: Option<String>,
+        priority: u8,
     },
     /// An open issue with no task: make one, pair them.
-    NewTask { number: u32, title: String },
+    NewTask {
+        number: u32,
+        title: String,
+        body: Option<String>,
+        priority: u8,
+    },
     /// An open task with no issue: open one, pair them.
-    NewIssue { uid: String, title: String },
+    NewIssue {
+        uid: String,
+        title: String,
+        body: Option<String>,
+        priority: u8,
+    },
 }
 
 /// Everything one pass changes, from every issue of the repo (a full
@@ -110,16 +172,22 @@ pub fn plan(issues: &[Issue], tasks: &[Ref], pairs: &[Pair]) -> Vec<Op> {
                 number: i.id,
                 uid: free.remove(at).id.clone(),
                 title: i.title.clone(),
+                body: i.body.clone(),
+                priority: i.priority,
             }),
             None => ops.push(Op::NewTask {
                 number: i.id,
                 title: i.title.clone(),
+                body: i.body.clone(),
+                priority: i.priority,
             }),
         }
     }
     ops.extend(free.into_iter().map(|t| Op::NewIssue {
         uid: t.id.clone(),
         title: t.title.clone(),
+        body: t.body.clone(),
+        priority: t.priority,
     }));
     ops
 }
@@ -130,23 +198,41 @@ fn merge(p: &Pair, i: &Issue, t: &Ref) -> Option<Op> {
     fn pick<T: Clone + PartialEq>(base: &T, issue: &T, task: &T) -> T {
         if issue != base { issue } else { task }.clone()
     }
+    fn side<Id>(
+        now: &Item<Id>,
+        title: &str,
+        open: bool,
+        body: &Option<String>,
+        priority: u8,
+    ) -> Change {
+        Change {
+            title: (now.title.as_str() != title).then(|| title.to_string()),
+            open: (now.open != open).then_some(open),
+            body: (now.body != *body).then(|| body.clone()),
+            priority: (now.priority != priority).then_some(priority),
+            labels: None,
+        }
+    }
     let title = pick(&p.title, &i.title, &t.title);
     let open = pick(&p.open, &i.open, &t.open);
-    let differs = |now_title: &str, now_open: bool| Change {
-        title: (now_title != title).then(|| title.clone()),
-        open: (now_open != open).then_some(open),
-    };
-    let task = differs(&t.title, t.open);
-    let issue = differs(&i.title, i.open);
-    (!task.is_empty() || !issue.is_empty() || title != p.title || open != p.open).then(|| {
-        Op::Merge {
-            number: p.number,
-            uid: p.uid.clone(),
-            task,
-            issue,
-            title,
-            open,
-        }
+    let body = pick(&p.body, &i.body, &t.body);
+    let priority = pick(&p.priority, &i.priority, &t.priority);
+    let task = side(t, &title, open, &body, priority);
+    let mut issue = side(i, &title, open, &body, priority);
+    if i.priority != priority {
+        issue.labels = Some(labels_for(&i.labels, priority));
+    }
+    let agreed =
+        title != p.title || open != p.open || body != p.body || priority != p.priority;
+    (!task.is_empty() || !issue.is_empty() || agreed).then(|| Op::Merge {
+        number: p.number,
+        uid: p.uid.clone(),
+        task,
+        issue,
+        title,
+        open,
+        body,
+        priority,
     })
 }
 
@@ -172,20 +258,34 @@ pub struct GitHub {
 }
 
 #[derive(Deserialize)]
+struct RawLabel {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct RawIssue {
     number: u32,
     title: String,
     state: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
     #[serde(default)]
     pull_request: Option<serde_json::Value>,
 }
 
 impl RawIssue {
     fn issue(self) -> Issue {
+        let labels: Vec<String> = self.labels.into_iter().map(|l| l.name).collect();
         Issue {
             id: self.number,
             title: self.title,
             open: self.state == "open",
+            // An empty body is no body, or the merge would chase its tail.
+            body: self.body.filter(|b| !b.trim().is_empty()),
+            priority: priority_of(&labels),
+            labels,
         }
     }
 }
@@ -269,15 +369,27 @@ impl GitHub {
         }
     }
 
-    pub async fn create(&self, repo: &str, title: &str) -> Result<Issue, RemoteError> {
+    pub async fn create(
+        &self,
+        repo: &str,
+        title: &str,
+        body: Option<&str>,
+        priority: u8,
+    ) -> Result<Issue, RemoteError> {
         let url = format!("{API}/repos/{repo}/issues");
-        let body = serde_json::json!({ "title": title });
-        let (_, _, body) = self.call(Method::POST, &url, Some(body), None).await?;
+        let mut body_json = serde_json::json!({ "title": title });
+        if let Some(b) = body.filter(|b| !b.trim().is_empty()) {
+            body_json["body"] = b.into();
+        }
+        if let Some(p) = label_of(priority) {
+            body_json["labels"] = serde_json::json!([p]);
+        }
+        let (_, _, body) = self.call(Method::POST, &url, Some(body_json), None).await?;
         Ok(parse::<RawIssue>(&body)?.issue())
     }
 
-    /// Change an issue's title or state. Closing says why: `completed`, or
-    /// `not_planned` for a task deleted rather than done.
+    /// Change an issue's title, body, labels or state. Closing says why:
+    /// `completed`, or `not_planned` for a task deleted rather than done.
     pub async fn update(
         &self,
         repo: &str,
@@ -289,6 +401,13 @@ impl GitHub {
         let mut body = serde_json::Map::new();
         if let Some(t) = &change.title {
             body.insert("title".into(), t.clone().into());
+        }
+        if let Some(b) = &change.body {
+            // An empty body clears the issue's.
+            body.insert("body".into(), b.clone().unwrap_or_default().into());
+        }
+        if let Some(labels) = &change.labels {
+            body.insert("labels".into(), serde_json::json!(labels));
         }
         match change.open {
             Some(true) => {
@@ -348,6 +467,9 @@ mod tests {
             id: number,
             title: title.into(),
             open,
+            body: None,
+            priority: 0,
+            labels: vec![],
         }
     }
 
@@ -356,6 +478,9 @@ mod tests {
             id: uid.into(),
             title: title.into(),
             open,
+            body: None,
+            priority: 0,
+            labels: vec![],
         }
     }
 
@@ -365,6 +490,8 @@ mod tests {
             uid: uid.into(),
             title: title.into(),
             open,
+            body: None,
+            priority: 0,
         }
     }
 
@@ -376,20 +503,22 @@ mod tests {
             issue,
             title: title.into(),
             open,
+            body: None,
+            priority: 0,
         }
     }
 
     fn title(t: &str) -> Change {
         Change {
             title: Some(t.into()),
-            open: None,
+            ..Change::default()
         }
     }
 
     fn state(open: bool) -> Change {
         Change {
-            title: None,
             open: Some(open),
+            ..Change::default()
         }
     }
 
@@ -497,20 +626,28 @@ mod tests {
                 Op::Adopt {
                     number: 1,
                     uid: "y".into(),
-                    title: "Same".into()
+                    title: "Same".into(),
+                    body: None,
+                    priority: 0
                 },
                 Op::NewTask {
                     number: 2,
-                    title: "Only on GitHub".into()
+                    title: "Only on GitHub".into(),
+                    body: None,
+                    priority: 0
                 },
                 Op::NewIssue {
                     uid: "x".into(),
-                    title: "Only here".into()
+                    title: "Only here".into(),
+                    body: None,
+                    priority: 0
                 },
                 // One task per issue: the second "Same" gets its own
                 Op::NewIssue {
                     uid: "w".into(),
-                    title: "Same".into()
+                    title: "Same".into(),
+                    body: None,
+                    priority: 0
                 },
             ]
         );
@@ -524,7 +661,85 @@ mod tests {
             plan(&issues, &[task("a", "Same", true)], &base),
             [Op::NewTask {
                 number: 2,
-                title: "Same".into()
+                title: "Same".into(),
+                body: None,
+                priority: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn notes_and_priority_cross_over_like_the_title() {
+        let mut base = pair(1, "a", "Fix it", true);
+        let mut i = issue(1, "Fix it", true);
+        let mut t = task("a", "Fix it", true);
+        // Notes written here, priority set on GitHub: both go across, and
+        // the issue's P2 label is already what was agreed.
+        t.body = Some("step one".into());
+        i.priority = 5;
+        i.labels = vec!["bug".into(), "P2".into()];
+        assert_eq!(
+            plan(&[i.clone()], &[t.clone()], &[base.clone()]),
+            [Op::Merge {
+                number: 1,
+                uid: "a".into(),
+                task: Change {
+                    priority: Some(5),
+                    ..Change::default()
+                },
+                issue: Change {
+                    body: Some(Some("step one".into())),
+                    ..Change::default()
+                },
+                title: "Fix it".into(),
+                open: true,
+                body: Some("step one".into()),
+                priority: 5,
+            }]
+        );
+        // Priority set here: the issue's labels are replaced whole, its
+        // other labels kept.
+        base.priority = 0;
+        i.priority = 0;
+        i.labels = vec!["bug".into()];
+        t.priority = 5;
+        t.body = None;
+        assert_eq!(
+            plan(&[i.clone()], &[t.clone()], &[base.clone()]),
+            [Op::Merge {
+                number: 1,
+                uid: "a".into(),
+                task: Change::default(),
+                issue: Change {
+                    priority: Some(5),
+                    labels: Some(vec!["bug".into(), "P2".into()]),
+                    ..Change::default()
+                },
+                title: "Fix it".into(),
+                open: true,
+                body: None,
+                priority: 5,
+            }]
+        );
+        // A body edited on GitHub comes back into the notes; the label
+        // dropped there drops the priority here.
+        i.body = Some("from the issue".into());
+        i.labels = vec![];
+        t.priority = 0;
+        assert_eq!(
+            plan(&[i], &[t], &[base]),
+            [Op::Merge {
+                number: 1,
+                uid: "a".into(),
+                task: Change {
+                    body: Some(Some("from the issue".into())),
+                    ..Change::default()
+                },
+                issue: Change::default(),
+                title: "Fix it".into(),
+                open: true,
+                body: Some("from the issue".into()),
+                priority: 0,
             }]
         );
     }

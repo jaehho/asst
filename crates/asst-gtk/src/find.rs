@@ -138,17 +138,7 @@ fn task_row(t: &TaskView, q: &str, sub: &str) -> gtk::ListBoxRow {
     let notes = (!in_title && !q.is_empty())
         .then(|| t.task.description.as_deref().and_then(|d| excerpt(d, q)))
         .flatten()
-        .map(|e| bold(&e, q))
-        .or_else(|| {
-            // Or the name of a note it links to.
-            let name = t
-                .task
-                .linked_notes
-                .iter()
-                .map(|n| asst_core::note_files::name(n))
-                .find(|n| !in_title && !q.is_empty() && n.to_lowercase().contains(q))?;
-            Some(format!("Linked note: {}", bold(name, q)))
-        });
+        .map(|e| bold(&e, q));
     let check = if t.task.is_open() {
         "check-round-outline-symbolic"
     } else {
@@ -298,12 +288,7 @@ pub fn open(
             let tasks: Vec<&TaskView> = open
                 .iter()
                 .filter(|t| {
-                    matches(&t.task.summary)
-                        || t.task.description.as_deref().is_some_and(&matches)
-                        || t.task
-                            .linked_notes
-                            .iter()
-                            .any(|n| matches(asst_core::note_files::name(n)))
+                    matches(&t.task.summary) || t.task.description.as_deref().is_some_and(&matches)
                 })
                 .take(40)
                 .collect();

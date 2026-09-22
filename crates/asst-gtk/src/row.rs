@@ -136,32 +136,15 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         i.set_tooltip_text(Some(&first));
         body.append(&i);
     }
-    if !t.task.alarms.is_empty() {
+    let alarms = t.task.alarms.len() + t.task.location_alarms.len();
+    if alarms > 0 {
         let b = gtk::Box::new(gtk::Orientation::Horizontal, 3);
         b.add_css_class("dim-label");
         b.append(&ui::icon("alarm-symbolic", 12));
-        let n = gtk::Label::new(Some(&t.task.alarms.len().to_string()));
+        let n = gtk::Label::new(Some(&alarms.to_string()));
         n.add_css_class("caption");
         b.append(&n);
         body.append(&b);
-    }
-    if t.task.url.is_some() {
-        let i = ui::icon("chain-link-loose-symbolic", 12);
-        i.add_css_class("dim-label");
-        i.set_tooltip_text(t.task.url.as_deref());
-        body.append(&i);
-    }
-    if !t.task.linked_notes.is_empty() {
-        let i = ui::icon("mail-attachment-symbolic", 12);
-        i.add_css_class("dim-label");
-        let names: Vec<&str> = t
-            .task
-            .linked_notes
-            .iter()
-            .map(|l| asst_core::note_files::name(l))
-            .collect();
-        i.set_tooltip_text(Some(&names.join("\n")));
-        body.append(&i);
     }
     if t.pending {
         let i = ui::icon("update-symbolic", 12);

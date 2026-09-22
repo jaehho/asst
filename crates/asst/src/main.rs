@@ -4,18 +4,17 @@ mod bar;
 mod out;
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, anyhow, bail};
 use asst_core::api::{
-    AddSpec, Added, AsstProxy, Change, LinkView, ListChange, ListSpec, ListView, NewNote, Settings,
+    AddSpec, Added, AsstProxy, Change, LinkView, ListChange, ListSpec, ListView, Settings,
     SettingsChange, StatusView, SyncState, TaskView,
 };
 use asst_core::store::{Query, View};
 use asst_core::sync::Report;
 use asst_core::task::priority_level;
-use asst_core::{fmt, note_files};
+use asst_core::fmt;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
@@ -45,9 +44,6 @@ enum Cmd {
     /// Open tasks, in one list or all
     Ls {
         list: Option<String>,
-        /// Only tasks linking this note
-        #[arg(long, value_name = "NOTE")]
-        attached: Option<PathBuf>,
     },
     /// Completed tasks, newest first
     Completed {
@@ -82,35 +78,12 @@ enum Cmd {
         /// `every monday`, `daily`, or an RRULE
         #[arg(long)]
         repeat: Option<String>,
-        #[arg(long)]
-        url: Option<String>,
         /// Where it came from (`kind:id`); adding the same source again is a no-op
         #[arg(long)]
         source: Option<String>,
-        /// Link a note, a file in the notes folder (again for more)
-        #[arg(long, value_name = "NOTE")]
-        attach: Vec<PathBuf>,
         /// Take the text as the title; don't read dates, #list or p1 in it
         #[arg(long)]
         literal: bool,
-    },
-    /// Link notes (files in the notes folder) to a task, or make a new one for it
-    Attach {
-        id: String,
-        #[arg(required_unless_present = "new")]
-        notes: Vec<PathBuf>,
-        /// A new note named after the task; prints its path
-        #[arg(long, conflicts_with = "notes")]
-        new: bool,
-        /// The new note's title instead
-        #[arg(long, requires = "new")]
-        title: Option<String>,
-    },
-    /// Unlink notes from a task: their paths, or their names
-    Detach {
-        id: String,
-        #[arg(required = true)]
-        notes: Vec<String>,
     },
     /// Tie a list to a GitHub repo: its issues are synced both ways;
     /// without arguments, show the ties
@@ -194,9 +167,6 @@ enum Cmd {
         /// Minutes before the due time that reminder rings (0: at the due time)
         #[arg(long)]
         alarm_before: Option<u32>,
-        /// The folder of notes tasks link to; `default` for ~/Nextcloud/Notes
-        #[arg(long, value_name = "FOLDER")]
-        notes: Option<String>,
     },
     /// Sync with the server now
     Sync,
@@ -322,7 +292,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             list,
             text,
             limit,
-            linked_note: None,
         })
         .expect("query serializes")
     };
@@ -338,11 +307,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             true,
             "Nothing scheduled.",
         )?,
-        Cmd::Ls { list, attached } => {
+        Cmd::Ls { list } => {
             let one = list.is_some();
             let query = Query {
                 list,
-                linked_note: attached.map(|p| full_path(&p)).transpose()?,
                 ..asst_core::api::query(View::Open)
             };
             list_tasks(
@@ -421,9 +389,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             priority,
             note,
             repeat,
-            url,
             source,
-            attach,
             literal,
         } => {
             let spec = AddSpec {
@@ -434,12 +400,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 priority,
                 description: note,
                 repeat_text: repeat,
-                url,
                 source,
-                linked_notes: attach
-                    .iter()
-                    .map(|p| full_path(p))
-                    .collect::<anyhow::Result<_>>()?,
                 ..AddSpec::default()
             };
             let raw = proxy.add(&serde_json::to_string(&spec)?).await?;
@@ -489,19 +450,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     fmt::due_label(&asst_core::time::When::Utc { at }, now),
                 );
             }
-            if let Some(u) = &t.task.url {
-                row("url", u.clone());
-            }
             if let Some(s) = &t.task.source {
                 row("source", s.clone());
-            }
-            if !t.task.linked_notes.is_empty() {
-                let dir = notes_dir(&proxy).await?;
-                for link in &t.task.linked_notes {
-                    let file = dir.join(link);
-                    let missing = if file.exists() { "" } else { " (missing)" };
-                    row("note", format!("{}{}", file.display(), style.dim(missing)));
-                }
             }
             if t.pending {
                 row("sync", "waiting to be sent".into());
@@ -573,71 +523,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             let t: TaskView = serde_json::from_str(&raw)?;
             println!("{}", out::task_line(&style, &t, now, true));
-        }
-        Cmd::Attach {
-            id,
-            new: true,
-            title,
-            ..
-        } => {
-            let raw = proxy.new_note(&id, title.as_deref().unwrap_or("")).await?;
-            if json {
-                return show_json(&raw);
-            }
-            let made: NewNote = serde_json::from_str(&raw)?;
-            println!("{}", made.file);
-        }
-        Cmd::Attach { id, notes, .. } => {
-            let t: TaskView = serde_json::from_str(&proxy.get(&id).await?)?;
-            let mut links: Vec<String> = t.task.linked_notes.clone();
-            for note in &notes {
-                links.push(full_path(note)?);
-            }
-            let change = Change {
-                linked_notes: Some(links),
-                ..Change::default()
-            };
-            let raw = proxy
-                .edit(&t.href, &serde_json::to_string(&change)?)
-                .await?;
-            if json {
-                return show_json(&raw);
-            }
-            let t: TaskView = serde_json::from_str(&raw)?;
-            println!("{}", out::task_line(&style, &t, now, true));
-            print_links(&style, &notes_dir(&proxy).await?, &t);
-        }
-        Cmd::Detach { id, notes } => {
-            let t: TaskView = serde_json::from_str(&proxy.get(&id).await?)?;
-            let dir = notes_dir(&proxy).await?;
-            let mut links = t.task.linked_notes.clone();
-            for given in &notes {
-                let path = std::path::absolute(given)
-                    .ok()
-                    .and_then(|p| note_files::relative(&dir, &p));
-                let before = links.len();
-                links.retain(|l| {
-                    Some(l) != path.as_ref()
-                        && l != given
-                        && !note_files::name(l).eq_ignore_ascii_case(given.trim())
-                });
-                if links.len() == before {
-                    bail!("“{}” doesn't link a note {given:?}", t.task.summary);
-                }
-            }
-            let change = Change {
-                linked_notes: Some(links),
-                ..Change::default()
-            };
-            let raw = proxy
-                .edit(&t.href, &serde_json::to_string(&change)?)
-                .await?;
-            if json {
-                return show_json(&raw);
-            }
-            let t: TaskView = serde_json::from_str(&raw)?;
-            println!("{}", out::task_line(&style, &t, now, true));
-            print_links(&style, &dir, &t);
         }
         Cmd::Link { list, repo } => match (list, repo) {
             (Some(list), Some(repo)) => {
@@ -796,20 +681,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             snooze,
             alarm_at_due,
             alarm_before,
-            notes,
         } => {
-            let notes = match notes {
-                Some(n) if n.eq_ignore_ascii_case("default") => Some(None),
-                Some(n) => Some(Some(full_path(Path::new(&n))?)),
-                None => None,
-            };
             let change = SettingsChange {
                 inbox: inbox.map(|i| Some(i).filter(|i| !i.eq_ignore_ascii_case("default"))),
                 interval,
                 snooze,
                 alarm_at_due,
                 alarm_before,
-                notes,
             };
             let raw = if change == SettingsChange::default() {
                 proxy.settings().await?
@@ -842,7 +720,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     m => format!("{} before", fmt::minutes(u64::from(m))),
                 },
             );
-            row("notes", s.notes);
         }
 
         Cmd::Lists => {
@@ -951,33 +828,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Bar => unreachable!("handled above"),
     }
     Ok(())
-}
-
-/// A path from the command line, made whole against the current folder, as
-/// the daemon takes files.
-fn full_path(path: &Path) -> anyhow::Result<String> {
-    let full = std::path::absolute(path).with_context(|| format!("reading {}", path.display()))?;
-    full.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("{} isn't valid UTF-8", full.display()))
-}
-
-async fn notes_dir(proxy: &AsstProxy<'_>) -> anyhow::Result<PathBuf> {
-    let s: Settings = serde_json::from_str(&proxy.settings().await?)?;
-    Ok(PathBuf::from(s.notes))
-}
-
-fn print_links(style: &Style, dir: &Path, t: &TaskView) {
-    for link in &t.task.linked_notes {
-        let file = dir.join(link);
-        let missing = if file.exists() { "" } else { " (missing)" };
-        println!(
-            "  {} {}{}",
-            style.dim("note"),
-            file.display(),
-            style.dim(missing)
-        );
-    }
 }
 
 /// Ask on the terminal; anything but yes is no.

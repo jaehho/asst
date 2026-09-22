@@ -2,7 +2,7 @@
 //! the GTK thread as command outputs.
 
 use asst_core::api::{
-    AddSpec, Added, AsstProxy, Change, ListChange, ListSpec, ListView, NewNote, Settings,
+    AddSpec, Added, AsstProxy, Change, ListChange, ListSpec, ListView, Settings,
     SettingsChange, StatusView, TaskView,
 };
 use asst_core::store::Query;
@@ -144,12 +144,6 @@ pub async fn delete_completed(list: Option<&str>) -> Result<u32> {
         .delete_completed(list.unwrap_or(""))
         .await
         .map_err(|e| describe(&e))
-}
-
-/// A note for a task in the notes folder, linked to it; titled after the
-/// task when `title` is empty.
-pub async fn new_note(id: &str, title: &str) -> Result<NewNote> {
-    json(proxy().await?.new_note(id, title).await)
 }
 
 /// A task's iCalendar object, as asst would send it.

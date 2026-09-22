@@ -1,19 +1,18 @@
 //! The daemon's state and everything it does with it. The D-Bus service,
 //! notification buttons, and system events all come through here.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use asst_core::api::{
-    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, NewNote, Settings,
+    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings,
     SettingsChange, StatusView, SyncState, TaskView, short_ids,
 };
 use asst_core::caldav::{self, Account, CalDav, RemoteError};
 use asst_core::config::{self, AccountConfig, Config};
 use asst_core::github;
-use asst_core::note_files;
 use asst_core::quickadd;
 use asst_core::store::{Query, Row, Store, StoreError};
 use asst_core::sync::{self, Report, SyncError};
@@ -67,8 +66,6 @@ pub struct Daemon {
     completed: watch::Sender<(u64, std::result::Result<Report, String>)>,
     /// Reminders recompute when tasks change.
     pub wake_reminders: Notify,
-    /// The notes folder setting changed: watch the new one.
-    pub notes_dir_changed: Notify,
     /// Tasks changed, here or on the server, or links did: a GitHub pass.
     pub wake_github: Notify,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
@@ -113,7 +110,6 @@ impl Daemon {
             requested: AtomicU64::new(0),
             completed: watch::channel((0, Ok(Report::default()))).0,
             wake_reminders: Notify::new(),
-            notes_dir_changed: Notify::new(),
             wake_github: Notify::new(),
             events,
         };
@@ -371,6 +367,23 @@ impl Daemon {
             .into_iter()
             .map(|l| (l.href, l.name))
             .collect();
+        // Which list is tied to which repo, and which task is which issue.
+        let repos: HashMap<String, String> = store
+            .gh_links()?
+            .into_iter()
+            .map(|(repo, href)| (href, repo))
+            .collect();
+        let mut pairs: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        for repo in repos.values() {
+            pairs.insert(
+                repo.clone(),
+                store
+                    .gh_pairs(repo)?
+                    .into_iter()
+                    .map(|p| (p.uid, p.number))
+                    .collect(),
+            );
+        }
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -379,7 +392,16 @@ impl Daemon {
                     .cloned()
                     .unwrap_or_else(|| r.task.uid.to_lowercase());
                 let list_name = names.get(&r.list).cloned().unwrap_or_default();
-                TaskView::new(r, id, list_name)
+                let issue = repos.get(&r.list).and_then(|repo| {
+                    let number = pairs.get(repo)?.get(&r.task.uid).copied()?;
+                    Some(asst_core::api::IssueLink {
+                        number,
+                        url: format!("https://github.com/{repo}/issues/{number}"),
+                    })
+                });
+                let mut view = TaskView::new(r, id, list_name);
+                view.issue = issue;
+                view
             })
             .collect())
     }
@@ -389,41 +411,9 @@ impl Daemon {
     }
 
     pub fn tasks(&self, query: &Query) -> Result<Vec<TaskView>> {
-        let mut query = query.clone();
-        if let Some(note) = &query.linked_note {
-            query.linked_note = Some(self.note_link(note)?);
-        }
         let store = self.store();
-        let rows = store.query(&query, self.now_local().date_naive())?;
+        let rows = store.query(query, self.now_local().date_naive())?;
         self.views(&store, rows)
-    }
-
-    /// A linked note as it is stored: its path in the notes folder. A full
-    /// path (from the CLI or an editor) has to be a file in that folder.
-    fn note_link(&self, given: &str) -> Result<String> {
-        let given = given.trim();
-        let dir = self.config().notes_dir();
-        if Path::new(given).is_absolute() {
-            return note_files::relative(&dir, Path::new(given)).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "{given} isn't in the notes folder, {}",
-                    dir.display()
-                ))
-            });
-        }
-        note_files::clean(given).ok_or_else(|| Error::Invalid(format!("not a note: {given:?}")))
-    }
-
-    /// Links as `AddSpec` and `Change` take them, stored once each.
-    fn note_links(&self, given: &[String]) -> Result<Vec<String>> {
-        let mut links: Vec<String> = Vec::new();
-        for g in given {
-            let link = self.note_link(g)?;
-            if !links.contains(&link) {
-                links.push(link);
-            }
-        }
-        Ok(links)
     }
 
     pub fn get(&self, id: &str) -> Result<TaskView> {
@@ -572,15 +562,8 @@ impl Daemon {
         if !alarms.is_empty() {
             edits.push(Edit::Alarms(alarms));
         }
-        if let Some(u) = &spec.url {
-            edits.push(Edit::Url(Some(u.clone())));
-        }
         if let Some(s) = &spec.source {
             edits.push(Edit::Source(Some(s.clone())));
-        }
-        let links = self.note_links(&spec.linked_notes)?;
-        if !links.is_empty() {
-            edits.push(Edit::LinkedNotes(links));
         }
         let mut store = self.store();
         let list = match spec
@@ -609,11 +592,6 @@ impl Daemon {
             (Some(r), _) => Some(r.clone()),
             (None, Some(t)) => Some(self.rrule_from_text(t)?),
             (None, None) => None,
-        };
-        // Before the store's lock: this reads the config.
-        let links = match &change.linked_notes {
-            Some(given) => Some(self.note_links(given)?),
-            None => None,
         };
         let mut store = self.store();
         let row = store.find(id)?;
@@ -657,17 +635,14 @@ impl Daemon {
         if let Some(a) = &change.alarms {
             edits.push(Edit::Alarms(a.clone()));
         }
-        if let Some(u) = &change.url {
-            edits.push(Edit::Url(u.clone()));
+        if let Some(a) = &change.location_alarms {
+            edits.push(Edit::LocationAlarms(a.clone()));
         }
         if let Some(s) = &change.source {
             edits.push(Edit::Source(s.clone()));
         }
         if let Some(o) = change.sort_order {
             edits.push(Edit::SortOrder(o));
-        }
-        if let Some(links) = links.filter(|l| *l != row.task.linked_notes) {
-            edits.push(Edit::LinkedNotes(links));
         }
         let mut row = if edits.is_empty() {
             row
@@ -743,68 +718,6 @@ impl Daemon {
         drop(store);
         self.changed_locally();
         Ok(view)
-    }
-
-    /// A new note in the notes folder, titled after the task unless `title`
-    /// says otherwise, and linked to it.
-    pub fn new_note(&self, id: &str, title: &str) -> Result<NewNote> {
-        let dir = self.config().notes_dir();
-        if !dir.is_dir() {
-            return Err(Error::Invalid(format!(
-                "the notes folder, {}, doesn't exist; choose another in Preferences or with `asst settings --notes`",
-                dir.display()
-            )));
-        }
-        let task = self.get(id)?;
-        let title = Some(title.trim())
-            .filter(|t| !t.is_empty())
-            .unwrap_or(&task.task.summary);
-        let path = note_files::create(&dir, title)
-            .map_err(|e| Error::Invalid(format!("making a note in {}: {e}", dir.display())))?;
-        let file = dir.join(&path);
-        let mut links = task.task.linked_notes.clone();
-        links.push(path.clone());
-        let change = Change {
-            linked_notes: Some(links),
-            ..Change::default()
-        };
-        match self.edit(&task.href, &change) {
-            Ok(task) => Ok(NewNote {
-                path,
-                file: file.to_string_lossy().into_owned(),
-                task,
-            }),
-            Err(e) => {
-                // Nothing links it (a read-only list): take back the file made just now.
-                let _ = std::fs::remove_file(&file);
-                Err(e)
-            }
-        }
-    }
-
-    /// Notes, or folders of them, moved within the notes folder (paths in
-    /// it, in order): the tasks linking them follow. Returns how many changed.
-    pub fn follow_moves(&self, moves: &[(String, String)]) -> Result<usize> {
-        let dir = self.config().notes_dir();
-        let exists = |path: &str| dir.join(path).exists();
-        let now = Utc::now();
-        let mut store = self.store();
-        let mut changed = 0;
-        for row in store.with_linked_notes()? {
-            let Some(links) = note_files::follow(&row.task.linked_notes, moves, exists) else {
-                continue;
-            };
-            match store.edit(&row.href, &[Edit::LinkedNotes(links)], now) {
-                Ok(_) => changed += 1,
-                Err(StoreError::ReadOnly(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        drop(store);
-        if changed > 0 {
-            self.changed_locally();
-        }
-        Ok(changed)
     }
 
     pub fn snooze(&self, href: &str, minutes: u64) -> Result<()> {
@@ -1015,9 +928,6 @@ impl Daemon {
         if cfg.interval != before.interval {
             self.settings_changed.notify_one();
         }
-        if cfg.notes_dir() != before.notes_dir() {
-            self.notes_dir_changed.notify_one();
-        }
         Ok(settings_of(&cfg))
     }
 
@@ -1139,7 +1049,6 @@ fn settings_of(cfg: &Config) -> Settings {
         snooze: cfg.snooze.clone(),
         alarm_at_due: cfg.alarm_at_due,
         alarm_before: cfg.alarm_before,
-        notes: cfg.notes_dir().to_string_lossy().into_owned(),
     }
 }
 
@@ -1179,20 +1088,6 @@ fn apply_settings(
             "the default reminder rings at most a week early".into(),
         ));
     }
-    let notes = change.notes.as_ref().map(|path| {
-        path.as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-    });
-    if let Some(Some(path)) = &notes
-        && !(path.is_absolute() || path.starts_with("~"))
-    {
-        return Err(Error::Invalid(format!(
-            "the notes folder needs a full path, not {}",
-            path.display()
-        )));
-    }
     if let Some(inbox) = inbox {
         cfg.inbox = inbox;
     }
@@ -1207,9 +1102,6 @@ fn apply_settings(
     }
     if let Some(m) = change.alarm_before {
         cfg.alarm_before = m;
-    }
-    if let Some(n) = notes {
-        cfg.notes = n;
     }
     Ok(())
 }
@@ -1236,19 +1128,12 @@ mod tests {
             assert!(apply_settings(&mut cfg, &change, None).is_err());
         }
 
-        let relative = SettingsChange {
-            notes: Some(Some("Notes".into())),
-            ..SettingsChange::default()
-        };
-        assert!(apply_settings(&mut cfg, &relative, None).is_err());
-
         let change = SettingsChange {
             inbox: Some(Some("work".into())),
             interval: Some(300),
             snooze: Some(vec![60, 5, 5]),
             alarm_at_due: Some(false),
             alarm_before: Some(30),
-            notes: Some(Some("/srv/notes".into())),
         };
         apply_settings(&mut cfg, &change, Some(Some("Work".into()))).unwrap();
         assert_eq!(
@@ -1259,18 +1144,11 @@ mod tests {
                 snooze: vec![5, 60],
                 alarm_at_due: false,
                 alarm_before: 30,
-                notes: "/srv/notes".into(),
             }
         );
         apply_settings(&mut cfg, &SettingsChange::default(), Some(None)).unwrap();
         assert_eq!(cfg.inbox, None);
         assert_eq!(cfg.interval, 300, "absent fields stay");
-        let back = SettingsChange {
-            notes: Some(None),
-            ..SettingsChange::default()
-        };
-        apply_settings(&mut cfg, &back, None).unwrap();
-        assert_eq!(cfg.notes_dir(), note_files::default_dir());
     }
 
     #[test]
