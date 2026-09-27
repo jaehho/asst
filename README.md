@@ -55,12 +55,6 @@ hl.bind(mainMod .. " + SHIFT + A", hl.dsp.exec_cmd("asst-gtk quick-add")) -- qui
 ```
 
 
-**Neovim:** `make install` puts a plugin in `~/.local/share/asst/nvim` (the package: `/usr/share/asst/nvim`). `:AsstTask` opens quick add. With lazy.nvim:
-
-```lua
-{ name = 'asst', dir = vim.fn.expand '~/.local/share/asst/nvim', cmd = { 'AsstTask', 'AsstAttach', 'AsstTasks' } },
-```
-
 **Waybar:**
 
 ```jsonc

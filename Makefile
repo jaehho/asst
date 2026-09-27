@@ -40,7 +40,7 @@ fmt:
 build:           ## optimized binaries -> target/release/
 	cargo build --release --workspace
 
-install: build   ## into ~/.local for this user (no sudo), Neovim plugin included
+install: build   ## into ~/.local for this user (no sudo)
 	install -Dm755 target/release/asst $(PREFIX)/bin/asst
 	install -Dm755 target/release/asstd $(PREFIX)/bin/asstd
 	install -Dm755 target/release/asst-gtk $(PREFIX)/bin/asst-gtk
@@ -51,8 +51,6 @@ install: build   ## into ~/.local for this user (no sudo), Neovim plugin include
 	sed 's#/usr/bin/#$(PREFIX)/bin/#' packaging/asstd.service > $(UNITDIR)/asstd.service
 	sed 's#/usr/bin/#$(PREFIX)/bin/#' packaging/dev.jaeho.Asst.Daemon.service > $(DBUSDIR)/dev.jaeho.Asst.Daemon.service
 	sed 's#/usr/bin/#$(PREFIX)/bin/#' packaging/dev.jaeho.Asst.service > $(DBUSDIR)/dev.jaeho.Asst.service
-	install -Dm644 nvim/plugin/asst.lua $(DATADIR)/asst/nvim/plugin/asst.lua
-	install -Dm644 nvim/lua/asst.lua $(DATADIR)/asst/nvim/lua/asst.lua
 	systemctl --user daemon-reload
 	@echo "installed. next: systemctl --user enable --now asstd && asst login <server>"
 
@@ -61,7 +59,6 @@ uninstall:       ## remove the user install (config, cache and keyring entry sta
 	rm -f $(PREFIX)/bin/asst $(PREFIX)/bin/asstd $(PREFIX)/bin/asst-gtk \
 	      $(UNITDIR)/asstd.service $(DBUSDIR)/dev.jaeho.Asst.Daemon.service $(DBUSDIR)/dev.jaeho.Asst.service \
 	      $(DATADIR)/applications/dev.jaeho.Asst.desktop $(DATADIR)/icons/hicolor/scalable/apps/dev.jaeho.Asst.svg
-	rm -rf $(DATADIR)/asst/nvim
 	systemctl --user daemon-reload
 
 package:         ## build the Arch package
