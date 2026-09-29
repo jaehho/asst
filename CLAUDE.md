@@ -6,6 +6,6 @@ Rust tasks app on Nextcloud CalDAV. Decisions and architecture: `DESIGN.md`.
 - **Never rewrite a VTODO from scratch.** Patch the stored server copy so properties from iOS or other clients survive; `ical.rs` tests pin byte-for-byte round trips.
 - **The daemon owns sync and reminders.** The GUI, CLI and quick add are D-Bus clients; none of them talk to Nextcloud.
 - **Test against the real server only in a throwaway list.** `make nextcloud-test` creates and purges its own. The user's lists sync to their iPhone.
-- **Gotchas live in `ISSUES.md`** (e.g. geoclue has no position source on omnibook).
+- **Gotchas and decisions live in GitHub issues** (labels `gotcha`, `decision`). Search before changing behavior: `gh issue list --label gotcha --state all --search <term>` (e.g. #12, geoclue has no position source on omnibook). Closed means believed fixed or decided; reopen on recurrence. Never add ISSUES.md, DESIGN_LOG.md or TODO.md.
 - **Try changes in `scripts/dev`, never on the session bus.** asst is installed and running, and a plain `dbus-run-session` can still start the installed asstd with the real config and cache. The script redirects the bus's service lookup, and runs a dev asstd against a local Radicale.
 - **Check the GUI without taking the screen.** `scripts/dev window` opens it on a hidden Hyprland workspace, unfocused. `scripts/dev drive`/`snap` click and capture through app actions (`devel.rs`); read the PNGs.
