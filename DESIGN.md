@@ -91,13 +91,12 @@ From decompiled iOS 18/26 ReminderKit (via research, not a device test):
 ## Integrations
 
 - **Location reminders.** A VALARM with `X-APPLE-PROXIMITY:ARRIVE` and an `X-APPLE-STRUCTURED-LOCATION` (`geo:lat,lon?u=radius`, `X-TITLE`, `X-ADDRESS`): asst reads, keeps and writes the same shape the phone does, matching its own by UID. The reminder popover searches Nominatim (one request per search) and adds a place with a 100 m radius; asstd subscribes to GeoClue2 while any open task has one, and notifies on arrival. DTSTART is the phone's business: asst never reads or writes it.
-- **Source links.** A task can carry where it came from (a steno meeting, a mail-digest item, a file) in `X-ASST-SOURCE`. `asst add --source <kind>:<id>` is idempotent on that key, so a re-run never duplicates.
+- **Source links.** A task can carry where it came from (a steno meeting, a file) in `X-ASST-SOURCE`. `asst add --source <kind>:<id>` is idempotent on that key, so a re-run never duplicates.
 - **steno (two-way, asst owns the state):**
   - After summarizing, steno calls `asst add --source steno:<session>/<key>` for each "You" item in the meeting's project list and stores the returned UID in `todos.json`.
   - Its checkbox calls `asst done`/`asst reopen`, and its view reads state back from asst, so checking either side shows on both (and on the phone).
   - Without asst running, steno falls back to its own `todos.json`.
   - This is a change in steno, not a file asst watches: two programs writing `todos.json` would race.
-- **mail-digest:** same client pattern; an action item becomes a task from the viewer or the ask session, linking back to the thread.
 - **GitHub issues (two-way):** `asst link <list> <owner/repo>` ties a list to a repo's issues, one repo per list; nothing is linked implicitly. Project tasks live in issues; the list keeps them in the window, quick add and on the phone.
   - Synced, both ways: the title, the notes (as the issue body), open/closed, and priority as `P1`–`P3` labels (p4/none = no label, an issue's other labels kept). Everything else — due dates, repeats, reminders — has no issue equivalent and stays on the CalDAV side. Pull requests are left out. An open issue with no task gets one, an open task with no issue gets one; on linking, an open issue and an open task with the same title are paired instead of duplicated. Closed issues and completed tasks nobody paired are left alone. A paired task shows its issue (`asst show --json`) built from the pair, not stored.
   - Which issue is which task lives in the cache (`gh_pairs`), not as markers in issue bodies, along with what the two last agreed on (title, state, body, priority). Each pass is a three-way merge against that base, field by field: the side that moved wins, the issue when both did. A push that fails leaves the base, so the next pass finds the same difference and retries.
