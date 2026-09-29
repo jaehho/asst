@@ -25,7 +25,7 @@ use relm4::{Component, ComponentParts, ComponentSender, RelmApp, adw};
 use crate::addcard::{AddCard, Target};
 use crate::content::{self, Opts};
 use crate::editor::Editor;
-use crate::model::{self, Counts, Data, Nav, Sort, ViewOpts};
+use crate::model::{self, Counts, Data, Nav, Quadrant, Sort, ViewOpts};
 use crate::motion;
 use crate::pickers::{self, DateOpts};
 use crate::prefs::Prefs;
@@ -145,6 +145,8 @@ pub enum Msg {
     Copy(String),
     Move(String, String),
     DropTask(String, Nav),
+    /// Dropped on a matrix box: move priority and due so it lands there.
+    DropQuadrant(String, Quadrant),
     Add(Box<AddSpec>),
     ShowAdd(Option<Target>),
     HideAdd,
@@ -1129,6 +1131,19 @@ impl Component for Window {
                     Nav::Completed => sender.input(Msg::Complete(href)),
                     _ => {}
                 }
+            }
+            Msg::DropQuadrant(href, q) => {
+                let Some(t) = self.find(&href).cloned() else {
+                    return;
+                };
+                let change = model::retarget(&t.task, q, self.now().date_naive(), self.zone);
+                if change == Change::default() {
+                    return;
+                }
+                let said = format!("Moved to {}", q.title());
+                sender.oneshot_command(async move {
+                    Cmd::Toast(client::edit(&href, &change).await.map(|_| said))
+                });
             }
             Msg::Add(spec) => {
                 sender.oneshot_command(async move { Cmd::Added(client::add(&spec).await) });

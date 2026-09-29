@@ -115,10 +115,26 @@ Name=dev.jaeho.Asst.Devel
 Exec=/usr/bin/env -u XDG_DATA_HOME XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_HOME=$DEV/config XDG_STATE_HOME=$DEV/state ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals $BIN/asst-gtk --gapplication-service
 SERVICE
     hide_window
-    # XDG_DATA_HOME and XDG_DATA_DIRS decide which services the bus can
-    # start: pointed away, it cannot find the installed asstd.
-    (setsid nohup env XDG_DATA_HOME="$DEV/data" XDG_DATA_DIRS=/nonexistent \
-      dbus-run-session -- "$0" inside > "$DEV/session.log" 2>&1 &)
+    # A bus that only starts this instance's services. Pointing
+    # XDG_DATA_DIRS away is not enough: standard_session_servicedirs still
+    # opens /usr/share and ~/.local, where a real install's units live.
+    cat > "$DEV/session.conf" <<CONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+  <servicedir>$DEV/data/dbus-1/services</servicedir>
+</busconfig>
+CONF
+    (setsid nohup dbus-run-session --config-file="$DEV/session.conf" \
+      -- "$0" inside > "$DEV/session.log" 2>&1 &)
     for _ in $(seq 50); do
       if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then echo "up: $DEV"; exit 0; fi
       sleep 0.2

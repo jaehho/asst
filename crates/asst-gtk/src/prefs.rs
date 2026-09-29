@@ -72,7 +72,13 @@ impl Default for Prefs {
 }
 
 /// The views a new sidebar has.
-const DEFAULT_SIDEBAR: [Nav; 4] = [Nav::Inbox, Nav::Today, Nav::Scheduled, Nav::Completed];
+const DEFAULT_SIDEBAR: [Nav; 5] = [
+    Nav::Inbox,
+    Nav::Today,
+    Nav::Matrix,
+    Nav::Scheduled,
+    Nav::Completed,
+];
 
 fn path() -> PathBuf {
     asst_core::config::config_path().with_file_name("window.toml")
@@ -92,6 +98,14 @@ impl Prefs {
             let mut keys: Vec<String> = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
             keys.extend(std::mem::take(&mut p.filters));
             p.sidebar = Some(keys);
+        }
+        // The default sidebar as it was before Matrix: put the new view in,
+        // once, without touching a sidebar the user arranged.
+        const BEFORE_MATRIX: [&str; 4] = ["inbox", "today", "scheduled", "completed"];
+        if let Some(keys) = &p.sidebar
+            && keys.iter().map(String::as_str).eq(BEFORE_MATRIX)
+        {
+            p.sidebar = Some(DEFAULT_SIDEBAR.iter().map(Nav::key).collect());
         }
         p
     }
@@ -162,7 +176,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidebar_starts_with_four_and_keeps_old_extras() {
+    fn sidebar_starts_with_the_defaults_and_keeps_old_extras() {
         assert_eq!(Prefs::parse("").sidebar_views(), DEFAULT_SIDEBAR);
         let old = Prefs::parse("filters = [\"tomorrow\"]\n");
         assert_eq!(
@@ -170,11 +184,20 @@ mod tests {
             [
                 Nav::Inbox,
                 Nav::Today,
+                Nav::Matrix,
                 Nav::Scheduled,
                 Nav::Completed,
                 Nav::Tomorrow
             ]
         );
+        // A sidebar arranged before Matrix stays as it was; the stock four
+        // gain Matrix.
+        let custom = Prefs::parse("sidebar = [\"today\", \"inbox\"]\n");
+        assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
+        let stock = Prefs::parse(
+            "sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n",
+        );
+        assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
         let text = toml::to_string(&old).unwrap();
         assert!(!text.contains("filters"));
         assert_eq!(Prefs::parse(&text).sidebar_views(), old.sidebar_views());

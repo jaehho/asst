@@ -785,3 +785,48 @@ menubutton.filtered > button {
   color: var(--accent-color);
   background-color: alpha(var(--accent-color), 0.12);
 }
+
+/* Eisenhower matrix: four cards, each with its own edge color. */
+.matrix {
+  min-height: 320px;
+}
+
+.matrix-quadrant {
+  border-radius: 12px;
+  background-color: var(--card-bg-color);
+  border: 1px solid var(--card-shade-color);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.matrix-quadrant.drop-hover {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px alpha(var(--accent-color), 0.35);
+}
+
+.matrix-quadrant .section-title {
+  font-weight: 700;
+}
+
+.matrix-quadrant.quadrant-do .section-title {
+  color: var(--p1);
+}
+
+.matrix-quadrant.quadrant-schedule .section-title {
+  color: var(--view-blue);
+}
+
+.matrix-quadrant.quadrant-delegate .section-title {
+  color: var(--p2);
+}
+
+.matrix-quadrant.quadrant-drop .section-title {
+  color: var(--dim-label-color, alpha(currentColor, 0.55));
+}
+
+.matrix-quadrant .task-list {
+  background: transparent;
+}
+
+.matrix-quadrant .task-list > row {
+  background: transparent;
+}

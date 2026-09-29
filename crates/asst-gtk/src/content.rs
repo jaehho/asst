@@ -8,10 +8,10 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use relm4::adw;
 use relm4::adw::prelude::*;
-use relm4::gtk;
+use relm4::gtk::{self, gdk, glib};
 
 use crate::addcard::Target;
-use crate::model::{Kind, Nav, Section};
+use crate::model::{Kind, Nav, Quadrant, Section};
 use crate::pickers::{self, DateOpts};
 use crate::row::{self, RowOpts};
 use crate::window::{Msg, Tx};
@@ -110,6 +110,13 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
     root.append(&title(o, open));
 
     let mut rows = Vec::new();
+    if matches!(o.nav, Nav::Matrix) {
+        root.append(&matrix(sections, o, tx, &mut rows));
+        if o.adding.is_some() {
+            root.append(&card());
+        }
+        return Built { root, rows };
+    }
     let any = sections.iter().any(|s| !s.tasks.is_empty());
     let mut placed = false;
     for s in sections {
@@ -133,6 +140,84 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
         root.append(&empty(o, tx));
     }
     Built { root, rows }
+}
+
+/// Eisenhower's 2×2: Do and Schedule on top, Delegate and Drop under.
+fn matrix(
+    sections: &[Section],
+    o: &Opts,
+    tx: &Tx,
+    rows: &mut Vec<(String, gtk::ListBoxRow)>,
+) -> gtk::Box {
+    let grid = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    grid.add_css_class("matrix");
+    grid.set_homogeneous(true);
+    for pair in sections.chunks(2) {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        line.set_homogeneous(true);
+        line.set_vexpand(true);
+        for s in pair {
+            line.append(&quadrant(s, o, tx, rows));
+        }
+        grid.append(&line);
+    }
+    grid
+}
+
+fn quadrant(
+    s: &Section,
+    o: &Opts,
+    tx: &Tx,
+    rows: &mut Vec<(String, gtk::ListBoxRow)>,
+) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("matrix-quadrant");
+    card.set_vexpand(true);
+    if let Kind::Quadrant(q) = s.kind {
+        card.add_css_class(q.css());
+        quadrant_drop(&card, q, tx);
+    }
+    card.append(&section(s, o, tx, rows));
+    card
+}
+
+/// A drop of a task onto a box retargets it there.
+fn quadrant_drop(widget: &impl IsA<gtk::Widget>, q: Quadrant, tx: &Tx) {
+    use crate::row::DRAG_PREFIX;
+
+    let target = gtk::DropTarget::new(
+        glib::Type::STRING,
+        gdk::DragAction::MOVE | gdk::DragAction::COPY,
+    );
+    let tx = tx.clone();
+    target.connect_accept(|_, drop| {
+        drop.formats().contain_mime_type("text/plain;charset=utf-8")
+            || drop.formats().contains_type(glib::Type::STRING)
+    });
+    {
+        let widget = widget.as_ref().clone();
+        target.connect_enter(move |_, _, _| {
+            widget.add_css_class("drop-hover");
+            gdk::DragAction::MOVE
+        });
+    }
+    {
+        let widget = widget.as_ref().clone();
+        target.connect_leave(move |_| {
+            widget.remove_css_class("drop-hover");
+        });
+    }
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(text) = value.get::<String>() else {
+            return false;
+        };
+        let Some(href) = text.strip_prefix(DRAG_PREFIX) else {
+            return false;
+        };
+        tx.emit(Msg::DropQuadrant(href.to_string(), q));
+        true
+    });
+    widget.add_controller(target);
 }
 
 /// The view's icon and name; under it the date, or how many open tasks it shows.

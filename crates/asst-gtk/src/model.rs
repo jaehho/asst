@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use asst_core::api::{ListView, StatusView, SyncState, TaskView};
+use asst_core::api::{Change, ListView, StatusView, SyncState, TaskView};
 use asst_core::fmt;
 use asst_core::task::{Task, priority_level};
 use asst_core::time::{Trigger, When, resolve, weekday_code};
@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 pub enum Nav {
     Inbox,
     Today,
+    /// Eisenhower's four boxes: important × urgent.
+    Matrix,
     Scheduled,
     Completed,
     Tomorrow,
@@ -29,10 +31,11 @@ pub enum Nav {
 
 impl Nav {
     /// The smart views, in sidebar order.
-    pub fn filters() -> [Nav; 8] {
+    pub fn filters() -> [Nav; 9] {
         [
             Nav::Inbox,
             Nav::Today,
+            Nav::Matrix,
             Nav::Scheduled,
             Nav::Completed,
             Nav::Tomorrow,
@@ -46,6 +49,7 @@ impl Nav {
         match self {
             Nav::Inbox => "Inbox".into(),
             Nav::Today => "Today".into(),
+            Nav::Matrix => "Matrix".into(),
             Nav::Scheduled => "Scheduled".into(),
             Nav::Completed => "Completed".into(),
             Nav::Tomorrow => "Tomorrow".into(),
@@ -63,6 +67,7 @@ impl Nav {
     pub fn keywords(&self) -> &'static [&'static str] {
         match self {
             Nav::Today => &["overdue"],
+            Nav::Matrix => &["eisenhower", "urgent", "important", "quadrant"],
             Nav::Scheduled => &["upcoming", "later"],
             Nav::Completed => &["done", "logbook", "finished"],
             Nav::Anytime => &["no date", "someday", "unscheduled"],
@@ -82,6 +87,7 @@ impl Nav {
         match self {
             Nav::Inbox => "The inbox list",
             Nav::Today => "Due today, and overdue",
+            Nav::Matrix => "Important and urgent, in four boxes",
             Nav::Scheduled => "Everything with a date, by day",
             Nav::Completed => "Done, by the day",
             Nav::Tomorrow => "Due tomorrow",
@@ -96,6 +102,7 @@ impl Nav {
         match self {
             Nav::Inbox => "mailbox-symbolic",
             Nav::Today => "star-outline-thick-symbolic",
+            Nav::Matrix => "flag-outline-thick-symbolic",
             Nav::Scheduled => "month-symbolic",
             Nav::Completed => "check-round-outline-symbolic",
             Nav::Tomorrow => "today-calendar-symbolic",
@@ -111,6 +118,7 @@ impl Nav {
         match self {
             Nav::Inbox | Nav::All | Nav::List(_) => "tint-blue",
             Nav::Today => "tint-green",
+            Nav::Matrix => "tint-orange",
             Nav::Scheduled | Nav::Tomorrow | Nav::Anytime | Nav::Repeating => "tint-purple",
             Nav::Completed => "tint-orange",
         }
@@ -121,6 +129,7 @@ impl Nav {
         match self {
             Nav::Inbox => "inbox".into(),
             Nav::Today => "today".into(),
+            Nav::Matrix => "matrix".into(),
             Nav::Scheduled => "scheduled".into(),
             Nav::Completed => "completed".into(),
             Nav::Tomorrow => "tomorrow".into(),
@@ -286,6 +295,100 @@ impl ViewOpts {
 
 // -- sections ---------------------------------------------------------------
 
+/// Eisenhower's four boxes. Importance is priority p1–p2; urgency is a due
+/// date on or before today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quadrant {
+    /// Important and urgent.
+    Do,
+    /// Important, not urgent.
+    Schedule,
+    /// Urgent, not important.
+    Delegate,
+    /// Neither.
+    Drop,
+}
+
+impl Quadrant {
+    pub const ALL: [Quadrant; 4] = [
+        Quadrant::Do,
+        Quadrant::Schedule,
+        Quadrant::Delegate,
+        Quadrant::Drop,
+    ];
+
+    pub fn important(self) -> bool {
+        matches!(self, Quadrant::Do | Quadrant::Schedule)
+    }
+
+    pub fn urgent(self) -> bool {
+        matches!(self, Quadrant::Do | Quadrant::Delegate)
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Quadrant::Do => "Do",
+            Quadrant::Schedule => "Schedule",
+            Quadrant::Delegate => "Delegate",
+            Quadrant::Drop => "Drop",
+        }
+    }
+
+    pub fn about(self) -> &'static str {
+        match self {
+            Quadrant::Do => "Important · Urgent",
+            Quadrant::Schedule => "Important · Later",
+            Quadrant::Delegate => "Not important · Urgent",
+            Quadrant::Drop => "Not important · Later",
+        }
+    }
+
+    /// CSS class on the quadrant card.
+    pub fn css(self) -> &'static str {
+        match self {
+            Quadrant::Do => "quadrant-do",
+            Quadrant::Schedule => "quadrant-schedule",
+            Quadrant::Delegate => "quadrant-delegate",
+            Quadrant::Drop => "quadrant-drop",
+        }
+    }
+}
+
+/// Which box a task is in: p1–p2 is important, due ≤ today is urgent.
+pub fn quadrant_of(priority: u8, due: Option<&When>, today: NaiveDate, zone: Tz) -> Quadrant {
+    let important = matches!(priority_level(priority), 1 | 2);
+    let urgent = due.is_some_and(|d| d.local_date(zone) <= today);
+    match (important, urgent) {
+        (true, true) => Quadrant::Do,
+        (true, false) => Quadrant::Schedule,
+        (false, true) => Quadrant::Delegate,
+        (false, false) => Quadrant::Drop,
+    }
+}
+
+/// The edit that lands `task` in `q`. Only the axes on the wrong side move:
+/// across importance, priority steps to p2 or p3; across urgency, the due
+/// date becomes today or goes away (and a repeat with it).
+pub fn retarget(task: &Task, q: Quadrant, today: NaiveDate, zone: Tz) -> Change {
+    let mut c = Change::default();
+    let is_important = matches!(priority_level(task.priority), 1 | 2);
+    if q.important() != is_important {
+        c.priority = Some(if q.important() { 2 } else { 3 });
+    }
+    let is_urgent = task.due.as_ref().is_some_and(|d| d.local_date(zone) <= today);
+    if q.urgent() != is_urgent {
+        if q.urgent() {
+            c.due = Some(Some(on_date(task.due.as_ref(), today, zone)));
+        } else {
+            c.due = Some(None);
+            if task.rrule.is_some() {
+                c.rrule = Some(None);
+            }
+        }
+    }
+    c
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     /// Due before today; these can be moved together.
@@ -296,6 +399,8 @@ pub enum Kind {
     Range,
     /// One list's tasks; a task added here goes to it.
     List(String),
+    /// One of the matrix's four boxes; dropping retargets the task.
+    Quadrant(Quadrant),
     Completed,
     Plain,
 }
@@ -486,6 +591,24 @@ pub fn plan(nav: &Nav, data: &Data, opts: &ViewOpts, now: DateTime<Tz>) -> Vec<S
             pick(&|t| t.task.due.is_none()),
             &|tasks| sorted(tasks, sort, zone),
         )),
+        Nav::Matrix => {
+            let mut boxes: [Vec<TaskView>; 4] = Default::default();
+            for t in pick(&|_| true) {
+                let q = quadrant_of(t.task.priority, t.task.due.as_ref(), today, zone);
+                boxes[Quadrant::ALL.iter().position(|x| *x == q).unwrap()].push(t);
+            }
+            for (q, tasks) in Quadrant::ALL.into_iter().zip(boxes) {
+                out.push(
+                    Section::new(
+                        Kind::Quadrant(q),
+                        Some(q.title().into()),
+                        sorted(tasks, sort, zone),
+                    )
+                    .note(q.about())
+                    .keep(),
+                );
+            }
+        }
         Nav::Repeating => {
             let tasks = sorted(pick(&|t| t.task.rrule.is_some()), sort, zone);
             out.push(Section::new(Kind::Plain, None, tasks).keep());
@@ -754,6 +877,8 @@ impl Counts {
         match nav {
             Nav::Inbox => Some(self.inbox),
             Nav::Today => Some(self.today),
+            // Every open task sits in some box.
+            Nav::Matrix => Some(self.all),
             Nav::Scheduled => Some(self.scheduled),
             Nav::Completed => None,
             Nav::Tomorrow => Some(self.tomorrow),
@@ -1453,5 +1578,104 @@ mod tests {
         {
             assert_eq!(Nav::from_key(&n.key()), Some(n));
         }
+    }
+
+    fn with(task: &TaskView, priority: u8, due: Option<When>) -> TaskView {
+        let mut t = task.clone();
+        t.task.priority = priority;
+        t.task.due = due;
+        t
+    }
+
+    #[test]
+    fn matrix_boxes_by_priority_and_due() {
+        // p1–p2 is important; due on or before today is urgent.
+        let day = on(date(9, 14));
+        let late = on(date(9, 20));
+        let early = on(date(9, 1));
+        assert_eq!(
+            quadrant_of(1, day.as_ref(), date(9, 14), ny()),
+            Quadrant::Do
+        );
+        assert_eq!(
+            quadrant_of(5, early.as_ref(), date(9, 14), ny()),
+            Quadrant::Do
+        );
+        assert_eq!(
+            quadrant_of(1, late.as_ref(), date(9, 14), ny()),
+            Quadrant::Schedule
+        );
+        assert_eq!(quadrant_of(5, None, date(9, 14), ny()), Quadrant::Schedule);
+        assert_eq!(
+            quadrant_of(9, day.as_ref(), date(9, 14), ny()),
+            Quadrant::Delegate
+        );
+        assert_eq!(
+            quadrant_of(0, early.as_ref(), date(9, 14), ny()),
+            Quadrant::Delegate
+        );
+        assert_eq!(
+            quadrant_of(9, late.as_ref(), date(9, 14), ny()),
+            Quadrant::Drop
+        );
+        assert_eq!(quadrant_of(0, None, date(9, 14), ny()), Quadrant::Drop);
+    }
+
+    #[test]
+    fn matrix_view_fills_all_four_boxes() {
+        let lists = lists();
+        let open = vec![
+            with(&task("do", "/a/", on(date(9, 14))), 1, on(date(9, 14))),
+            with(&task("plan", "/a/", on(date(9, 20))), 1, on(date(9, 20))),
+            with(&task("rush", "/b/", on(date(9, 10))), 0, on(date(9, 10))),
+            with(&task("later", "/b/", None), 9, None),
+        ];
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: None,
+            sunday_first: false,
+        };
+        let s = plan(&Nav::Matrix, &data, &ViewOpts::default(), now());
+        assert_eq!(s.len(), 4);
+        assert_eq!(uids(&s[0]), ["do"]);
+        assert_eq!(uids(&s[1]), ["plan"]);
+        assert_eq!(uids(&s[2]), ["rush"]);
+        assert_eq!(uids(&s[3]), ["later"]);
+        assert!(s.iter().all(|s| s.keep));
+    }
+
+    #[test]
+    fn retarget_only_moves_the_wrong_axis() {
+        let base = task("x", "/a/", on(date(9, 14)));
+        // Already in Do: nothing to do.
+        let do_now = with(&base, 1, on(date(9, 14)));
+        assert_eq!(
+            retarget(&do_now.task, Quadrant::Do, date(9, 14), ny()),
+            Change::default()
+        );
+        // Across importance only (Do → Delegate): p3, date kept.
+        let c = retarget(&do_now.task, Quadrant::Delegate, date(9, 14), ny());
+        assert_eq!(c.priority, Some(3));
+        assert_eq!(c.due, None);
+        // Across urgency only (Do → Schedule): no date, priority kept.
+        let c = retarget(&do_now.task, Quadrant::Schedule, date(9, 14), ny());
+        assert_eq!(c.priority, None);
+        assert_eq!(c.due, Some(None));
+        // Across both (Do → Drop): p3 and no date.
+        let c = retarget(&do_now.task, Quadrant::Drop, date(9, 14), ny());
+        assert_eq!(c.priority, Some(3));
+        assert_eq!(c.due, Some(None));
+        // Into Do from a dated-later, no-priority task: p2 and today.
+        let soft = with(&base, 0, on(date(9, 20)));
+        let c = retarget(&soft.task, Quadrant::Do, date(9, 14), ny());
+        assert_eq!(c.priority, Some(2));
+        assert_eq!(c.due, Some(Some(When::Date { date: date(9, 14) })));
+        // Dropping a repeat out of urgency clears the rule with the date.
+        let mut rep = with(&base, 0, on(date(9, 14)));
+        rep.task.rrule = Some("FREQ=WEEKLY".into());
+        let c = retarget(&rep.task, Quadrant::Drop, date(9, 14), ny());
+        assert_eq!(c.due, Some(None));
+        assert_eq!(c.rrule, Some(None));
     }
 }

@@ -468,7 +468,7 @@ impl Sidebar {
             }
             if !matches!(
                 nav,
-                Nav::Scheduled | Nav::Anytime | Nav::Repeating | Nav::All
+                Nav::Matrix | Nav::Scheduled | Nav::Anytime | Nav::Repeating | Nav::All
             ) {
                 drop_target(&child, nav.clone(), &self.tx);
             }

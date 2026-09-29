@@ -29,7 +29,7 @@ The daemon, not the window, keeps sync and reminders alive, so closing the windo
 
 Planify's look and layout, rebuilt in relm4, because the first plain libadwaita list felt bare next to it:
 - **Sidebar:** colored view tiles with counts, then lists with color rings.
-- **Views:** a big title, then sections under a rule.
+- **Views:** a big title, then sections under a rule. Matrix is the exception: four cards in a 2×2 (Do / Schedule / Delegate / Drop), from TickTick's Eisenhower view. Placement is pure model: p1–p2 is important, due ≤ today is urgent. Dropping on a box edits only the axes on the wrong side (priority → p2/p3, due → today or none), never rewriting the task.
 - **Tasks open in place:** the row grows into a card with the title, notes and a bar of buttons, as in Planify. A pane on the right came first; the card was preferred.
 - **Pickers:** Planify's date picker (suggestions, three weeks, time, repeat), plus priority, list and reminder pickers.
 - **Also:** the task menu, the add card, Quick Find, selection, and Planify's colors and icons (GNOME Icon Development Kit, bundled as a GResource).
@@ -82,7 +82,7 @@ From decompiled iOS 18/26 ReminderKit (via research, not a device test):
 
 ## Features
 
-**v1:** CalDAV lists as projects, title, notes (plain text, with lists that carry on and links), linked notes (files in Nextcloud Notes' folder), due date/time, recurrence (RRULE), reminders (VALARM → notifications with snooze/complete/open), priority p1–p4 (iOS high/medium/low = 1/5/9), Today (with overdue), Scheduled, Inbox (a Nextcloud list), a few smart filters, search, completed tasks, archived lists, location reminders (made here or on the iPhone, fired on arrival), quick-add syntax (`#project p1 !reminder`, natural-language dates, `every …`; see `quickadd.rs`), CLI, vim-style keys, waybar module, a Hyprland bind for quick add (a layer surface, so no window rules).
+**v1:** CalDAV lists as projects, title, notes (plain text, with lists that carry on and links), linked notes (files in Nextcloud Notes' folder), due date/time, recurrence (RRULE), reminders (VALARM → notifications with snooze/complete/open), priority p1–p4 (iOS high/medium/low = 1/5/9), Today (with overdue), Matrix (Eisenhower 2×2), Scheduled, Inbox (a Nextcloud list), a few smart filters, search, completed tasks, archived lists, location reminders (made here or on the iPhone, fired on arrival), quick-add syntax (`#project p1 !reminder`, natural-language dates, `every …`; see `quickadd.rs`), CLI, vim-style keys, waybar module, a Hyprland bind for quick add (a layer surface, so no window rules).
 
 **Deferred (decide later):** subtasks (they cannot match the phone over CalDAV), spell checking, productivity stats, completion sound.
 
