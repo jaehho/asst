@@ -830,3 +830,18 @@ menubutton.filtered > button {
 .matrix-quadrant .task-list > row {
   background: transparent;
 }
+
+/* The list scrolls inside the card; keep the scroller chrome out of the way. */
+.matrix-quadrant .quadrant-scroll {
+  background: transparent;
+}
+
+.matrix-quadrant .quadrant-scroll undershoot {
+  background: none;
+  box-shadow: none;
+}
+
+.matrix-quadrant .quadrant-scroll scrollbar {
+  min-width: 8px;
+  margin: 2px;
+}

@@ -29,7 +29,7 @@ The daemon, not the window, keeps sync and reminders alive, so closing the windo
 
 Planify's look and layout, rebuilt in relm4, because the first plain libadwaita list felt bare next to it:
 - **Sidebar:** colored view tiles with counts, then lists with color rings.
-- **Views:** a big title, then sections under a rule. Matrix is the exception: four cards in a 2×2 (Do / Schedule / Delegate / Drop), from TickTick's Eisenhower view. Placement is pure model: p1–p2 is important, due ≤ today is urgent. Dropping on a box edits only the axes on the wrong side (priority → p2/p3, due → today or none), never rewriting the task.
+- **Views:** a big title, then sections under a rule. Matrix is the exception: four cards in a 2×2 (Do / Schedule / Delegate / Drop), from TickTick's Eisenhower view. Each card's list is a scroller capped at a fixed height, so the four stay equal without growing to the longest box. Placement is pure model: p1–p2 is important, due ≤ today is urgent. Dropping on a box edits only the axes on the wrong side (priority → p2/p3, due → today or none), never rewriting the task.
 - **Tasks open in place:** the row grows into a card with the title, notes and a bar of buttons, as in Planify. A pane on the right came first; the card was preferred.
 - **Pickers:** Planify's date picker (suggestions, three weeks, time, repeat), plus priority, list and reminder pickers.
 - **Also:** the task menu, the add card, Quick Find, selection, and Planify's colors and icons (GNOME Icon Development Kit, bundled as a GResource).

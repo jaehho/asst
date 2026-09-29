@@ -125,7 +125,7 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
         }
         let target = section_target(&s.kind);
         let adding_here = target.is_some() && target == o.adding;
-        root.append(&section(s, o, tx, &mut rows));
+        root.append(&section(s, o, tx, &mut rows, None));
         if adding_here {
             root.append(&card());
             placed = true;
@@ -141,6 +141,11 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
     }
     Built { root, rows }
 }
+
+/// How tall a matrix box's task list may get before it scrolls. The four
+/// boxes stay equal (homogeneous), sized by the tallest list capped here,
+/// so a full Drop does not stretch the whole 2×2 to 117 rows.
+const QUADRANT_LIST_MAX: i32 = 320;
 
 /// Eisenhower's 2×2: Do and Schedule on top, Delegate and Drop under.
 fn matrix(
@@ -164,12 +169,7 @@ fn matrix(
     grid
 }
 
-fn quadrant(
-    s: &Section,
-    o: &Opts,
-    tx: &Tx,
-    rows: &mut Vec<(String, gtk::ListBoxRow)>,
-) -> gtk::Box {
+fn quadrant(s: &Section, o: &Opts, tx: &Tx, rows: &mut Vec<(String, gtk::ListBoxRow)>) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("matrix-quadrant");
     card.set_vexpand(true);
@@ -177,7 +177,7 @@ fn quadrant(
         card.add_css_class(q.css());
         quadrant_drop(&card, q, tx);
     }
-    card.append(&section(s, o, tx, rows));
+    card.append(&section(s, o, tx, rows, Some(QUADRANT_LIST_MAX)));
     card
 }
 
@@ -267,7 +267,15 @@ fn title(o: &Opts, open: usize) -> gtk::Box {
     b
 }
 
-fn section(s: &Section, o: &Opts, tx: &Tx, rows: &mut Vec<(String, gtk::ListBoxRow)>) -> gtk::Box {
+/// `list_max_height` wraps the rows in a scroller of that height (the
+/// matrix boxes). Other views scroll as a whole and pass `None`.
+fn section(
+    s: &Section,
+    o: &Opts,
+    tx: &Tx,
+    rows: &mut Vec<(String, gtk::ListBoxRow)>,
+    list_max_height: Option<i32>,
+) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
     b.add_css_class("task-section");
     if let Some(title) = &s.title {
@@ -360,7 +368,22 @@ fn section(s: &Section, o: &Opts, tx: &Tx, rows: &mut Vec<(String, gtk::ListBoxR
         list.append(&r);
         rows.push((t.href.clone(), r));
     }
-    b.append(&list);
+    match list_max_height {
+        Some(max) => {
+            // Short lists stay short; long ones scroll inside the box.
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&list)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .propagate_natural_height(true)
+                .max_content_height(max)
+                .min_content_height(96)
+                .vexpand(true)
+                .build();
+            scroller.add_css_class("quadrant-scroll");
+            b.append(&scroller);
+        }
+        None => b.append(&list),
+    }
     b
 }
 
