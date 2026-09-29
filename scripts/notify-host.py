@@ -38,18 +38,18 @@ XML = """
 
 PATH = "/org/freedesktop/Notifications"
 IFACE = "org.freedesktop.Notifications"
-last_id = 0
+_last_id = [0]
 
 
-def call(conn, sender, path, iface, method, params, invocation):
-    global last_id
+def call(conn, _sender, _path, _iface, method, params, invocation):
+    """D-Bus method-call callback; the signature is fixed by Gio."""
     if method == "Notify":
         app, replaces, _icon, summary, body, actions, _hints, _timeout = params.unpack()
-        last_id = replaces or last_id + 1
-        pairs = dict(zip(actions[::2], actions[1::2]))
-        line = {"id": last_id, "app": app, "summary": summary, "body": body, "actions": pairs}
+        _last_id[0] = replaces or _last_id[0] + 1
+        pairs = dict(zip(actions[::2], actions[1::2], strict=True))
+        line = {"id": _last_id[0], "app": app, "summary": summary, "body": body, "actions": pairs}
         print(json.dumps(line), flush=True)
-        invocation.return_value(GLib.Variant("(u)", (last_id,)))
+        invocation.return_value(GLib.Variant("(u)", (_last_id[0],)))
     elif method == "CloseNotification":
         (nid,) = params.unpack()
         print(json.dumps({"closed": nid}), flush=True)
@@ -74,7 +74,7 @@ def acquired(conn, name):
     print(json.dumps({"serving": name}), flush=True)
 
 
-def lost(conn, name):
+def lost(_conn, name):
     print(json.dumps({"lost": name}), flush=True)
     sys.exit(1)
 

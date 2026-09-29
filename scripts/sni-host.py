@@ -24,7 +24,8 @@ XML = """
 items: list[str] = []
 
 
-def call(conn, sender, path, iface, method, params, invocation):
+def call(conn, _sender, _path, _iface, method, params, invocation):
+    """D-Bus method-call callback; the signature is fixed by Gio."""
     if method == "RegisterStatusNotifierItem":
         (service,) = params.unpack()
         item = service if "/" in service else f"{service}/StatusNotifierItem"
@@ -41,7 +42,8 @@ def call(conn, sender, path, iface, method, params, invocation):
     invocation.return_value(None)
 
 
-def get(conn, sender, path, iface, prop):
+def get(_conn, _sender, _path, _iface, prop):
+    """D-Bus property-get callback; the signature is fixed by Gio."""
     return {
         "RegisteredStatusNotifierItems": GLib.Variant("as", items),
         "IsStatusNotifierHostRegistered": GLib.Variant("b", True),
@@ -49,15 +51,15 @@ def get(conn, sender, path, iface, prop):
     }[prop]
 
 
-def acquired(conn, name):
+def acquired(conn, _name):
     info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
     register = getattr(conn, "register_object_with_closures2", conn.register_object)
     register("/StatusNotifierWatcher", info, call, get, None)
     print("watching", flush=True)
 
 
-def lost(conn, name):
-    print("lost org.kde.StatusNotifierWatcher", flush=True)
+def lost(_conn, name):
+    print(f"lost {name}", flush=True)
     sys.exit(1)
 
 
