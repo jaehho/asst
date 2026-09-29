@@ -1,0 +1,111 @@
+#!/bin/sh
+# What asst-live must never do: run a binary when the build failed, or run
+# something other than the name it was invoked as. Cheap, and wrong here
+# means a stale app with no sign anything broke.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/bin" "$tmp/src/target/release"
+# Cargo that always fails.
+cat >"$tmp/bin/cargo" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$tmp/bin/cargo"
+# A binary that would leave a mark if anyone ran it.
+cat >"$tmp/src/target/release/asst" <<'EOF'
+#!/bin/sh
+echo ran >>"$MARKER"
+EOF
+chmod +x "$tmp/src/target/release/asst"
+touch "$tmp/src/Cargo.toml"
+
+# Invoke as `asst`, the way PATH and the desktop file do.
+ln -s "$here/asst-live" "$tmp/bin/asst"
+
+export MARKER="$tmp/marker"
+export ASST_SRC="$tmp/src"
+export PATH="$tmp/bin:$PATH"
+export XDG_STATE_HOME="$tmp/state"
+
+if out=$("$tmp/bin/asst" 2>&1); then
+  echo "FAIL: expected a non-zero exit when the build fails" >&2
+  exit 1
+fi
+if [ -e "$MARKER" ]; then
+  echo "FAIL: the binary ran after a failed build" >&2
+  exit 1
+fi
+case $out in
+  *"build failed"*) ;;
+  *)
+    echo "FAIL: no build-failed message; got: $out" >&2
+    exit 1
+    ;;
+esac
+
+# Wrong name: refuse, and do not build.
+cat >"$tmp/bin/cargo" <<'EOF'
+#!/bin/sh
+echo built >>"$MARKER"
+EOF
+chmod +x "$tmp/bin/cargo"
+ln -s "$here/asst-live" "$tmp/bin/nope"
+if out=$("$tmp/bin/nope" 2>&1); then
+  echo "FAIL: expected a non-zero exit for an unknown name" >&2
+  exit 1
+fi
+if [ -e "$MARKER" ]; then
+  echo "FAIL: built for a name that is not asst/asst-gtk/asstd" >&2
+  exit 1
+fi
+
+# Happy path: a successful build runs exactly that binary, with our args.
+cat >"$tmp/bin/cargo" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$tmp/bin/cargo"
+cat >"$tmp/src/target/release/asst" <<'EOF'
+#!/bin/sh
+echo "args:$*" >>"$MARKER"
+EOF
+chmod +x "$tmp/src/target/release/asst"
+if ! out=$("$tmp/bin/asst" one two 2>&1); then
+  echo "FAIL: happy path exited non-zero: $out" >&2
+  exit 1
+fi
+[ "$(cat "$MARKER")" = "args:one two" ] || {
+  echo "FAIL: did not exec the binary with our args; got $(cat "$MARKER" 2>/dev/null)" >&2
+  exit 1
+}
+
+# After `make install`, the baked-in tree wins over $HOME/projects/asst,
+# and the sentinel must not have eaten the fallback check.
+sed "s|^DEFAULT_ROOT=\"@ROOT@\"|DEFAULT_ROOT=\"$tmp/src\"|" \
+  "$here/asst-live" >"$tmp/bin/installed"
+chmod 755 "$tmp/bin/installed"
+# A copy under the name `asst`, not a symlink back at scripts/asst-live.
+rm -f "$tmp/bin/asst"
+cp "$tmp/bin/installed" "$tmp/bin/asst"
+: >"$MARKER"
+if ! out=$(HOME="$tmp/home" ASST_SRC= PATH="$tmp/bin:$PATH" \
+  XDG_STATE_HOME="$tmp/state" MARKER="$MARKER" "$tmp/bin/asst" x 2>&1); then
+  echo "FAIL: installed wrapper exited non-zero: $out" >&2
+  exit 1
+fi
+[ "$(cat "$MARKER")" = "args:x" ] || {
+  echo "FAIL: installed wrapper did not use the baked-in tree; got $(cat "$MARKER" 2>/dev/null)" >&2
+  exit 1
+}
+
+# The source tree must still be the uninstalled template.
+grep -q 'DEFAULT_ROOT="@ROOT@"' "$here/asst-live" || {
+  echo "FAIL: scripts/asst-live lost its @ROOT@ sentinel" >&2
+  exit 1
+}
+
+echo "asst-live: ok"

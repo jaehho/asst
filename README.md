@@ -5,10 +5,12 @@ Tasks and reminders on a CalDAV server (built against Nextcloud, interoperating 
 ## Install
 
 ```sh
-make install                       # ~/.local/bin, user unit, D-Bus services, desktop entry
+make install                       # live wrappers in ~/.local/bin, user unit, D-Bus services, desktop entry
 systemctl --user enable --now asstd
 asst login cloud.example.com       # opens the browser; approves an app password for asst
 ```
+
+`make install` puts a **wrapper** at `~/.local/bin/{asst,asst-gtk,asstd}` (one script, three names). Each run rebuilds that package from the checkout that installed it and then runs it, so the window, CLI and daemon are always the working tree, released or not. A failed build refuses to start and points at `~/.local/state/asst-live.log`; `ASST_SRC` runs a different tree. `make test-live` pins that behavior.
 
 `packaging/PKGBUILD` builds `asst-git` for Arch. Needs gtk4, libadwaita, gtk4-layer-shell, and a Secret Service (gnome-keyring, KeePassXC) for the app password.
 

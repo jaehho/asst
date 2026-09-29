@@ -1,7 +1,7 @@
 # asst: CalDAV tasks. asstd syncs and reminds; asst, the bar, the window and
 # quick add all talk to it.
 
-.PHONY: help dev daemon window quick-add test nextcloud-test lint fmt build install uninstall package srcinfo clean
+.PHONY: help dev daemon window quick-add test test-live nextcloud-test lint fmt build install uninstall package srcinfo clean
 
 PREFIX  ?= $(HOME)/.local
 DATADIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)
@@ -24,8 +24,11 @@ window:          ## the window, from the source tree
 quick-add:       ## the quick-add popup, from the source tree
 	cargo run -p asst-gtk -- quick-add
 
-test:            ## unit tests: no server, no bus
+test: test-live  ## unit tests: no server, no bus
 	cargo test --workspace
+
+test-live:       ## the install wrapper never runs a failed build
+	scripts/test-asst-live
 
 nextcloud-test:  ## round trip against a real server, in a list it creates and removes (ASST_TEST_DAV_URL, _USERNAME, _PASSWORD)
 	cargo test -p asst-core --test nextcloud -- --ignored --nocapture
@@ -40,10 +43,14 @@ fmt:
 build:           ## optimized binaries -> target/release/
 	cargo build --release --workspace
 
-install: build   ## into ~/.local for this user (no sudo)
-	install -Dm755 target/release/asst $(PREFIX)/bin/asst
-	install -Dm755 target/release/asstd $(PREFIX)/bin/asstd
-	install -Dm755 target/release/asst-gtk $(PREFIX)/bin/asst-gtk
+install:         ## live wrappers in ~/.local for this user (no sudo)
+	# Three names, one script. Each rebuilds its package from this tree
+	# on the way in. @ROOT@ becomes the checkout that installed it.
+	install -d $(PREFIX)/bin
+	sed 's|^DEFAULT_ROOT="@ROOT@"|DEFAULT_ROOT="$(CURDIR)"|' scripts/asst-live > $(PREFIX)/bin/asst
+	chmod 755 $(PREFIX)/bin/asst
+	ln -sf asst $(PREFIX)/bin/asst-gtk
+	ln -sf asst $(PREFIX)/bin/asstd
 	install -Dm644 packaging/icons/dev.jaeho.Asst.svg $(DATADIR)/icons/hicolor/scalable/apps/dev.jaeho.Asst.svg
 	mkdir -p $(DATADIR)/applications
 	sed 's#^Exec=asst-gtk#Exec=$(PREFIX)/bin/asst-gtk#' packaging/dev.jaeho.Asst.desktop > $(DATADIR)/applications/dev.jaeho.Asst.desktop

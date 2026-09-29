@@ -1,0 +1,62 @@
+#!/bin/sh
+# asst, asst-gtk, asstd from the working checkout: rebuild when the tree
+# moves, then run that binary. Installed by `make install` under those
+# three names (see also steno's wrapper). ASST_SRC points at another tree.
+#
+# Rules this relies on:
+#   - a failed build never runs a binary (stale code is worse than no code)
+#   - exec, so the app is this process (signals, one PID, exit status)
+#   - build output lands in a log; GUI launches have no console
+set -eu
+
+# The checkout this was installed from. `make install` rewrites the
+# DEFAULT_ROOT line only; the @ROOT@ below stays a sentinel, so a run out
+# of scripts/ still recognizes an uninstalled copy.
+DEFAULT_ROOT="@ROOT@"
+if [ "$DEFAULT_ROOT" = "@ROOT@" ]; then
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  if [ -f "$d/../Cargo.toml" ]; then
+    DEFAULT_ROOT=$(CDPATH= cd -- "$d/.." && pwd)
+  else
+    DEFAULT_ROOT="${HOME}/projects/asst"
+  fi
+fi
+ROOT="${ASST_SRC:-$DEFAULT_ROOT}"
+
+name=$(basename "$0")
+case "$name" in
+  asst | asst-gtk | asstd) pkg=$name ;;
+  *)
+    echo "asst-live: run as asst, asst-gtk or asstd, not '$name'" >&2
+    exit 127
+    ;;
+esac
+
+fail() {
+  echo "asst-live: $*" >&2
+  # Desktop launches have no console; say it somewhere the user will see.
+  if [ "$name" != asstd ] && command -v notify-send >/dev/null 2>&1; then
+    notify-send -a asst -u critical "asst" "$*" 2>/dev/null || true
+  fi
+  exit 1
+}
+
+[ -f "$ROOT/Cargo.toml" ] || fail "no checkout at $ROOT (set ASST_SRC)"
+command -v cargo >/dev/null 2>&1 || fail "cargo not on PATH"
+
+# Keep the last build output somewhere a failed GUI launch can point at.
+log="${XDG_STATE_HOME:-$HOME/.local/state}/asst-live.log"
+mkdir -p "$(dirname "$log")"
+
+# Incremental: a tree that is already fresh finishes in well under a second.
+# Two launches at once serialize on cargo's lock, which is what we want.
+if ! cargo build --release --manifest-path "$ROOT/Cargo.toml" -p "$pkg" \
+  >"$log" 2>&1
+then
+  fail "build failed; see $log"
+fi
+
+bin="$ROOT/target/release/$name"
+[ -x "$bin" ] || fail "build left no $bin; see $log"
+
+exec "$bin" "$@"
