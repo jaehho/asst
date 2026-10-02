@@ -10,7 +10,7 @@ systemctl --user enable --now asstd
 asst login cloud.example.com       # opens the browser; approves an app password for asst
 ```
 
-`make install` puts a **wrapper** at `~/.local/bin/{asst,asst-gtk,asstd}` (one script, three names). Each run rebuilds that package from the checkout that installed it and then runs it, so the window, CLI and daemon are always the working tree, released or not. A failed build refuses to start and points at `~/.local/state/asst-live.log`; `ASST_SRC` runs a different tree. `make test-live` pins that behavior.
+`make install` puts a **wrapper** at `~/.local/bin/{asst,asst-gtk,asstd}` (one script, three names). It runs the binary from the checkout that installed it right away and rebuilds in the background, so opening the window never waits on cargo. The next launch picks up source changes. With no binary yet, a failed build refuses to start and points at `~/.local/state/asst-live.log`; `ASST_SRC` runs a different tree. `make test-live` pins that behavior.
 
 `packaging/PKGBUILD` builds `asst-git` for Arch. Needs gtk4, libadwaita, gtk4-layer-shell, and a Secret Service (gnome-keyring, KeePassXC) for the app password.
 
@@ -31,7 +31,7 @@ asst track ingest [--date YYYY-MM-DD] [--dry-run] | asst track tags | asst track
 
 IDs are the shortest unambiguous UID prefix shown in listings. `--json` works everywhere; `asst add --source kind:id` is idempotent, for tools that file tasks.
 
-**ActivityWatch:** sensors live in `~/projects/aw-watchers`; raw rollups are stock AW (`aw` / webui). `asst track ingest` tags AFK-clipped spans (`~/.config/asst/tags.toml`) and writes them to the `blocks` table (`planned=0`). `suggest` prints rule stubs for untagged sources.
+**ActivityWatch:** sensors live in `~/projects/aw-watchers`; raw rollups are stock AW (`aw` / webui). The **Time** sidebar view shows one day of tagged blocks. `asst track ingest` (CLI, for tools) tags AFK-clipped spans (`~/.config/asst/tags.toml`) into `blocks` (`planned=0`); `suggest` prints rule stubs for untagged sources.
 
 **GitHub issues:** `asst link <list> <owner/repo>` keeps a list and a repo's issues in step: title, notes (as the issue body), open/closed and priority (`P1`–`P3` labels) both ways; a task's other labels are left alone. `asst link` shows the links, `asst unlink <owner/repo>` drops one. asstd uses `$GITHUB_TOKEN`, or the token `gh auth login` stored.
 

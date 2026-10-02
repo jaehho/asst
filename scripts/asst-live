@@ -1,10 +1,12 @@
 #!/bin/sh
-# asst, asst-gtk, asstd from the working checkout: rebuild when the tree
-# moves, then run that binary. Installed by `make install` under those
-# three names (see also steno's wrapper). ASST_SRC points at another tree.
+# asst, asst-gtk, asstd from the working checkout. Installed by `make install`
+# under those three names (see also steno's wrapper). ASST_SRC points at
+# another tree.
 #
 # Rules this relies on:
-#   - a failed build never runs a binary (stale code is worse than no code)
+#   - with no binary yet, a failed build never runs (first install is exact)
+#   - with a binary already there, run it now and rebuild in the background,
+#     so opening the window never waits on a dirty cargo tree
 #   - exec, so the app is this process (signals, one PID, exit status)
 #   - build output lands in a log; GUI launches have no console
 set -eu
@@ -44,19 +46,38 @@ fail() {
 [ -f "$ROOT/Cargo.toml" ] || fail "no checkout at $ROOT (set ASST_SRC)"
 command -v cargo >/dev/null 2>&1 || fail "cargo not on PATH"
 
-# Keep the last build output somewhere a failed GUI launch can point at.
+# Keep the build output somewhere a failed launch can point at.
 log="${XDG_STATE_HOME:-$HOME/.local/state}/asst-live.log"
 mkdir -p "$(dirname "$log")"
+bin="$ROOT/target/release/$name"
 
-# Incremental: a tree that is already fresh finishes in well under a second.
-# Two launches at once serialize on cargo's lock, which is what we want.
-if ! cargo build --release --manifest-path "$ROOT/Cargo.toml" -p "$pkg" \
-  >"$log" 2>&1
-then
-  fail "build failed; see $log"
+build() {
+  cargo build --release --manifest-path "$ROOT/Cargo.toml" -p "$pkg"
+}
+
+# Background rebuild: next launch picks up the tree. Failures stay in the log;
+# the running binary is left alone. Two launches serialize on cargo's lock.
+# nohup: exec would otherwise let the shell take the build down with it.
+rebuild_later() {
+  nohup sh -c '
+    log=$1 name=$2 manifest=$3 pkg=$4
+    if ! cargo build --release --manifest-path "$manifest" -p "$pkg"; then
+      if [ "$name" != asstd ] && command -v notify-send >/dev/null 2>&1; then
+        notify-send -a asst -u critical "asst" "background build failed; see $log" \
+          2>/dev/null || true
+      fi
+    fi
+  ' sh "$log" "$name" "$ROOT/Cargo.toml" "$pkg" >>"$log" 2>&1 &
+}
+
+if [ -x "$bin" ]; then
+  rebuild_later
+  exec "$bin" "$@"
 fi
 
-bin="$ROOT/target/release/$name"
+# Nothing to run yet: build here, and do not start on a failed build.
+if ! build >"$log" 2>&1; then
+  fail "build failed; see $log"
+fi
 [ -x "$bin" ] || fail "build left no $bin; see $log"
-
 exec "$bin" "$@"

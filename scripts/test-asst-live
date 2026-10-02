@@ -1,7 +1,7 @@
 #!/bin/sh
-# What asst-live must never do: run a binary when the build failed, or run
-# something other than the name it was invoked as. Cheap, and wrong here
-# means a stale app with no sign anything broke.
+# What asst-live must do: never run a missing binary after a failed first
+# build; with a binary present, run it now and rebuild in the background;
+# never run a name that is not asst/asst-gtk/asstd.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -31,12 +31,14 @@ export ASST_SRC="$tmp/src"
 export PATH="$tmp/bin:$PATH"
 export XDG_STATE_HOME="$tmp/state"
 
+# First install: no binary yet, failed build must not run anything.
+rm -f "$tmp/src/target/release/asst"
 if out=$("$tmp/bin/asst" 2>&1); then
-  echo "FAIL: expected a non-zero exit when the build fails" >&2
+  echo "FAIL: expected a non-zero exit when the first build fails" >&2
   exit 1
 fi
 if [ -e "$MARKER" ]; then
-  echo "FAIL: the binary ran after a failed build" >&2
+  echo "FAIL: something ran after a failed first build" >&2
   exit 1
 fi
 case $out in
@@ -63,10 +65,12 @@ if [ -e "$MARKER" ]; then
   exit 1
 fi
 
-# Happy path: a successful build runs exactly that binary, with our args.
+# Binary present: run it now (args preserved) even if the background build fails.
 cat >"$tmp/bin/cargo" <<'EOF'
 #!/bin/sh
-exit 0
+echo built >>"$MARKER"
+sleep 0.2
+exit 1
 EOF
 chmod +x "$tmp/bin/cargo"
 cat >"$tmp/src/target/release/asst" <<'EOF'
@@ -74,12 +78,20 @@ cat >"$tmp/src/target/release/asst" <<'EOF'
 echo "args:$*" >>"$MARKER"
 EOF
 chmod +x "$tmp/src/target/release/asst"
+: >"$MARKER"
 if ! out=$("$tmp/bin/asst" one two 2>&1); then
-  echo "FAIL: happy path exited non-zero: $out" >&2
+  echo "FAIL: existing binary did not run: $out" >&2
   exit 1
 fi
-[ "$(cat "$MARKER")" = "args:one two" ] || {
-  echo "FAIL: did not exec the binary with our args; got $(cat "$MARKER" 2>/dev/null)" >&2
+# The foreground is only the binary; cargo runs in the background.
+grep -q '^args:one two$' "$MARKER" || {
+  echo "FAIL: did not exec the binary with our args; got $(cat "$MARKER")" >&2
+  exit 1
+}
+# Wait briefly for the background build to touch MARKER (and then fail).
+sleep 0.5
+grep -q '^built$' "$MARKER" || {
+  echo "FAIL: did not kick a background rebuild; got $(cat "$MARKER")" >&2
   exit 1
 }
 
@@ -97,8 +109,8 @@ if ! out=$(HOME="$tmp/home" ASST_SRC= PATH="$tmp/bin:$PATH" \
   echo "FAIL: installed wrapper exited non-zero: $out" >&2
   exit 1
 fi
-[ "$(cat "$MARKER")" = "args:x" ] || {
-  echo "FAIL: installed wrapper did not use the baked-in tree; got $(cat "$MARKER" 2>/dev/null)" >&2
+grep -q '^args:x$' "$MARKER" || {
+  echo "FAIL: installed wrapper did not use the baked-in tree; got $(cat "$MARKER")" >&2
   exit 1
 }
 
