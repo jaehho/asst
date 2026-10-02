@@ -72,11 +72,12 @@ impl Default for Prefs {
 }
 
 /// The views a new sidebar has.
-const DEFAULT_SIDEBAR: [Nav; 5] = [
+const DEFAULT_SIDEBAR: [Nav; 6] = [
     Nav::Inbox,
     Nav::Today,
     Nav::Matrix,
     Nav::Scheduled,
+    Nav::Time,
     Nav::Completed,
 ];
 
@@ -106,6 +107,15 @@ impl Prefs {
             && keys.iter().map(String::as_str).eq(BEFORE_MATRIX)
         {
             p.sidebar = Some(DEFAULT_SIDEBAR.iter().map(Nav::key).collect());
+        }
+        // Same for Time after the stock five: insert it before Completed.
+        if let Some(keys) = &mut p.sidebar {
+            let has_time = keys.iter().any(|k| k == "time");
+            let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
+            const BEFORE_TIME: [&str; 5] = ["inbox", "today", "matrix", "scheduled", "completed"];
+            if !has_time && stock == BEFORE_TIME {
+                *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
+            }
         }
         p
     }
@@ -186,18 +196,24 @@ mod tests {
                 Nav::Today,
                 Nav::Matrix,
                 Nav::Scheduled,
+                Nav::Time,
                 Nav::Completed,
                 Nav::Tomorrow
             ]
         );
         // A sidebar arranged before Matrix stays as it was; the stock four
-        // gain Matrix.
+        // gain Matrix (and then Time).
         let custom = Prefs::parse("sidebar = [\"today\", \"inbox\"]\n");
         assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
         let stock = Prefs::parse(
             "sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n",
         );
         assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
+        // Stock five with Matrix gains Time once.
+        let with_matrix = Prefs::parse(
+            "sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"completed\"]\n",
+        );
+        assert_eq!(with_matrix.sidebar_views(), DEFAULT_SIDEBAR);
         let text = toml::to_string(&old).unwrap();
         assert!(!text.contains("filters"));
         assert_eq!(Prefs::parse(&text).sidebar_views(), old.sidebar_views());

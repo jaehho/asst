@@ -845,3 +845,30 @@ menubutton.filtered > button {
   min-width: 8px;
   margin: 2px;
 }
+
+/* Time view: one row per tracked block. */
+.time-list {
+  margin-top: 8px;
+}
+
+.time-row {
+  border-radius: 8px;
+  padding: 0;
+}
+
+.time-item {
+  padding: 8px 10px;
+}
+
+.time-swatch {
+  font-size: 14px;
+  opacity: 0.85;
+}
+
+.time-title {
+  font-weight: 600;
+}
+
+.time-duration {
+  font-variant-numeric: tabular-nums;
+}

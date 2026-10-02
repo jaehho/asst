@@ -21,6 +21,8 @@ pub enum Nav {
     /// Eisenhower's four boxes: important × urgent.
     Matrix,
     Scheduled,
+    /// One day of tracked time, by tag.
+    Time,
     Completed,
     Tomorrow,
     Anytime,
@@ -31,12 +33,13 @@ pub enum Nav {
 
 impl Nav {
     /// The smart views, in sidebar order.
-    pub fn filters() -> [Nav; 9] {
+    pub fn filters() -> [Nav; 10] {
         [
             Nav::Inbox,
             Nav::Today,
             Nav::Matrix,
             Nav::Scheduled,
+            Nav::Time,
             Nav::Completed,
             Nav::Tomorrow,
             Nav::Anytime,
@@ -51,6 +54,7 @@ impl Nav {
             Nav::Today => "Today".into(),
             Nav::Matrix => "Matrix".into(),
             Nav::Scheduled => "Scheduled".into(),
+            Nav::Time => "Time".into(),
             Nav::Completed => "Completed".into(),
             Nav::Tomorrow => "Tomorrow".into(),
             Nav::Anytime => "Anytime".into(),
@@ -69,6 +73,7 @@ impl Nav {
             Nav::Today => &["overdue"],
             Nav::Matrix => &["eisenhower", "urgent", "important", "quadrant"],
             Nav::Scheduled => &["upcoming", "later"],
+            Nav::Time => &["tracked", "timeline", "activity", "blocks"],
             Nav::Completed => &["done", "logbook", "finished"],
             Nav::Anytime => &["no date", "someday", "unscheduled"],
             Nav::Repeating => &["recurring"],
@@ -89,6 +94,7 @@ impl Nav {
             Nav::Today => "Due today, and overdue",
             Nav::Matrix => "Important and urgent, in four boxes",
             Nav::Scheduled => "Everything with a date, by day",
+            Nav::Time => "Tracked time, by day",
             Nav::Completed => "Done, by the day",
             Nav::Tomorrow => "Due tomorrow",
             Nav::Anytime => "Tasks with no date",
@@ -104,6 +110,7 @@ impl Nav {
             Nav::Today => "star-outline-thick-symbolic",
             Nav::Matrix => "flag-outline-thick-symbolic",
             Nav::Scheduled => "month-symbolic",
+            Nav::Time => "stopwatch-symbolic",
             Nav::Completed => "check-round-outline-symbolic",
             Nav::Tomorrow => "today-calendar-symbolic",
             Nav::Anytime => "grid-large-symbolic",
@@ -120,6 +127,7 @@ impl Nav {
             Nav::Today => "tint-green",
             Nav::Matrix => "tint-orange",
             Nav::Scheduled | Nav::Tomorrow | Nav::Anytime | Nav::Repeating => "tint-purple",
+            Nav::Time => "tint-blue",
             Nav::Completed => "tint-orange",
         }
     }
@@ -131,6 +139,7 @@ impl Nav {
             Nav::Today => "today".into(),
             Nav::Matrix => "matrix".into(),
             Nav::Scheduled => "scheduled".into(),
+            Nav::Time => "time".into(),
             Nav::Completed => "completed".into(),
             Nav::Tomorrow => "tomorrow".into(),
             Nav::Anytime => "anytime".into(),
@@ -591,6 +600,13 @@ pub fn plan(nav: &Nav, data: &Data, opts: &ViewOpts, now: DateTime<Tz>) -> Vec<S
             pick(&|t| t.task.due.is_none()),
             &|tasks| sorted(tasks, sort, zone),
         )),
+        Nav::Time => {
+            // The day timeline is drawn from `blocks`, not tasks. One empty
+            // kept section so the column still has a day header.
+            out.push(
+                Section::new(Kind::Day(today), Some("Tracked".into()), Vec::new()).keep(),
+            );
+        }
         Nav::Matrix => {
             let mut boxes: [Vec<TaskView>; 4] = Default::default();
             for t in pick(&|_| true) {
@@ -880,6 +896,7 @@ impl Counts {
             // Every open task sits in some box.
             Nav::Matrix => Some(self.all),
             Nav::Scheduled => Some(self.scheduled),
+            Nav::Time => None,
             Nav::Completed => None,
             Nav::Tomorrow => Some(self.tomorrow),
             Nav::Anytime => Some(self.anytime),

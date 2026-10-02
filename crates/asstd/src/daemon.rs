@@ -416,6 +416,11 @@ impl Daemon {
         self.views(&store, rows)
     }
 
+    /// Tracked (and later planned) spans overlapping [start, end).
+    pub fn blocks(&self, start_ms: i64, end_ms: i64) -> Result<Vec<asst_core::store::Block>> {
+        Ok(self.store().blocks_between(start_ms, end_ms)?)
+    }
+
     pub fn get(&self, id: &str) -> Result<TaskView> {
         let store = self.store();
         let row = store.find(id)?;

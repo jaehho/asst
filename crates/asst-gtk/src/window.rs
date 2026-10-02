@@ -273,6 +273,8 @@ impl std::fmt::Debug for Loaded {
 pub enum Cmd {
     Loaded(u64, client::Result<Loaded>),
     CompletedLoaded(u64, client::Result<Vec<TaskView>>),
+    /// Tracked blocks for the Time view.
+    BlocksLoaded(u64, client::Result<Vec<asst_core::api::BlockView>>),
     Changed,
     Status(StatusView),
     LoginDone(bool, String),
@@ -325,6 +327,8 @@ enum Completing {
 
 pub struct Window {
     nav: Nav,
+    /// Tracked blocks for the Time view (today).
+    blocks: Vec<asst_core::api::BlockView>,
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
@@ -360,6 +364,7 @@ pub struct Window {
     hidden: HashSet<String>,
     load_generation: u64,
     completed_generation: u64,
+    blocks_generation: u64,
     dirty: bool,
     shown: u64,
     pending_d: Option<Instant>,
@@ -819,6 +824,7 @@ impl Component for Window {
             lists: Vec::new(),
             open: Vec::new(),
             completed: None,
+            blocks: Vec::new(),
             status: None,
             settings: None,
             error: None,
@@ -842,6 +848,7 @@ impl Component for Window {
             hidden: HashSet::new(),
             load_generation: 0,
             completed_generation: 0,
+            blocks_generation: 0,
             dirty: false,
             shown: 0,
             pending_d: None,
@@ -900,6 +907,10 @@ impl Component for Window {
                     }
                     if self.needs_completed() && self.completed.is_none() {
                         self.reload_completed(&sender);
+                    }
+                    if self.nav == Nav::Time {
+                        let day = self.now().date_naive();
+                        self.reload_blocks(&sender, day);
                     }
                     self.close_editor(w, &sender);
                 }
@@ -1570,6 +1581,15 @@ impl Component for Window {
                     Err(e) => toast(w, &e),
                 }
             }
+            Cmd::BlocksLoaded(generation, result) => {
+                if generation != self.blocks_generation {
+                    return;
+                }
+                match result {
+                    Ok(b) => self.blocks = b,
+                    Err(e) => toast(w, &e),
+                }
+            }
             Cmd::Changed => {
                 self.reload(&sender);
                 return;
@@ -1857,6 +1877,10 @@ impl Window {
         if self.needs_completed() || self.completed.is_some() {
             self.reload_completed(sender);
         }
+        if self.nav == Nav::Time {
+            let day = self.now().date_naive();
+            self.reload_blocks(sender, day);
+        }
     }
 
     fn reload_completed(&mut self, sender: &ComponentSender<Self>) {
@@ -1868,6 +1892,31 @@ impl Window {
                 ..query(View::Completed)
             };
             Cmd::CompletedLoaded(generation, client::tasks(&q).await)
+        });
+    }
+
+    /// Tracked blocks for one local day (the Time view).
+    fn reload_blocks(&mut self, sender: &ComponentSender<Self>, day: chrono::NaiveDate) {
+        use asst_core::api::BlockRange;
+        use asst_core::track::day_window;
+
+        self.blocks_generation += 1;
+        let generation = self.blocks_generation;
+        sender.oneshot_command(async move {
+            let range = day_window(&day.to_string()).map(|(_, start, end)| {
+                let s = chrono::DateTime::parse_from_rfc3339(&start)
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(0);
+                let e = chrono::DateTime::parse_from_rfc3339(&end)
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(0);
+                BlockRange { start: s, end: e }
+            });
+            let result = match range {
+                Ok(r) => client::blocks(r).await,
+                Err(e) => Err(e.to_string()),
+            };
+            Cmd::BlocksLoaded(generation, result)
         });
     }
 
@@ -2560,6 +2609,7 @@ impl Window {
                 &Opts {
                     nav: &self.nav,
                     lists: &self.lists,
+                    blocks: &self.blocks,
                     archived: self.nav_archived(),
                     now,
                     completing: &self.completing.keys().cloned().collect(),

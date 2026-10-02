@@ -42,6 +42,11 @@ impl Service {
         json(&self.daemon.tasks(&q).map_err(failed)?)
     }
 
+    async fn blocks(&self, range: &str) -> fdo::Result<String> {
+        let r: asst_core::api::BlockRange = arg(range)?;
+        json(&self.daemon.blocks(r.start, r.end).map_err(failed)?)
+    }
+
     async fn get(&self, id: &str) -> fdo::Result<String> {
         json(&self.daemon.get(id).map_err(failed)?)
     }

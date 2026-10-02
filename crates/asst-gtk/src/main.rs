@@ -18,6 +18,7 @@ mod quick_add;
 mod row;
 mod settings;
 mod sidebar;
+mod time;
 mod tray;
 mod ui;
 mod window;

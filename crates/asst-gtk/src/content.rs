@@ -20,6 +20,8 @@ use crate::{motion, ui};
 pub struct Opts<'a> {
     pub nav: &'a Nav,
     pub lists: &'a [ListView],
+    /// Tracked blocks for the Time view.
+    pub blocks: &'a [asst_core::api::BlockView],
     /// The view is a list that was archived.
     pub archived: bool,
     pub now: DateTime<Tz>,
@@ -73,6 +75,9 @@ pub fn section_target(kind: &Kind) -> Option<Target> {
 }
 
 pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Built {
+    if matches!(o.nav, Nav::Time) {
+        return crate::time::build_column(o, sections, tx);
+    }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("view-column");
     if o.fresh.view {

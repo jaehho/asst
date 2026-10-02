@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::store::{Query, Row};
+use crate::store::{Block, Query, Row};
 use crate::task::Task;
 use crate::time::{Trigger, When};
 
@@ -25,6 +25,8 @@ pub trait Asst {
     fn lists(&self) -> zbus::Result<String>;
     /// `Query` → `[TaskView]`
     fn tasks(&self, query: &str) -> zbus::Result<String>;
+    /// `BlockRange` → `[Block]`: tracked (and later planned) time.
+    fn blocks(&self, range: &str) -> zbus::Result<String>;
     /// id → `TaskView`
     fn get(&self, id: &str) -> zbus::Result<String>;
     /// `AddSpec` → `Added`
@@ -136,6 +138,16 @@ pub struct IssueLink {
     pub number: u32,
     pub url: String,
 }
+
+/// Half-open range in epoch milliseconds (UTC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRange {
+    pub start: i64,
+    pub end: i64,
+}
+
+/// A tracked or planned span, as the window draws it.
+pub type BlockView = Block;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskView {
