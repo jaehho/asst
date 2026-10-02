@@ -30,5 +30,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 rrule = "0.14"
 toml = "1"
 tower-service = "0.3"
+ureq = { version = "2", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 zbus = { workspace = true }

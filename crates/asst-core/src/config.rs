@@ -104,10 +104,18 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
         })
 }
 
-pub fn config_path() -> PathBuf {
+/// `~/.config` (or `$XDG_CONFIG_HOME`).
+pub fn xdg_config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config")
-        .join("asst")
-        .join("config.toml")
+}
+
+/// `~/.config/asst`.
+pub fn config_dir() -> PathBuf {
+    xdg_config_dir().join("asst")
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 /// systemd's StateDirectory= when run as the service, else the XDG path.

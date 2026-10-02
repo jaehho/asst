@@ -75,6 +75,25 @@ pub struct Pending {
     pub sent_edits: usize,
 }
 
+/// A time block: actual tracked time (`planned = 0`) or a planned slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Block {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_uid: Option<String>,
+    /// Epoch milliseconds.
+    pub start: i64,
+    /// Epoch milliseconds.
+    pub end: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub planned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum View {
@@ -153,6 +172,18 @@ CREATE TABLE IF NOT EXISTS gh_pairs (
   priority INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (repo, number)
 );
+CREATE TABLE IF NOT EXISTS blocks (
+  id INTEGER PRIMARY KEY,
+  task_uid TEXT,
+  start INTEGER NOT NULL,
+  end INTEGER NOT NULL,
+  label TEXT,
+  planned INTEGER NOT NULL DEFAULT 0,
+  source TEXT UNIQUE,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS blocks_task ON blocks(task_uid);
+CREATE INDEX IF NOT EXISTS blocks_start ON blocks(start);
 ";
 
 const TASK_COLS: &str = "href, list, etag, (etag IS NULL OR edits != '[]' OR deleted = 1), json";
@@ -984,6 +1015,74 @@ impl Store {
             params![repo, number],
         )?;
         Ok(())
+    }
+
+    // --- time blocks (asst track) ---
+
+    pub fn blocks_between(&self, start_ms: i64, end_ms: i64) -> Result<Vec<Block>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_uid, start, end, label, planned, source, created_at
+             FROM blocks WHERE start < ?2 AND end > ?1 ORDER BY start",
+        )?;
+        let rows = stmt.query_map(params![start_ms, end_ms], |r| {
+            Ok(Block {
+                id: Some(r.get(0)?),
+                task_uid: r.get(1)?,
+                start: r.get(2)?,
+                end: r.get(3)?,
+                label: r.get(4)?,
+                planned: r.get::<_, i64>(5)? != 0,
+                source: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Drop actual blocks overlapping [start, end) and insert `rows`.
+    /// Window replace: late AFK data can move boundaries.
+    pub fn replace_actual_blocks(
+        &mut self,
+        start_ms: i64,
+        end_ms: i64,
+        rows: &[Block],
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM blocks WHERE planned = 0 AND start < ?2 AND end > ?1",
+            params![start_ms, end_ms],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO blocks(task_uid, start, end, label, planned, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                 ON CONFLICT(source) DO UPDATE SET
+                   task_uid = excluded.task_uid,
+                   start = excluded.start,
+                   end = excluded.end,
+                   label = excluded.label,
+                   created_at = excluded.created_at",
+            )?;
+            for b in rows {
+                stmt.execute(params![
+                    b.task_uid,
+                    b.start,
+                    b.end,
+                    b.label,
+                    b.source,
+                    b.created_at
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    pub fn delete_blocks_by_source_prefix(&self, prefix: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM blocks WHERE source LIKE ?1",
+            params![format!("{prefix}%")],
+        )?)
     }
 }
 

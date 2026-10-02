@@ -26,9 +26,12 @@ asst show ID [--raw] | asst dup ID | asst open ID | asst sync | asst status
 asst lists | asst list new NAME [--color '#rrggbb'] | asst list rename LIST NAME
 asst list color LIST '#rrggbb' | asst list rm LIST [--yes]
 asst settings [--inbox LIST|default] [--interval SECONDS] [--snooze MINUTES,…] [--alarm-at-due yes|no] [--alarm-before MINUTES]
+asst track ingest [--date YYYY-MM-DD] [--dry-run] | asst track tags | asst track suggest
 ```
 
 IDs are the shortest unambiguous UID prefix shown in listings. `--json` works everywhere; `asst add --source kind:id` is idempotent, for tools that file tasks.
+
+**ActivityWatch:** sensors live in `~/projects/aw-watchers`; raw rollups are stock AW (`aw` / webui). `asst track ingest` tags AFK-clipped spans (`~/.config/asst/tags.toml`) and writes them to the `blocks` table (`planned=0`). `suggest` prints rule stubs for untagged sources.
 
 **GitHub issues:** `asst link <list> <owner/repo>` keeps a list and a repo's issues in step: title, notes (as the issue body), open/closed and priority (`P1`–`P3` labels) both ways; a task's other labels are left alone. `asst link` shows the links, `asst unlink <owner/repo>` drops one. asstd uses `$GITHUB_TOKEN`, or the token `gh auth login` stored.
 

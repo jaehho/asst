@@ -11,9 +11,10 @@ use asst_core::api::{
     AddSpec, Added, AsstProxy, Change, LinkView, ListChange, ListSpec, ListView, Settings,
     SettingsChange, StatusView, SyncState, TaskView,
 };
-use asst_core::store::{Query, View};
+use asst_core::store::{Query, Store, View};
 use asst_core::sync::Report;
 use asst_core::task::priority_level;
+use asst_core::track;
 use asst_core::fmt;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -186,8 +187,36 @@ enum Cmd {
     },
     /// Sign out, and forget the tasks stored here
     Logout,
+    /// Project tags and ActivityWatch ingest (blocks, planned=0)
+    Track {
+        #[command(subcommand)]
+        cmd: TrackCmd,
+    },
     /// A waybar module: prints a JSON line whenever tasks change
     Bar,
+}
+
+#[derive(Subcommand)]
+enum TrackCmd {
+    /// AFK-clipped tagged spans → blocks (replaces the day's actual blocks)
+    Ingest {
+        /// Calendar day (local). Default: today.
+        #[arg(long)]
+        date: Option<String>,
+        /// Print spans without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Tag rollup for a day (from a live AW query)
+    Tags {
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// [[rule]] stubs for untagged sources
+    Suggest {
+        #[arg(long)]
+        date: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +281,9 @@ fn message(e: &anyhow::Error) -> String {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(Cmd::Bar) = cli.command {
         return bar::run().await;
+    }
+    if let Some(Cmd::Track { cmd }) = cli.command {
+        return track_run(cmd, cli.json);
     }
     let conn = zbus::Connection::session()
         .await
@@ -826,6 +858,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
         Cmd::Bar => unreachable!("handled above"),
+        Cmd::Track { .. } => unreachable!("handled above"),
     }
     Ok(())
 }
@@ -869,5 +902,103 @@ fn print_status(style: &Style, s: &StatusView) {
             s.pending,
             if s.pending == 1 { "" } else { "s" }
         );
+    }
+}
+
+/// `asst track` talks to aw-server and SQLite directly: a batch tool, not
+/// the daemon's D-Bus surface. asstd owns day-to-day task writes; this
+/// replaces a day's actual blocks in one transaction.
+fn track_run(cmd: TrackCmd, as_json: bool) -> anyhow::Result<()> {
+    let client = track::AwClient::default();
+    match cmd {
+        TrackCmd::Ingest { date, dry_run } => {
+            let date = date.unwrap_or_else(track::today);
+            let report = track::collect_day(&client, &date)?;
+            if dry_run {
+                if as_json {
+                    let spans: Vec<_> = report
+                        .spans
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "start": s.start.to_rfc3339(),
+                                "end": s.end.to_rfc3339(),
+                                "tag": s.tag,
+                                "task_uid": s.task_uid,
+                                "label": s.label,
+                                "source": s.source,
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "date": report.date,
+                            "focused_seconds": report.focused_seconds,
+                            "tags": report.tags,
+                            "spans": spans,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "awq-style dry run {}  focused {:.1}h  {} spans",
+                        report.date,
+                        report.focused_seconds / 3600.0,
+                        report.spans.len()
+                    );
+                    let mut tags: Vec<_> = report.tags.iter().collect();
+                    tags.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    for (k, v) in tags.into_iter().take(20) {
+                        println!("  {k:<40} {:.1}h", v / 3600.0);
+                    }
+                }
+                return Ok(());
+            }
+            let (_, start, end) = track::day_window(&date)?;
+            let start_dt = chrono::DateTime::parse_from_rfc3339(&start)?.with_timezone(&Utc);
+            let end_dt = chrono::DateTime::parse_from_rfc3339(&end)?.with_timezone(&Utc);
+            let zone = asst_core::time::local_zone();
+            let mut store = Store::open(&asst_core::config::state_dir().join("asst.db"), zone)?;
+            track::purge_legacy_import(&store)?;
+            let n = track::ingest_spans(&mut store, start_dt, end_dt, &report.spans)?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "date": report.date,
+                        "ingested": n,
+                        "focused_seconds": report.focused_seconds,
+                        "tags": report.tags,
+                    }))?
+                );
+            } else {
+                println!(
+                    "ingested {n} blocks for {}  focused {:.1}h",
+                    report.date,
+                    report.focused_seconds / 3600.0
+                );
+            }
+            Ok(())
+        }
+        TrackCmd::Tags { date } => {
+            let date = date.unwrap_or_else(track::today);
+            let report = track::collect_day(&client, &date)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&report.tags)?);
+            } else {
+                let mut tags: Vec<_> = report.tags.iter().collect();
+                tags.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (k, v) in tags {
+                    println!("{k:<40} {:.1}h", v / 3600.0);
+                }
+            }
+            Ok(())
+        }
+        TrackCmd::Suggest { date } => {
+            let date = date.unwrap_or_else(track::today);
+            let report = track::collect_day(&client, &date)?;
+            print!("{}", track::suggest_rules(&report.spans));
+            Ok(())
+        }
     }
 }
