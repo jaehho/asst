@@ -22,6 +22,8 @@ pub struct Opts<'a> {
     pub lists: &'a [ListView],
     /// Tracked blocks for the Time view.
     pub blocks: &'a [asst_core::api::BlockView],
+    /// Day the Time view is showing.
+    pub time_day: chrono::NaiveDate,
     /// The view is a list that was archived.
     pub archived: bool,
     pub now: DateTime<Tz>,

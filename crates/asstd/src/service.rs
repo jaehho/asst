@@ -47,6 +47,10 @@ impl Service {
         json(&self.daemon.blocks(r.start, r.end).map_err(failed)?)
     }
 
+    async fn track_ingest(&self, date: &str) -> fdo::Result<String> {
+        json(&self.daemon.track_ingest(date).map_err(failed)?)
+    }
+
     async fn get(&self, id: &str) -> fdo::Result<String> {
         json(&self.daemon.get(id).map_err(failed)?)
     }

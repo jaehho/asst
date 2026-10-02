@@ -120,24 +120,68 @@ pub fn day_note(blocks: &[BlockView]) -> String {
     format!("{} tracked", dur_label(total))
 }
 
-/// The Time view column: title, day note, then the block list.
+/// The Time view column: title, day stepper, note, then the block list.
 pub fn build_column(
     o: &crate::content::Opts<'_>,
     _sections: &[crate::model::Section],
-    _tx: &crate::window::Tx,
+    tx: &crate::window::Tx,
 ) -> crate::content::Built {
+    use crate::window::Msg;
+
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("view-column");
     if o.fresh.view {
         root.add_css_class("view-enter");
     }
 
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let title = gtk::Label::new(Some("Time"));
     title.add_css_class("view-title");
     title.set_xalign(0.0);
-    root.append(&title);
+    title.set_hexpand(true);
+    head.append(&title);
 
-    let note = gtk::Label::new(Some(&day_note(o.blocks)));
+    let prev = gtk::Button::from_icon_name("go-previous-symbolic");
+    prev.add_css_class("flat");
+    prev.set_tooltip_text(Some("Previous day"));
+    {
+        let tx = tx.clone();
+        prev.connect_clicked(move |_| {
+            let _ = tx.send(Msg::TimeStep(-1));
+        });
+    }
+    let next = gtk::Button::from_icon_name("go-next-symbolic");
+    next.add_css_class("flat");
+    next.set_tooltip_text(Some("Next day"));
+    {
+        let tx = tx.clone();
+        next.connect_clicked(move |_| {
+            let _ = tx.send(Msg::TimeStep(1));
+        });
+    }
+    let today = gtk::Button::with_label("Today");
+    today.add_css_class("flat");
+    {
+        let tx = tx.clone();
+        let showing = o.time_day;
+        today.connect_clicked(move |_| {
+            let delta = showing.signed_duration_since(chrono::Local::now().date_naive())
+                .num_days() as i32;
+            if delta != 0 {
+                let _ = tx.send(Msg::TimeStep(-delta));
+            }
+        });
+    }
+    head.append(&prev);
+    head.append(&next);
+    head.append(&today);
+    root.append(&head);
+
+    let day_label = o
+        .time_day
+        .format("%Y-%m-%d (%a)")
+        .to_string();
+    let note = gtk::Label::new(Some(&format!("{day_label} · {}", day_note(o.blocks))));
     note.add_css_class("dim-label");
     note.add_css_class("caption");
     note.set_xalign(0.0);

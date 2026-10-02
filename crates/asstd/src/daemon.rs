@@ -32,6 +32,8 @@ pub enum Error {
     Remote(#[from] RemoteError),
     #[error(transparent)]
     Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Track(#[from] asst_core::track::TrackError),
     #[error("this needs a connection to the server")]
     Offline,
 }
@@ -419,6 +421,28 @@ impl Daemon {
     /// Tracked (and later planned) spans overlapping [start, end).
     pub fn blocks(&self, start_ms: i64, end_ms: i64) -> Result<Vec<asst_core::store::Block>> {
         Ok(self.store().blocks_between(start_ms, end_ms)?)
+    }
+
+    /// Pull one local day of ActivityWatch time into `blocks`.
+    pub fn track_ingest(&self, date: &str) -> Result<asst_core::api::TrackIngested> {
+        use asst_core::track;
+        let client = track::AwClient::default();
+        let report = track::collect_day(&client, date)?;
+        let (_, start, end) = track::day_window(date)?;
+        let start = chrono::DateTime::parse_from_rfc3339(&start)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339(&end)
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let mut store = self.store();
+        track::purge_legacy_import(&store)?;
+        let blocks = track::ingest_spans(&mut store, start, end, &report.spans)?;
+        Ok(asst_core::api::TrackIngested {
+            date: report.date,
+            blocks,
+            focused_seconds: report.focused_seconds,
+        })
     }
 
     pub fn get(&self, id: &str) -> Result<TaskView> {

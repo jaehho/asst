@@ -27,6 +27,8 @@ pub trait Asst {
     fn tasks(&self, query: &str) -> zbus::Result<String>;
     /// `BlockRange` → `[Block]`: tracked (and later planned) time.
     fn blocks(&self, range: &str) -> zbus::Result<String>;
+    /// Pull one local day from ActivityWatch into `blocks` → `BlockRange` written.
+    fn track_ingest(&self, date: &str) -> zbus::Result<String>;
     /// id → `TaskView`
     fn get(&self, id: &str) -> zbus::Result<String>;
     /// `AddSpec` → `Added`
@@ -144,6 +146,14 @@ pub struct IssueLink {
 pub struct BlockRange {
     pub start: i64,
     pub end: i64,
+}
+
+/// What `track_ingest` wrote for one day.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackIngested {
+    pub date: String,
+    pub blocks: usize,
+    pub focused_seconds: f64,
 }
 
 /// A tracked or planned span, as the window draws it.

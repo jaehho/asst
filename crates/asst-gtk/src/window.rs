@@ -115,6 +115,8 @@ pub enum Batch {
 #[derive(Debug)]
 pub enum Msg {
     Navigate(Nav),
+    /// Step the Time view by whole days (−1 yesterday, +1 tomorrow).
+    TimeStep(i32),
     ToggleSidebar,
     Refresh,
     Tick,
@@ -329,6 +331,8 @@ pub struct Window {
     nav: Nav,
     /// Tracked blocks for the Time view (today).
     blocks: Vec<asst_core::api::BlockView>,
+    /// Which local day the Time view shows.
+    time_day: chrono::NaiveDate,
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
@@ -825,6 +829,7 @@ impl Component for Window {
             open: Vec::new(),
             completed: None,
             blocks: Vec::new(),
+            time_day: chrono::Local::now().date_naive(),
             status: None,
             settings: None,
             error: None,
@@ -894,6 +899,10 @@ impl Component for Window {
         // an animation.
         let passive = matches!(msg, Msg::Resume | Msg::Tick | Msg::Focused);
         match msg {
+            Msg::TimeStep(delta) => {
+                let day = self.time_day + chrono::Duration::days(i64::from(delta));
+                self.reload_blocks(&sender, day);
+            }
             Msg::Navigate(nav) => {
                 if nav != self.nav {
                     self.nav = nav;
@@ -909,7 +918,7 @@ impl Component for Window {
                         self.reload_completed(&sender);
                     }
                     if self.nav == Nav::Time {
-                        let day = self.now().date_naive();
+                        let day = self.time_day;
                         self.reload_blocks(&sender, day);
                     }
                     self.close_editor(w, &sender);
@@ -1878,7 +1887,7 @@ impl Window {
             self.reload_completed(sender);
         }
         if self.nav == Nav::Time {
-            let day = self.now().date_naive();
+            let day = self.time_day;
             self.reload_blocks(sender, day);
         }
     }
@@ -1895,14 +1904,17 @@ impl Window {
         });
     }
 
-    /// Tracked blocks for one local day (the Time view).
+    /// Pull the day from ActivityWatch, then load `blocks` for the Time view.
     fn reload_blocks(&mut self, sender: &ComponentSender<Self>, day: chrono::NaiveDate) {
         use asst_core::api::BlockRange;
         use asst_core::track::day_window;
 
+        self.time_day = day;
         self.blocks_generation += 1;
         let generation = self.blocks_generation;
         sender.oneshot_command(async move {
+            // Best effort: the window still shows whatever is already stored.
+            let _ = client::track_ingest(&day.to_string()).await;
             let range = day_window(&day.to_string()).map(|(_, start, end)| {
                 let s = chrono::DateTime::parse_from_rfc3339(&start)
                     .map(|t| t.timestamp_millis())
@@ -2610,6 +2622,7 @@ impl Window {
                     nav: &self.nav,
                     lists: &self.lists,
                     blocks: &self.blocks,
+                    time_day: self.time_day,
                     archived: self.nav_archived(),
                     now,
                     completing: &self.completing.keys().cloned().collect(),

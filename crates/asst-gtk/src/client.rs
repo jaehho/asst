@@ -3,7 +3,7 @@
 
 use asst_core::api::{
     AddSpec, Added, AsstProxy, BlockRange, BlockView, Change, ListChange, ListSpec, ListView,
-    Settings, SettingsChange, StatusView, TaskView,
+    Settings, SettingsChange, StatusView, TaskView, TrackIngested,
 };
 use asst_core::store::Query;
 use serde::de::DeserializeOwned;
@@ -73,6 +73,10 @@ pub async fn blocks(range: BlockRange) -> Result<Vec<BlockView>> {
             .blocks(&serde_json::to_string(&range).expect("range serializes"))
             .await,
     )
+}
+
+pub async fn track_ingest(date: &str) -> Result<TrackIngested> {
+    json(proxy().await?.track_ingest(date).await)
 }
 
 pub async fn add(spec: &AddSpec) -> Result<Added> {
