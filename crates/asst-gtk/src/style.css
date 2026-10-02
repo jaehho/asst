@@ -846,29 +846,83 @@ menubutton.filtered > button {
   margin: 2px;
 }
 
-/* Time view: one row per tracked block. */
-.time-list {
+/* Time view: Google Calendar–style day planner. */
+.time-planner {
   margin-top: 8px;
 }
 
-.time-row {
-  border-radius: 8px;
-  padding: 0;
+.time-gutter {
+  margin-right: 4px;
 }
 
-.time-item {
-  padding: 8px 10px;
-}
-
-.time-swatch {
-  font-size: 14px;
-  opacity: 0.85;
-}
-
-.time-title {
-  font-weight: 600;
-}
-
-.time-duration {
+.time-hour {
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.time-hour-line {
+  color: alpha(@borders, 0.55);
+  min-height: 1px;
+}
+
+.time-grid {
+  background: transparent;
+}
+
+.time-block {
+  border-radius: 6px;
+  padding: 2px 6px;
+  border-left-width: 3px;
+  border-left-style: solid;
+  background: alpha(@accent_color, 0.18);
+  border-left-color: @accent_color;
+}
+
+.time-block.tint-blue {
+  background: alpha(@blue_3, 0.22);
+  border-left-color: @blue_3;
+}
+.time-block.tint-green {
+  background: alpha(@green_3, 0.22);
+  border-left-color: @green_3;
+}
+.time-block.tint-purple {
+  background: alpha(@purple_3, 0.22);
+  border-left-color: @purple_3;
+}
+.time-block.tint-orange {
+  background: alpha(@orange_3, 0.22);
+  border-left-color: @orange_3;
+}
+
+.time-block-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.time-block-meta {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.time-now {
+  color: @destructive_color;
+  min-height: 2px;
+  background: @destructive_color;
+}
+
+.time-now-dot {
+  color: @destructive_color;
+  font-size: 10px;
+}
+
+.time-date {
+  font-weight: 600;
+  opacity: 0.9;
+}
+
+button.pill {
+  border-radius: 999px;
+  padding: 4px 12px;
 }

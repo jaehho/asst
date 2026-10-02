@@ -2527,7 +2527,12 @@ impl Window {
         let key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             self.nav.key().hash(&mut h);
-            now.date_naive().hash(&mut h);
+            // Time steps change `time_day`, not the wall-clock date.
+            if self.nav == Nav::Time {
+                self.time_day.hash(&mut h);
+            } else {
+                now.date_naive().hash(&mut h);
+            }
             format!(
                 "{:?}{:?}{:?}{:?}{:?}{:?}{}{}",
                 self.adding,
