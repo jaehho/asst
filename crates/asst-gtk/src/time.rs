@@ -181,7 +181,9 @@ fn day_grid(
             continue;
         }
         let s = minutes_from_midnight(b.start, day, zone);
-        let e = minutes_from_midnight(b.end, day, zone).max(s + 3.0);
+        // Real end for packing: inflating short spans stacked a rainbow of
+        // overlapping lanes. Height gets a floor below.
+        let e = minutes_from_midnight(b.end, day, zone).max(s);
         placed.push((s, e, b));
     }
     placed.sort_by(|a, b| {
@@ -205,12 +207,14 @@ fn day_grid(
         chip.add_css_class(tint_for(label));
         chip.set_halign(gtk::Align::Start);
         chip.set_valign(gtk::Align::Start);
+        chip.set_overflow(gtk::Overflow::Hidden);
         chip.set_size_request((180 / lane_n.max(1) as i32).max(64), height_px as i32);
 
         let title = gtk::Label::new(Some(label));
         title.add_css_class("time-block-title");
         title.set_xalign(0.0);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title.set_max_width_chars(18);
         chip.append(&title);
         if height_px >= 34.0 {
             let meta = gtk::Label::new(Some(&format!("{start_s}–{end_s} · {dur}")));
@@ -229,10 +233,12 @@ fn day_grid(
             + f64::from(now.time().minute())
             + f64::from(now.time().second()) / 60.0;
         let y = mins / 60.0 * f64::from(HOUR_H);
-        let line = gtk::Separator::new(gtk::Orientation::Horizontal);
+        // Fixed children keep their requested width; a Separator with Fill
+        // collapses to nothing. Ask for the full grid.
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         line.add_css_class("time-now");
-        line.set_halign(gtk::Align::Fill);
-        layer.put(&line, 0.0, y);
+        line.set_size_request(4000, 2);
+        layer.put(&line, 0.0, y - 1.0);
         let dot = gtk::Label::new(Some("●"));
         dot.add_css_class("time-now-dot");
         layer.put(&dot, 0.0, y - 9.0);

@@ -540,6 +540,110 @@ pub fn tagged_timeline(
     out
 }
 
+/// Longest gap still considered the same work session.
+///
+/// Short AFK flickers and source handoffs should not split a task into
+/// dozens of slivers. Distinct tagged projects stay separate.
+pub const SESSION_GAP: Duration = Duration::minutes(5);
+
+/// Spans shorter than this are sensor noise (about:blank flicker, focus
+/// races) and are dropped when they stand alone.
+pub const MIN_SPAN: Duration = Duration::seconds(5);
+
+/// Collapse fragmented spans into calendar-like session blocks.
+///
+/// `tagged_timeline` is intentionally fine-grained (correct boundaries and
+/// rollups). The day planner wants one event per stretch of work: a gap is
+/// what starts a new event, not a tab switch or a project flicker.
+pub fn coalesce_sessions(spans: &[TaggedSpan], max_gap: Duration) -> Vec<TaggedSpan> {
+    let mut sorted: Vec<TaggedSpan> = spans.to_vec();
+    sorted.retain(|s| s.end > s.start && s.seconds() >= MIN_SPAN.num_seconds() as f64);
+    sorted.sort_by_key(|s| (s.start, s.end));
+    let mut out: Vec<TaggedSpan> = Vec::new();
+    let mut members: Vec<TaggedSpan> = Vec::new();
+
+    let flush = |members: &mut Vec<TaggedSpan>, out: &mut Vec<TaggedSpan>| {
+        if members.is_empty() {
+            return;
+        }
+        out.push(session_block(members.drain(..)));
+    };
+
+    for s in sorted {
+        let joins = match members.last() {
+            None => true,
+            Some(last) => s.start <= last.end + max_gap,
+        };
+        if joins {
+            members.push(s);
+        } else {
+            flush(&mut members, &mut out);
+            members.push(s);
+        }
+    }
+    flush(&mut members, &mut out);
+    out
+}
+
+/// Outer span of a session, labeled by where the time actually went.
+fn session_block(members: impl IntoIterator<Item = TaggedSpan>) -> TaggedSpan {
+    let mut start: Option<DateTime<Utc>> = None;
+    let mut end: Option<DateTime<Utc>> = None;
+    let mut first: Option<TaggedSpan> = None;
+    let mut by_tag: BTreeMap<String, f64> = BTreeMap::new();
+    let mut by_label: BTreeMap<String, f64> = BTreeMap::new();
+    let mut label_kind: BTreeMap<String, Option<SignalKind>> = BTreeMap::new();
+    for m in members {
+        let secs = m.seconds();
+        *by_tag.entry(m.tag.clone()).or_default() += secs;
+        *by_label.entry(m.label.clone()).or_default() += secs;
+        label_kind.insert(m.label.clone(), m.untagged_kind);
+        start = Some(match start {
+            None => m.start,
+            Some(t) => t.min(m.start),
+        });
+        end = Some(match end {
+            None => m.end,
+            Some(t) => t.max(m.end),
+        });
+        if first.is_none() {
+            first = Some(m);
+        }
+    }
+    let first = first.expect("session has members");
+    let start = start.expect("session has members");
+    let end = end.expect("session has members");
+    // Prefer a real project tag over untagged when both appear.
+    let tag = by_tag
+        .iter()
+        .max_by(|(ka, a), (kb, b)| {
+            let rank = |k: &String| if k.as_str() == "untagged" { 0u8 } else { 1u8 };
+            rank(ka)
+                .cmp(&rank(kb))
+                .then(a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| first.tag.clone());
+    let label = if tag == "untagged" {
+        by_label
+            .iter()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| first.label.clone())
+    } else {
+        tag.clone()
+    };
+    TaggedSpan {
+        start,
+        end,
+        source: format!("aw:{}:{}", start.timestamp_millis(), tag),
+        tag,
+        task_uid: first.task_uid.clone(),
+        untagged_kind: label_kind.get(&label).copied().flatten(),
+        label,
+    }
+}
+
 /// Printable `[[rule]]` stubs for unmatched signals. Does not write.
 pub fn suggest_rules(spans: &[TaggedSpan]) -> String {
     let mut seen: BTreeMap<(SignalKind, String), ()> = BTreeMap::new();
@@ -735,16 +839,19 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
     let allowed = not_afk_spans(&afk_raw);
     let focused: f64 = allowed.iter().map(|s| s.seconds()).sum();
 
-    let spans = tagged_timeline(
-        &[
-            (SourceKind::Claude, &claude),
-            (SourceKind::Neovim, &neovim),
-            (SourceKind::Terminal, &terminal),
-            (SourceKind::Window, &window),
-            (SourceKind::Web, &web),
-        ],
-        &allowed,
-        &cfg,
+    let spans = coalesce_sessions(
+        &tagged_timeline(
+            &[
+                (SourceKind::Claude, &claude),
+                (SourceKind::Neovim, &neovim),
+                (SourceKind::Terminal, &terminal),
+                (SourceKind::Window, &window),
+                (SourceKind::Web, &web),
+            ],
+            &allowed,
+            &cfg,
+        ),
+        SESSION_GAP,
     );
     let tags = tag_rollup(&spans);
     Ok(IngestReport {
@@ -902,6 +1009,149 @@ mod tests {
     fn load_missing_rules_is_empty() {
         let cfg = TagsConfig::load(std::path::Path::new("/nope/tags.toml")).unwrap();
         assert!(cfg.rule.is_empty());
+    }
+
+    #[test]
+    fn coalesce_joins_same_tag_across_short_gaps() {
+        let a = TaggedSpan {
+            start: ts("2026-10-02T12:00:00Z"),
+            end: ts("2026-10-02T12:10:00Z"),
+            tag: "champalimaud".into(),
+            task_uid: None,
+            source: "aw:1:champalimaud".into(),
+            label: "champalimaud".into(),
+            untagged_kind: None,
+        };
+        let mut b = a.clone();
+        b.start = ts("2026-10-02T12:12:00Z");
+        b.end = ts("2026-10-02T12:40:00Z");
+        b.source = "aw:2:champalimaud".into();
+        let mut far = a.clone();
+        far.start = ts("2026-10-02T13:00:00Z");
+        far.end = ts("2026-10-02T13:05:00Z");
+        far.source = "aw:3:champalimaud".into();
+        let out = coalesce_sessions(&[a, b, far], SESSION_GAP);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
+        assert_eq!(out[0].end, ts("2026-10-02T12:40:00Z"));
+        assert_eq!(out[0].label, "champalimaud");
+    }
+
+    #[test]
+    fn coalesce_browsing_is_one_block() {
+        let mk = |start: &str, end: &str, label: &str| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: "untagged".into(),
+            task_uid: None,
+            source: format!("aw:{start}:{label}"),
+            label: label.into(),
+            untagged_kind: Some(SignalKind::Domain),
+        };
+        let out = coalesce_sessions(
+            &[
+                mk(
+                    "2026-10-02T12:00:00Z",
+                    "2026-10-02T12:02:00Z",
+                    "nytimes.com",
+                ),
+                mk(
+                    "2026-10-02T12:02:00Z",
+                    "2026-10-02T12:05:00Z",
+                    "duckduckgo.com",
+                ),
+                mk(
+                    "2026-10-02T12:05:30Z",
+                    "2026-10-02T12:08:00Z",
+                    "nytimes.com",
+                ),
+            ],
+            SESSION_GAP,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
+        assert_eq!(out[0].end, ts("2026-10-02T12:08:00Z"));
+        assert_eq!(out[0].label, "nytimes.com");
+    }
+
+    #[test]
+    fn coalesce_splits_only_on_real_gaps() {
+        let mk = |start: &str, end: &str, tag: &str| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: tag.into(),
+            task_uid: None,
+            source: format!("aw:{start}:{tag}"),
+            label: tag.into(),
+            untagged_kind: None,
+        };
+        let out = coalesce_sessions(
+            &[
+                mk(
+                    "2026-10-02T12:00:00Z",
+                    "2026-10-02T12:10:00Z",
+                    "champalimaud",
+                ),
+                mk("2026-10-02T12:11:00Z", "2026-10-02T12:20:00Z", "dotfiles"),
+                mk(
+                    "2026-10-02T12:21:00Z",
+                    "2026-10-02T12:30:00Z",
+                    "champalimaud",
+                ),
+                // Walked away: the next work is a new event.
+                mk(
+                    "2026-10-02T13:30:00Z",
+                    "2026-10-02T13:40:00Z",
+                    "champalimaud",
+                ),
+            ],
+            SESSION_GAP,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
+        assert_eq!(out[0].end, ts("2026-10-02T12:30:00Z"));
+        assert_eq!(out[0].label, "champalimaud");
+        assert_eq!(out[1].label, "champalimaud");
+    }
+
+    #[test]
+    fn coalesce_absorbs_web_blips_into_project() {
+        let mk = |start: &str, end: &str, tag: &str, label: &str| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: tag.into(),
+            task_uid: None,
+            source: format!("aw:{start}:{label}"),
+            label: label.into(),
+            untagged_kind: None,
+        };
+        let out = coalesce_sessions(
+            &[
+                mk(
+                    "2026-10-02T12:00:00Z",
+                    "2026-10-02T12:10:00Z",
+                    "champalimaud",
+                    "champalimaud",
+                ),
+                mk(
+                    "2026-10-02T12:10:00Z",
+                    "2026-10-02T12:10:20Z",
+                    "untagged",
+                    "github.com",
+                ),
+                mk(
+                    "2026-10-02T12:10:20Z",
+                    "2026-10-02T12:15:00Z",
+                    "champalimaud",
+                    "champalimaud",
+                ),
+            ],
+            SESSION_GAP,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "champalimaud");
+        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
+        assert_eq!(out[0].end, ts("2026-10-02T12:15:00Z"));
     }
 
     #[test]
