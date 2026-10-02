@@ -6,9 +6,9 @@ use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
 
 /// Pixels per hour on the day grid.
-const HOUR_H: f64 = 52.0;
+const HOUR_H: i32 = 52;
 /// Width of the hour-label gutter.
-const GUTTER: f64 = 56.0;
+const GUTTER: i32 = 56;
 
 fn dur_label(secs: f64) -> String {
     let s = secs.max(0.0).round() as i64;
@@ -57,7 +57,6 @@ pub fn day_note(blocks: &[BlockView]) -> String {
     format!("{} tracked", dur_label(total))
 }
 
-/// Minutes from local midnight for an instant on `day` (clamped).
 fn minutes_from_midnight(ms: i64, day: NaiveDate, zone: Tz) -> f64 {
     let t = local_of(ms, zone);
     if t.date_naive() < day {
@@ -79,7 +78,6 @@ fn hour_label(hour: u32) -> String {
     }
 }
 
-/// Place overlapping blocks in side-by-side lanes. Returns (lane, lane_count).
 fn lanes(blocks: &[(f64, f64, &BlockView)]) -> Vec<(usize, usize)> {
     let n = blocks.len();
     let mut out = vec![(0usize, 1usize); n];
@@ -113,32 +111,69 @@ fn lanes(blocks: &[(f64, f64, &BlockView)]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Hour gutter + rules + event chips + now line.
-fn day_grid(blocks: &[BlockView], day: NaiveDate, zone: Tz, now: chrono::DateTime<Tz>) -> gtk::Widget {
-    let height = 24.0 * HOUR_H;
+fn step_button(icon: &str, tip: &str, delta: i32, tx: &crate::window::Tx) -> gtk::Button {
+    use crate::window::Msg;
+    let image = gtk::Image::from_icon_name(icon);
+    image.set_pixel_size(16);
+    let b = gtk::Button::builder().child(&image).build();
+    b.add_css_class("flat");
+    b.set_tooltip_text(Some(tip));
+    b.set_focus_on_click(false);
+    let tx = tx.clone();
+    b.connect_clicked(move |_| {
+        let _ = tx.send(Msg::TimeStep(delta));
+    });
+    b
+}
 
-    let gutter = gtk::Fixed::new();
-    gutter.set_size_request(GUTTER as i32, height as i32);
+/// Hour rows as the grid background (always allocates), chips on top.
+fn day_grid(
+    blocks: &[BlockView],
+    day: NaiveDate,
+    zone: Tz,
+    now: chrono::DateTime<Tz>,
+) -> gtk::Widget {
+    let height = 24 * HOUR_H;
+
+    // Hour labels, one row each — never clipped away.
+    let gutter = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    gutter.set_size_request(GUTTER, height);
     gutter.add_css_class("time-gutter");
     for h in 0..24u32 {
+        let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        slot.set_size_request(GUTTER, HOUR_H);
         let lab = gtk::Label::new(Some(&hour_label(h)));
         lab.add_css_class("time-hour");
         lab.add_css_class("dim-label");
         lab.set_xalign(1.0);
-        lab.set_width_chars(7);
-        gutter.put(&lab, 0.0, (f64::from(h) * HOUR_H - 9.0).max(0.0));
+        lab.set_yalign(0.0);
+        lab.set_margin_top(-8);
+        lab.set_margin_end(8);
+        slot.append(&lab);
+        gutter.append(&slot);
     }
 
-    let grid = gtk::Fixed::new();
-    grid.set_hexpand(true);
-    grid.set_size_request(240, height as i32);
-    grid.add_css_class("time-grid");
-
-    for h in 0..24u32 {
-        let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
-        rule.add_css_class("time-hour-line");
-        grid.put(&rule, 0.0, f64::from(h) * HOUR_H);
+    // Hour rules as stacked rows (reliable allocation).
+    let rules = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    rules.set_hexpand(true);
+    rules.set_size_request(240, height);
+    rules.add_css_class("time-grid");
+    for _ in 0..24 {
+        let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        slot.set_hexpand(true);
+        slot.set_height_request(HOUR_H);
+        slot.add_css_class("time-hour-slot");
+        rules.append(&slot);
     }
+
+    // Event chips, absolutely placed over the rules.
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&rules));
+    let layer = gtk::Fixed::new();
+    layer.set_hexpand(true);
+    layer.set_vexpand(true);
+    layer.set_halign(gtk::Align::Fill);
+    layer.set_valign(gtk::Align::Fill);
 
     let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
     for b in blocks {
@@ -157,8 +192,8 @@ fn day_grid(blocks: &[BlockView], day: NaiveDate, zone: Tz, now: chrono::DateTim
     let lays = lanes(&placed);
 
     for (i, (s, e, b)) in placed.iter().enumerate() {
-        let top = s / 60.0 * HOUR_H;
-        let height_px = ((e - s) / 60.0 * HOUR_H).max(16.0);
+        let top = s / 60.0 * f64::from(HOUR_H);
+        let height_px = ((e - s) / 60.0 * f64::from(HOUR_H)).max(18.0);
         let (lane, lane_n) = lays[i];
         let label = b.label.as_deref().unwrap_or("untagged");
         let start_s = local_of(b.start, zone).format("%H:%M").to_string();
@@ -168,7 +203,9 @@ fn day_grid(blocks: &[BlockView], day: NaiveDate, zone: Tz, now: chrono::DateTim
         let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
         chip.add_css_class("time-block");
         chip.add_css_class(tint_for(label));
+        chip.set_halign(gtk::Align::Start);
         chip.set_valign(gtk::Align::Start);
+        chip.set_size_request((180 / lane_n.max(1) as i32).max(64), height_px as i32);
 
         let title = gtk::Label::new(Some(label));
         title.add_css_class("time-block-title");
@@ -183,30 +220,31 @@ fn day_grid(blocks: &[BlockView], day: NaiveDate, zone: Tz, now: chrono::DateTim
             chip.append(&meta);
         }
 
-        // Lane indent; width leaves room for siblings.
-        let left = 6.0 + lane as f64 * 10.0;
-        let width = (220.0 / lane_n.max(1) as f64).max(56.0);
-        chip.set_size_request(width as i32, height_px as i32);
-        grid.put(&chip, left, top);
+        let left = 4.0 + lane as f64 * 12.0;
+        layer.put(&chip, left, top);
     }
 
     if now.date_naive() == day {
         let mins = f64::from(now.time().hour()) * 60.0
             + f64::from(now.time().minute())
             + f64::from(now.time().second()) / 60.0;
-        let y = mins / 60.0 * HOUR_H;
+        let y = mins / 60.0 * f64::from(HOUR_H);
         let line = gtk::Separator::new(gtk::Orientation::Horizontal);
         line.add_css_class("time-now");
-        grid.put(&line, 0.0, y);
+        line.set_halign(gtk::Align::Fill);
+        layer.put(&line, 0.0, y);
         let dot = gtk::Label::new(Some("●"));
         dot.add_css_class("time-now-dot");
-        grid.put(&dot, 0.0, y - 9.0);
+        layer.put(&dot, 0.0, y - 9.0);
     }
+
+    overlay.add_overlay(&layer);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("time-planner");
+    row.set_size_request(GUTTER + 240, height);
     row.append(&gutter);
-    row.append(&grid);
+    row.append(&overlay);
     row.upcast()
 }
 
@@ -224,36 +262,21 @@ pub fn build_column(
         root.add_css_class("view-enter");
     }
 
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // Header: title + date on the left, day controls pinned right.
+    let head = gtk::CenterBox::new();
+    head.add_css_class("time-head");
+    let left = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let title = gtk::Label::new(Some("Time"));
     title.add_css_class("view-title");
-    title.set_xalign(0.0);
-    head.append(&title);
-
-    let date_lab = gtk::Label::new(Some(&o.time_day.format("%B %-d, %Y").to_string()));
+    left.append(&title);
+    let date_lab = gtk::Label::new(Some(&o.time_day.format("%B %e, %Y").to_string()));
     date_lab.add_css_class("time-date");
-    date_lab.set_hexpand(true);
     date_lab.set_xalign(0.0);
-    head.append(&date_lab);
+    left.append(&date_lab);
+    head.set_start_widget(Some(&left));
 
-    let prev = gtk::Button::from_icon_name("go-previous-symbolic");
-    prev.add_css_class("flat");
-    prev.set_tooltip_text(Some("Previous day"));
-    {
-        let tx = tx.clone();
-        prev.connect_clicked(move |_| {
-            let _ = tx.send(Msg::TimeStep(-1));
-        });
-    }
-    let next = gtk::Button::from_icon_name("go-next-symbolic");
-    next.add_css_class("flat");
-    next.set_tooltip_text(Some("Next day"));
-    {
-        let tx = tx.clone();
-        next.connect_clicked(move |_| {
-            let _ = tx.send(Msg::TimeStep(1));
-        });
-    }
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    controls.add_css_class("time-controls");
     let today = gtk::Button::with_label("Today");
     today.add_css_class("pill");
     {
@@ -268,9 +291,10 @@ pub fn build_column(
             }
         });
     }
-    head.append(&prev);
-    head.append(&next);
-    head.append(&today);
+    controls.append(&step_button("go-previous-symbolic", "Previous day", -1, tx));
+    controls.append(&step_button("go-next-symbolic", "Next day", 1, tx));
+    controls.append(&today);
+    head.set_end_widget(Some(&controls));
     root.append(&head);
 
     let note = gtk::Label::new(Some(&day_note(o.blocks)));
@@ -281,6 +305,7 @@ pub fn build_column(
 
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
+    scroll.set_hexpand(true);
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroll.add_css_class("time-scroll");
     scroll.set_child(Some(&day_grid(
@@ -291,11 +316,12 @@ pub fn build_column(
     )));
     root.append(&scroll);
 
-    // Open around 8am so the workday is in view.
     {
         let scroll = scroll.clone();
         glib::idle_add_local_once(move || {
-            scroll.vadjustment().set_value(7.5 * HOUR_H);
+            scroll
+                .vadjustment()
+                .set_value(7.5 * f64::from(HOUR_H));
         });
     }
 

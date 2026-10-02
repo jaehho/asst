@@ -926,3 +926,15 @@ button.pill {
   border-radius: 999px;
   padding: 4px 12px;
 }
+
+.time-head {
+  margin-bottom: 2px;
+}
+
+.time-controls {
+  margin-left: 8px;
+}
+
+.time-hour-slot {
+  border-top: 1px solid alpha(@borders, 0.55);
+}

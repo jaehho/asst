@@ -2554,6 +2554,12 @@ impl Window {
             for l in &self.lists {
                 (&l.href, &l.name, &l.color).hash(&mut h);
             }
+            // Time chips come from `blocks`, not from task sections.
+            if self.nav == Nav::Time {
+                for b in &self.blocks {
+                    (b.start, b.end, &b.label, b.planned).hash(&mut h);
+                }
+            }
             counts.of(&self.nav).hash(&mut h);
             for s in &sections {
                 format!("{:?}{:?}{:?}", s.kind, s.title, s.note).hash(&mut h);
