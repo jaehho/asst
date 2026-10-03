@@ -5,6 +5,11 @@ window {
   --view-green: #2ec27e;
   --view-purple: #9141ac;
   --view-orange: #ff7800;
+  /* Solid event chips: dark enough for white labels in both themes. */
+  --event-blue: #1a66c9;
+  --event-green: #24824e;
+  --event-purple: #7a3b96;
+  --event-orange: #c05200;
   --due-today: #16af54;
   --due-overdue: #fa1955;
   --done: #ff7800;
@@ -880,20 +885,20 @@ menubutton.filtered > button {
 }
 
 .time-block.tint-blue {
-  background: var(--view-blue);
-  border-left-color: var(--view-blue);
+  background: var(--event-blue);
+  border-left-color: var(--event-blue);
 }
 .time-block.tint-green {
-  background: var(--view-green);
-  border-left-color: var(--view-green);
+  background: var(--event-green);
+  border-left-color: var(--event-green);
 }
 .time-block.tint-purple {
-  background: var(--view-purple);
-  border-left-color: var(--view-purple);
+  background: var(--event-purple);
+  border-left-color: var(--event-purple);
 }
 .time-block.tint-orange {
-  background: var(--view-orange);
-  border-left-color: var(--view-orange);
+  background: var(--event-orange);
+  border-left-color: var(--event-orange);
 }
 
 /* Tint classes color text; event labels stay white on the solid chip. */
