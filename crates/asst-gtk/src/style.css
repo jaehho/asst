@@ -880,30 +880,45 @@ menubutton.filtered > button {
 }
 
 .time-block.tint-blue {
-  background: alpha(@blue_3, 0.22);
-  border-left-color: @blue_3;
+  background: var(--view-blue);
+  border-left-color: var(--view-blue);
 }
 .time-block.tint-green {
-  background: alpha(@green_3, 0.22);
-  border-left-color: @green_3;
+  background: var(--view-green);
+  border-left-color: var(--view-green);
 }
 .time-block.tint-purple {
-  background: alpha(@purple_3, 0.22);
-  border-left-color: @purple_3;
+  background: var(--view-purple);
+  border-left-color: var(--view-purple);
 }
 .time-block.tint-orange {
-  background: alpha(@orange_3, 0.22);
-  border-left-color: @orange_3;
+  background: var(--view-orange);
+  border-left-color: var(--view-orange);
+}
+
+/* Tint classes color text; event labels stay white on the solid chip. */
+.time-block,
+.time-block.tint-blue,
+.time-block.tint-green,
+.time-block.tint-purple,
+.time-block.tint-orange {
+  color: #fff;
 }
 
 .time-block-title {
+  color: #fff;
   font-weight: 600;
   font-size: 12px;
 }
 
 .time-block-meta {
+  color: #fff;
   font-size: 10px;
-  opacity: 0.8;
+  opacity: 0.9;
+}
+
+.time-now-row {
+  min-height: 12px;
 }
 
 .time-now {
@@ -915,6 +930,7 @@ menubutton.filtered > button {
 .time-now-dot {
   color: @destructive_color;
   font-size: 10px;
+  min-width: 10px;
 }
 
 .time-date {

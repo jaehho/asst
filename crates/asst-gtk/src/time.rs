@@ -4,6 +4,8 @@ use asst_core::api::BlockView;
 use chrono::{NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Pixels per hour on the day grid.
 const HOUR_H: i32 = 52;
@@ -193,6 +195,10 @@ fn day_grid(
     });
     let lays = lanes(&placed);
 
+    // Fixed does not stretch children; re-fit widths when the grid resizes.
+    let fit: Rc<RefCell<Vec<(gtk::Box, f64, i32, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+    let now_line: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
+
     for (i, (s, e, b)) in placed.iter().enumerate() {
         let top = s / 60.0 * f64::from(HOUR_H);
         let height_px = ((e - s) / 60.0 * f64::from(HOUR_H)).max(18.0);
@@ -208,23 +214,24 @@ fn day_grid(
         chip.set_halign(gtk::Align::Start);
         chip.set_valign(gtk::Align::Start);
         chip.set_overflow(gtk::Overflow::Hidden);
-        chip.set_size_request((180 / lane_n.max(1) as i32).max(64), height_px as i32);
+        let height_i = height_px as i32;
+        chip.set_size_request(120, height_i);
 
         let title = gtk::Label::new(Some(label));
         title.add_css_class("time-block-title");
         title.set_xalign(0.0);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title.set_max_width_chars(18);
         chip.append(&title);
         if height_px >= 34.0 {
             let meta = gtk::Label::new(Some(&format!("{start_s}–{end_s} · {dur}")));
             meta.add_css_class("time-block-meta");
-            meta.add_css_class("dim-label");
             meta.set_xalign(0.0);
             chip.append(&meta);
         }
 
         let left = 4.0 + lane as f64 * 12.0;
+        fit.borrow_mut()
+            .push((chip.clone(), left, lane_n.max(1) as i32, height_i));
         layer.put(&chip, left, top);
     }
 
@@ -233,15 +240,46 @@ fn day_grid(
             + f64::from(now.time().minute())
             + f64::from(now.time().second()) / 60.0;
         let y = mins / 60.0 * f64::from(HOUR_H);
-        // Fixed children keep their requested width; a Separator with Fill
-        // collapses to nothing. Ask for the full grid.
-        let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        line.add_css_class("time-now");
-        line.set_size_request(4000, 2);
-        layer.put(&line, 0.0, y - 1.0);
+        // Dot and rule in one row so the rule sits on the dot's center.
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.add_css_class("time-now-row");
+        row.set_halign(gtk::Align::Start);
+        row.set_valign(gtk::Align::Start);
         let dot = gtk::Label::new(Some("●"));
         dot.add_css_class("time-now-dot");
-        layer.put(&dot, 0.0, y - 9.0);
+        row.append(&dot);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        line.add_css_class("time-now");
+        line.set_valign(gtk::Align::Center);
+        line.set_size_request(4000, 2);
+        row.append(&line);
+        layer.put(&row, 0.0, y - 7.0);
+        *now_line.borrow_mut() = Some(line);
+    }
+
+    {
+        let fit = fit.clone();
+        let now_line = now_line.clone();
+        let layer_for_fit = layer.clone();
+        let relayout: Rc<dyn Fn()> = Rc::new(move || {
+            let w = layer_for_fit.width();
+            if w <= 1 {
+                return;
+            }
+            for (chip, left, lane_n, h) in fit.borrow().iter() {
+                let lanes = f64::from(*lane_n).max(1.0);
+                let cw = ((f64::from(w) - left - 8.0) / lanes).max(48.0) as i32;
+                chip.set_size_request(cw, *h);
+            }
+            if let Some(line) = now_line.borrow().as_ref() {
+                let w = f64::from(w) - 20.0;
+                line.set_size_request(w.max(20.0) as i32, 2);
+            }
+        });
+        let r1 = relayout.clone();
+        layer.connect_map(move |_| r1());
+        let r2 = relayout.clone();
+        layer.connect_notify_local(Some("width"), move |_, _| r2());
     }
 
     overlay.add_overlay(&layer);
