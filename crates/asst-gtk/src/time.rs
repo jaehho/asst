@@ -78,39 +78,6 @@ fn hour_label(hour: u32) -> String {
     }
 }
 
-fn lanes(blocks: &[(f64, f64, &BlockView)]) -> Vec<(usize, usize)> {
-    let n = blocks.len();
-    let mut out = vec![(0usize, 1usize); n];
-    if n == 0 {
-        return out;
-    }
-    let mut lane_ends: Vec<f64> = Vec::new();
-    for (i, (start, end, _)) in blocks.iter().enumerate() {
-        let lane = lane_ends
-            .iter()
-            .position(|e| *e <= *start + 0.5)
-            .unwrap_or(lane_ends.len());
-        if lane == lane_ends.len() {
-            lane_ends.push(*end);
-        } else {
-            lane_ends[lane] = *end;
-        }
-        out[i].0 = lane;
-    }
-    for i in 0..n {
-        let (s, e, _) = blocks[i];
-        let mut cluster = 1usize;
-        for j in 0..n {
-            let (s2, e2, _) = blocks[j];
-            if s2 < e && s < e2 {
-                cluster = cluster.max(out[j].0 + 1);
-            }
-        }
-        out[i].1 = cluster;
-    }
-    out
-}
-
 fn step_button(icon: &str, tip: &str, delta: i32, tx: &crate::window::Tx) -> gtk::Button {
     use crate::window::Msg;
     let image = gtk::Image::from_icon_name(icon);
@@ -166,16 +133,10 @@ fn day_grid(
         rules.append(&slot);
     }
 
-    // Event chips, absolutely placed over the rules.
+    // Event chips over the rules. A normal box (not Fixed) so chips take
+    // the column width and keep both rounded corners.
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&rules));
-    overlay.set_overflow(gtk::Overflow::Hidden);
-    let layer = gtk::Fixed::new();
-    layer.set_hexpand(true);
-    layer.set_vexpand(true);
-    layer.set_halign(gtk::Align::Fill);
-    layer.set_valign(gtk::Align::Fill);
-    layer.set_overflow(gtk::Overflow::Hidden);
 
     let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
     for b in blocks {
@@ -193,16 +154,15 @@ fn day_grid(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     });
-    let lays = lanes(&placed);
 
-    // Fixed keeps each child at its requested width. Ask for far more than
-    // the column and let the scroller clip: same trick as the now-line.
-    const SPAN_W: i32 = 4000;
-
-    for (i, (s, e, b)) in placed.iter().enumerate() {
+    let stack = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    stack.set_halign(gtk::Align::Fill);
+    stack.set_valign(gtk::Align::Start);
+    stack.set_hexpand(true);
+    let mut prev_bottom = 0.0f64;
+    for (s, e, b) in placed.iter() {
         let top = s / 60.0 * f64::from(HOUR_H);
         let height_px = ((e - s) / 60.0 * f64::from(HOUR_H)).max(18.0);
-        let (lane, lane_n) = lays[i];
         let label = b.label.as_deref().unwrap_or("untagged");
         let start_s = local_of(b.start, zone).format("%H:%M").to_string();
         let end_s = local_of(b.end, zone).format("%H:%M").to_string();
@@ -211,13 +171,11 @@ fn day_grid(
         let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
         chip.add_css_class("time-block");
         chip.add_css_class(tint_for(label));
-        chip.set_halign(gtk::Align::Start);
-        chip.set_valign(gtk::Align::Start);
-        chip.set_overflow(gtk::Overflow::Hidden);
-        chip.set_size_request(
-            SPAN_W / lane_n.max(1) as i32,
-            height_px as i32,
-        );
+        chip.set_hexpand(true);
+        chip.set_height_request(height_px as i32);
+        chip.set_margin_top((top - prev_bottom).max(0.0) as i32);
+        chip.set_margin_start(4);
+        chip.set_margin_end(4);
 
         let title = gtk::Label::new(Some(label));
         title.add_css_class("time-block-title");
@@ -231,9 +189,10 @@ fn day_grid(
             chip.append(&meta);
         }
 
-        let left = 4.0 + lane as f64 * 12.0;
-        layer.put(&chip, left, top);
+        stack.append(&chip);
+        prev_bottom = top + height_px;
     }
+    overlay.add_overlay(&stack);
 
     if now.date_naive() == day {
         let mins = f64::from(now.time().hour()) * 60.0
@@ -243,20 +202,20 @@ fn day_grid(
         // Dot and rule in one row so the rule sits on the dot's center.
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         row.add_css_class("time-now-row");
-        row.set_halign(gtk::Align::Start);
+        row.set_halign(gtk::Align::Fill);
         row.set_valign(gtk::Align::Start);
+        row.set_margin_top((y - 7.0) as i32);
         let dot = gtk::Label::new(Some("●"));
         dot.add_css_class("time-now-dot");
         row.append(&dot);
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         line.add_css_class("time-now");
         line.set_valign(gtk::Align::Center);
-        line.set_size_request(SPAN_W, 2);
+        line.set_hexpand(true);
+        line.set_height_request(2);
         row.append(&line);
-        layer.put(&row, 0.0, y - 7.0);
+        overlay.add_overlay(&row);
     }
-
-    overlay.add_overlay(&layer);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("time-planner");
