@@ -4,8 +4,6 @@ use asst_core::api::BlockView;
 use chrono::{NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// Pixels per hour on the day grid.
 const HOUR_H: i32 = 52;
@@ -171,11 +169,13 @@ fn day_grid(
     // Event chips, absolutely placed over the rules.
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&rules));
+    overlay.set_overflow(gtk::Overflow::Hidden);
     let layer = gtk::Fixed::new();
     layer.set_hexpand(true);
     layer.set_vexpand(true);
     layer.set_halign(gtk::Align::Fill);
     layer.set_valign(gtk::Align::Fill);
+    layer.set_overflow(gtk::Overflow::Hidden);
 
     let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
     for b in blocks {
@@ -195,9 +195,9 @@ fn day_grid(
     });
     let lays = lanes(&placed);
 
-    // Fixed does not stretch children; re-fit widths when the grid resizes.
-    let fit: Rc<RefCell<Vec<(gtk::Box, f64, i32, i32)>>> = Rc::new(RefCell::new(Vec::new()));
-    let now_line: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
+    // Fixed keeps each child at its requested width. Ask for far more than
+    // the column and let the scroller clip: same trick as the now-line.
+    const SPAN_W: i32 = 4000;
 
     for (i, (s, e, b)) in placed.iter().enumerate() {
         let top = s / 60.0 * f64::from(HOUR_H);
@@ -214,8 +214,10 @@ fn day_grid(
         chip.set_halign(gtk::Align::Start);
         chip.set_valign(gtk::Align::Start);
         chip.set_overflow(gtk::Overflow::Hidden);
-        let height_i = height_px as i32;
-        chip.set_size_request(120, height_i);
+        chip.set_size_request(
+            SPAN_W / lane_n.max(1) as i32,
+            height_px as i32,
+        );
 
         let title = gtk::Label::new(Some(label));
         title.add_css_class("time-block-title");
@@ -230,8 +232,6 @@ fn day_grid(
         }
 
         let left = 4.0 + lane as f64 * 12.0;
-        fit.borrow_mut()
-            .push((chip.clone(), left, lane_n.max(1) as i32, height_i));
         layer.put(&chip, left, top);
     }
 
@@ -251,35 +251,9 @@ fn day_grid(
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         line.add_css_class("time-now");
         line.set_valign(gtk::Align::Center);
-        line.set_size_request(4000, 2);
+        line.set_size_request(SPAN_W, 2);
         row.append(&line);
         layer.put(&row, 0.0, y - 7.0);
-        *now_line.borrow_mut() = Some(line);
-    }
-
-    {
-        let fit = fit.clone();
-        let now_line = now_line.clone();
-        let layer_for_fit = layer.clone();
-        let relayout: Rc<dyn Fn()> = Rc::new(move || {
-            let w = layer_for_fit.width();
-            if w <= 1 {
-                return;
-            }
-            for (chip, left, lane_n, h) in fit.borrow().iter() {
-                let lanes = f64::from(*lane_n).max(1.0);
-                let cw = ((f64::from(w) - left - 8.0) / lanes).max(48.0) as i32;
-                chip.set_size_request(cw, *h);
-            }
-            if let Some(line) = now_line.borrow().as_ref() {
-                let w = f64::from(w) - 20.0;
-                line.set_size_request(w.max(20.0) as i32, 2);
-            }
-        });
-        let r1 = relayout.clone();
-        layer.connect_map(move |_| r1());
-        let r2 = relayout.clone();
-        layer.connect_notify_local(Some("width"), move |_, _| r2());
     }
 
     overlay.add_overlay(&layer);
