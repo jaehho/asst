@@ -199,11 +199,14 @@ impl Daemon {
         self.wake_sync.notify_one();
     }
 
-    /// Sync now and wait for that round (or a later one) to finish.
+    /// Sync now and wait for that round (or a later one) to finish. A
+    /// GitHub pass is asked for too; it runs on its own loop, apart from
+    /// the round that is waited for.
     pub async fn sync_and_wait(&self) -> std::result::Result<Report, String> {
         let want = self.requested.fetch_add(1, Ordering::SeqCst) + 1;
         let mut rx = self.completed.subscribe();
         self.wake_sync.notify_one();
+        self.wake_github.notify_one();
         match rx.wait_for(|(generation, _)| *generation >= want).await {
             Ok(done) => done.1.clone(),
             Err(_) => Err("the daemon is shutting down".into()),
@@ -1223,5 +1226,21 @@ mod tests {
         assert!(daemon.unlink("jaehho/asst").unwrap());
         assert!(!daemon.unlink("jaehho/asst").unwrap());
         assert_eq!(daemon.links().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_now_also_asks_for_a_github_pass() {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let store = Store::in_memory(zone).unwrap();
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        tokio::spawn(daemon.clone().sync_loop());
+        let woken = daemon.wake_github.notified();
+        tokio::pin!(woken);
+        // Not signed in: the round fails, and the GitHub pass is still asked
+        // for, so `asst sync` and the window's Sync both reach GitHub now.
+        assert!(daemon.sync_and_wait().await.is_err());
+        tokio::time::timeout(Duration::from_millis(100), &mut woken)
+            .await
+            .expect("sync now wakes a github pass");
     }
 }
