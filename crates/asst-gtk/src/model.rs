@@ -942,6 +942,24 @@ pub fn slot_duration(start: u32, duration: u32) -> u32 {
     duration.clamp(PLAN_MIN_DURATION.min(room), room)
 }
 
+/// Start a block takes when the keyboard nudges it by `delta` minutes.
+pub fn nudge_start(start: u32, delta: i32) -> u32 {
+    snap(start as i32 + delta)
+}
+
+/// Where a keyboard place lands: `now` snapped to the grid when it sits
+/// there, else the first hour of the day. Never claims a false "now".
+pub fn place_start(now_min: Option<u32>, hour_start: u32) -> u32 {
+    now_min.map_or(hour_start * 60, |m| snap(m as i32))
+}
+
+/// `now` in minutes if it falls on the grid `hour_start..hour_end`, else
+/// none: the now-line must not pin itself to a rule it is not on.
+pub fn now_on_grid(now: DateTime<Tz>, hour_start: u32, hour_end: u32) -> Option<u32> {
+    let mins = now.time().hour() * 60 + now.time().minute() + u32::from(now.time().second() > 30);
+    (mins >= hour_start * 60 && mins < hour_end * 60).then_some(mins)
+}
+
 /// The block a drop of `task` at `start` for `duration` would create.
 /// `blocks` are the ones already on the grid; `task`'s own block among
 /// them is left out, so a move previews without the old home. The ghost
@@ -1046,9 +1064,7 @@ pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> Day
         hour_end: PLAN_HOUR_END,
         blocks,
         tray,
-        now_min: Some(
-            now.time().hour() * 60 + now.time().minute() + u32::from(now.time().second() > 30),
-        ),
+        now_min: now_on_grid(now, PLAN_HOUR_START, PLAN_HOUR_END),
     }
 }
 
@@ -2104,6 +2120,37 @@ mod tests {
         assert_eq!(snap(9 * 60 + 8), 9 * 60 + 15);
         assert_eq!(snap(-30), 0);
         assert_eq!(snap(24 * 60), 24 * 60 - 1);
+    }
+
+    #[test]
+    fn now_line_only_claims_a_place_on_the_grid() {
+        let on = |h, m, s| ny().with_ymd_and_hms(2026, 9, 14, h, m, s).unwrap();
+        assert_eq!(now_on_grid(on(10, 0, 0), 7, 23), Some(10 * 60));
+        assert_eq!(now_on_grid(on(7, 0, 0), 7, 23), Some(7 * 60));
+        assert_eq!(now_on_grid(on(22, 59, 0), 7, 23), Some(22 * 60 + 59));
+        // Outside 07:00–23:00: no claim, not a pin at the top rule.
+        assert_eq!(now_on_grid(on(0, 59, 0), 7, 23), None);
+        assert_eq!(now_on_grid(on(6, 59, 0), 7, 23), None);
+        assert_eq!(now_on_grid(on(23, 0, 0), 7, 23), None);
+        // Seconds round the minute the same way the grid does.
+        assert_eq!(now_on_grid(on(10, 0, 40), 7, 23), Some(10 * 60 + 1));
+        // day_plan carries the rule through.
+        let p = day_plan(&[], &[], on(0, 59, 0));
+        assert_eq!(p.now_min, None);
+        let p = day_plan(&[], &[], on(10, 0, 0));
+        assert_eq!(p.now_min, Some(10 * 60));
+    }
+
+    #[test]
+    fn keyboard_place_and_nudge_snap_to_the_grid() {
+        assert_eq!(place_start(Some(9 * 60 + 7), PLAN_HOUR_START), 9 * 60);
+        assert_eq!(place_start(Some(9 * 60 + 8), PLAN_HOUR_START), 9 * 60 + 15);
+        // Off the grid: the first hour, not a false now.
+        assert_eq!(place_start(None, PLAN_HOUR_START), PLAN_HOUR_START * 60);
+        assert_eq!(nudge_start(9 * 60, 15), 9 * 60 + 15);
+        assert_eq!(nudge_start(9 * 60, -15), 8 * 60 + 45);
+        assert_eq!(nudge_start(9 * 60 + 7, 15), 9 * 60 + 15);
+        assert_eq!(nudge_start(0, -15), 0);
     }
 
     #[test]
