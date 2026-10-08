@@ -2,13 +2,13 @@
 //! the sidebar counts, and the date and repeat arithmetic behind the
 //! pickers. No GTK here, so it is tested like the core.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use asst_core::api::{Change, ListView, StatusView, SyncState, TaskView};
 use asst_core::fmt;
 use asst_core::task::{Task, priority_level};
 use asst_core::time::{Trigger, When, resolve, weekday_code};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 pub enum Nav {
     Inbox,
     Today,
+    /// Today's tasks on an hour timeline: the day plan.
+    Plan,
     /// Eisenhower's four boxes: important × urgent.
     Matrix,
     Scheduled,
@@ -33,10 +35,11 @@ pub enum Nav {
 
 impl Nav {
     /// The smart views, in sidebar order.
-    pub fn filters() -> [Nav; 10] {
+    pub fn filters() -> [Nav; 11] {
         [
             Nav::Inbox,
             Nav::Today,
+            Nav::Plan,
             Nav::Matrix,
             Nav::Scheduled,
             Nav::Time,
@@ -52,6 +55,7 @@ impl Nav {
         match self {
             Nav::Inbox => "Inbox".into(),
             Nav::Today => "Today".into(),
+            Nav::Plan => "Plan".into(),
             Nav::Matrix => "Matrix".into(),
             Nav::Scheduled => "Scheduled".into(),
             Nav::Time => "Time".into(),
@@ -71,6 +75,7 @@ impl Nav {
     pub fn keywords(&self) -> &'static [&'static str] {
         match self {
             Nav::Today => &["overdue"],
+            Nav::Plan => &["timebox", "day plan", "agenda", "timeline", "schedule"],
             Nav::Matrix => &["eisenhower", "urgent", "important", "quadrant"],
             Nav::Scheduled => &["upcoming", "later"],
             Nav::Time => &["tracked", "timeline", "activity", "blocks"],
@@ -92,6 +97,7 @@ impl Nav {
         match self {
             Nav::Inbox => "The inbox list",
             Nav::Today => "Due today, and overdue",
+            Nav::Plan => "Today's tasks on a timeline",
             Nav::Matrix => "Important and urgent, in four boxes",
             Nav::Scheduled => "Everything with a date, by day",
             Nav::Time => "Tracked time, by day",
@@ -108,6 +114,7 @@ impl Nav {
         match self {
             Nav::Inbox => "mailbox-symbolic",
             Nav::Today => "star-outline-thick-symbolic",
+            Nav::Plan => "calendar-hollow-symbolic",
             Nav::Matrix => "flag-outline-thick-symbolic",
             Nav::Scheduled => "month-symbolic",
             Nav::Time => "stopwatch-symbolic",
@@ -124,7 +131,7 @@ impl Nav {
     pub fn tint(&self) -> &'static str {
         match self {
             Nav::Inbox | Nav::All | Nav::List(_) => "tint-blue",
-            Nav::Today => "tint-green",
+            Nav::Today | Nav::Plan => "tint-green",
             Nav::Matrix => "tint-orange",
             Nav::Scheduled | Nav::Tomorrow | Nav::Anytime | Nav::Repeating => "tint-purple",
             Nav::Time => "tint-blue",
@@ -137,6 +144,7 @@ impl Nav {
         match self {
             Nav::Inbox => "inbox".into(),
             Nav::Today => "today".into(),
+            Nav::Plan => "plan".into(),
             Nav::Matrix => "matrix".into(),
             Nav::Scheduled => "scheduled".into(),
             Nav::Time => "time".into(),
@@ -166,6 +174,11 @@ impl Nav {
             Nav::Inbox | Nav::List(_) => Sort::Custom,
             _ => Sort::Due,
         }
+    }
+
+    /// The day plan draws its own timeline; the others are lists of rows.
+    pub fn is_timeline(&self) -> bool {
+        matches!(self, Nav::Time | Nav::Plan)
     }
 }
 
@@ -607,6 +620,14 @@ pub fn plan(nav: &Nav, data: &Data, opts: &ViewOpts, now: DateTime<Tz>) -> Vec<S
                 Section::new(Kind::Day(today), Some("Tracked".into()), Vec::new()).keep(),
             );
         }
+        Nav::Plan => {
+            // The timeline is drawn from `day_plan`; the tray is its own
+            // column beside it. One kept section so the day still has a
+            // header in the shared shape.
+            out.push(
+                Section::new(Kind::Day(today), Some("Plan".into()), Vec::new()).keep(),
+            );
+        }
         Nav::Matrix => {
             let mut boxes: [Vec<TaskView>; 4] = Default::default();
             for t in pick(&|_| true) {
@@ -840,6 +861,186 @@ pub fn reorder(tasks: &[TaskView], moved: &str, target: &str, after: bool) -> Ve
         .collect()
 }
 
+// -- day plan ----------------------------------------------------------------
+
+/// First hour row of the Plan grid (inclusive).
+pub const PLAN_HOUR_START: u32 = 7;
+/// End of the Plan grid (exclusive): rows run `PLAN_HOUR_START..PLAN_HOUR_END`.
+pub const PLAN_HOUR_END: u32 = 22;
+/// Minutes a newly placed task holds until its edge is dragged.
+pub const PLAN_DEFAULT_DURATION: u32 = 30;
+/// Shortest slot the plan keeps. The grid may still draw one shorter higher.
+pub const PLAN_MIN_DURATION: u32 = 15;
+
+/// A window-local planned slot. The iPhone has no such thing, so this never
+/// reaches the VTODO: `window.toml` holds it, keyed by task UID + date, with
+/// the start (minutes from midnight) and the duration in minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSlot {
+    pub uid: String,
+    pub date: NaiveDate,
+    pub start: u32,
+    pub duration: u32,
+}
+
+/// One task on the day grid, after overlap layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanBlock {
+    pub task: TaskView,
+    pub start: u32,
+    pub duration: u32,
+    /// 0-based column among the blocks this one overlaps.
+    pub col: usize,
+    /// Columns the whole overlap group shares; the block is `1/cols` wide.
+    pub cols: usize,
+}
+
+/// What the Plan view draws: placed blocks, the tray, and the now-line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DayPlan {
+    pub hour_start: u32,
+    pub hour_end: u32,
+    pub blocks: Vec<PlanBlock>,
+    /// Today's open and overdue tasks that are not placed.
+    pub tray: Vec<TaskView>,
+    /// Minutes from midnight, when the grid shows today.
+    pub now_min: Option<u32>,
+}
+
+/// Upsert `uid`'s slot on `date`. One slot per task per day.
+pub fn place(slots: &mut Vec<PlanSlot>, uid: &str, date: NaiveDate, start: u32, duration: u32) {
+    let start = start.min(24 * 60 - 1);
+    let room = (24 * 60 - start).max(1);
+    let duration = duration.clamp(PLAN_MIN_DURATION.min(room), room);
+    match slots.iter_mut().find(|s| s.uid == uid && s.date == date) {
+        Some(s) => {
+            s.start = start;
+            s.duration = duration;
+        }
+        None => slots.push(PlanSlot {
+            uid: uid.to_string(),
+            date,
+            start,
+            duration,
+        }),
+    }
+}
+
+/// Take `uid` off `date`'s plan.
+pub fn unplace(slots: &mut Vec<PlanSlot>, uid: &str, date: NaiveDate) {
+    slots.retain(|s| !(s.uid == uid && s.date == date));
+}
+
+/// Drop slots whose task is gone from the open set. Leaves the rest alone.
+pub fn prune_slots(slots: &mut Vec<PlanSlot>, live: &HashSet<&str>) -> bool {
+    let before = slots.len();
+    slots.retain(|s| live.contains(s.uid.as_str()));
+    slots.len() != before
+}
+
+/// Today's day plan. Blocks are the open tasks with a slot on `today`; the
+/// tray is the rest of Today (overdue, then due today), unscheduled.
+///
+/// Overlaps sit side by side: each block takes the leftmost column that no
+/// overlapping block already holds, and a group of blocks linked by overlap
+/// shares one width (`cols` columns). A drop or a move only changes the
+/// slot; the layout is recomputed here every time.
+pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> DayPlan {
+    let zone = now.timezone();
+    let today = now.date_naive();
+    let today_slots: Vec<&PlanSlot> = slots.iter().filter(|s| s.date == today).collect();
+    let placed: HashSet<&str> = today_slots.iter().map(|s| s.uid.as_str()).collect();
+    let mut blocks: Vec<PlanBlock> = Vec::new();
+    for s in &today_slots {
+        if let Some(t) = open.iter().find(|t| t.task.uid == s.uid) {
+            blocks.push(PlanBlock {
+                task: t.clone(),
+                start: s.start,
+                duration: s.duration,
+                col: 0,
+                cols: 1,
+            });
+        }
+    }
+    blocks.sort_by_key(|b| (b.start, b.duration, b.task.task.uid.clone()));
+    layout(&mut blocks);
+
+    let day = |t: &TaskView| t.task.due.as_ref().map(|d| d.local_date(zone));
+    let mut tray: Vec<TaskView> = open
+        .iter()
+        .filter(|t| {
+            !placed.contains(t.task.uid.as_str()) && day(t).is_some_and(|d| d <= today)
+        })
+        .cloned()
+        .collect();
+    tray.sort_by_key(|t| {
+        let d = day(t);
+        (d.is_none(), d, priority_level(t.task.priority), t.task.uid.clone())
+    });
+
+    DayPlan {
+        hour_start: PLAN_HOUR_START,
+        hour_end: PLAN_HOUR_END,
+        blocks,
+        tray,
+        now_min: Some(
+            u32::from(now.time().hour()) * 60
+                + u32::from(now.time().minute())
+                + u32::from(now.time().second() > 30),
+        ),
+    }
+}
+
+/// Greedy side-by-side columns, then each block's group width.
+fn layout(blocks: &mut [PlanBlock]) {
+    // Columns used by the blocks each one already overlaps.
+    let mut col_of: Vec<usize> = vec![0; blocks.len()];
+    for i in 0..blocks.len() {
+        let (s, e) = (blocks[i].start, blocks[i].start + blocks[i].duration);
+        let mut taken = HashSet::new();
+        for j in 0..i {
+            let (os, oe) = (blocks[j].start, blocks[j].start + blocks[j].duration);
+            if s < oe && os < e {
+                taken.insert(col_of[j]);
+            }
+        }
+        let mut col = 0;
+        while taken.contains(&col) {
+            col += 1;
+        }
+        col_of[i] = col;
+    }
+    // Connected components of the overlap graph share one width.
+    let mut group = vec![usize::MAX; blocks.len()];
+    for i in 0..blocks.len() {
+        if group[i] != usize::MAX {
+            continue;
+        }
+        let mut stack = vec![i];
+        let mut members = Vec::new();
+        group[i] = i;
+        while let Some(k) = stack.pop() {
+            members.push(k);
+            let (s, e) = (blocks[k].start, blocks[k].start + blocks[k].duration);
+            for j in 0..blocks.len() {
+                if group[j] != usize::MAX {
+                    continue;
+                }
+                let (os, oe) = (blocks[j].start, blocks[j].start + blocks[j].duration);
+                if s < oe && os < e {
+                    group[j] = i;
+                    stack.push(j);
+                }
+            }
+        }
+        let cols = members.iter().map(|&m| col_of[m]).max().unwrap_or(0) + 1;
+        for m in members {
+            blocks[m].col = col_of[m];
+            blocks[m].cols = cols;
+        }
+    }
+}
+
 // -- counts -----------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -852,11 +1053,13 @@ pub struct Counts {
     pub anytime: usize,
     pub repeating: usize,
     pub all: usize,
+    /// Open tasks with a planned slot today.
+    pub plan: usize,
     pub lists: HashMap<String, usize>,
 }
 
 impl Counts {
-    pub fn new(data: &Data, now: DateTime<Tz>) -> Counts {
+    pub fn new(data: &Data, slots: &[PlanSlot], now: DateTime<Tz>) -> Counts {
         let zone = now.timezone();
         let today = now.date_naive();
         let mut c = Counts::default();
@@ -885,6 +1088,7 @@ impl Counts {
                 }
             }
         }
+        c.plan = day_plan(data.open, slots, now).blocks.len();
         c
     }
 
@@ -893,6 +1097,7 @@ impl Counts {
         match nav {
             Nav::Inbox => Some(self.inbox),
             Nav::Today => Some(self.today),
+            Nav::Plan => Some(self.plan),
             // Every open task sits in some box.
             Nav::Matrix => Some(self.all),
             Nav::Scheduled => Some(self.scheduled),
@@ -1311,7 +1516,7 @@ mod tests {
         assert_eq!(s[1].title.as_deref(), Some("Today"));
         assert_eq!(uids(&s[1]), vec!["now"]);
 
-        let c = Counts::new(&data, now());
+        let c = Counts::new(&data, &[], now());
         assert_eq!((c.today, c.overdue, c.scheduled, c.tomorrow), (2, 1, 1, 1));
         assert_eq!((c.anytime, c.all, c.inbox), (1, 4, 2));
     }
@@ -1694,5 +1899,133 @@ mod tests {
         let c = retarget(&rep.task, Quadrant::Drop, date(9, 14), ny());
         assert_eq!(c.due, Some(None));
         assert_eq!(c.rrule, Some(None));
+    }
+
+    fn slot(uid: &str, start: u32, duration: u32) -> PlanSlot {
+        PlanSlot {
+            uid: uid.into(),
+            date: date(9, 14),
+            start,
+            duration,
+        }
+    }
+
+    fn placed(p: &DayPlan, uid: &str) -> Option<(u32, u32, usize, usize)> {
+        p.blocks
+            .iter()
+            .find(|b| b.task.task.uid == uid)
+            .map(|b| (b.start, b.duration, b.col, b.cols))
+    }
+
+    #[test]
+    fn plan_places_blocks_and_leaves_the_rest_in_the_tray() {
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("now", "/a/", on(date(9, 14))),
+            task("soon", "/b/", on(date(9, 15))),
+            task("someday", "/b/", None),
+            task("other", "/a/", on(date(9, 14))),
+        ];
+        let slots = vec![slot("now", 9 * 60, 60), slot("gone", 10 * 60, 30)];
+        let p = day_plan(&open, &slots, now());
+        assert_eq!((p.hour_start, p.hour_end), (PLAN_HOUR_START, PLAN_HOUR_END));
+        // `now` sits on the grid; `gone` is not open and is dropped.
+        assert_eq!(placed(&p, "now"), Some((9 * 60, 60, 0, 1)));
+        assert_eq!(placed(&p, "gone"), None);
+        // Tray: overdue and due today, unplaced; future and undated stay out.
+        let tray: Vec<&str> = p.tray.iter().map(|t| t.task.uid.as_str()).collect();
+        assert_eq!(tray, ["late", "other"]);
+        // 10:00 on Sep 14 2026.
+        assert_eq!(p.now_min, Some(10 * 60));
+        // A slot for a task the open set no longer holds does not count.
+        let c = Counts::new(
+            &Data {
+                lists: &lists(),
+                open: &open,
+                completed: None,
+                sunday_first: false,
+            },
+            &slots,
+            now(),
+        );
+        assert_eq!(c.plan, 1);
+    }
+
+    #[test]
+    fn overlapping_blocks_share_a_width_side_by_side() {
+        // A 09:00–11:00, B 09:30–11:00, C 10:00–11:30: every pair overlaps,
+        // so three columns. D 12:00–12:30 is alone.
+        let open = vec![
+            task("a", "/a/", on(date(9, 14))),
+            task("b", "/a/", on(date(9, 14))),
+            task("c", "/a/", on(date(9, 14))),
+            task("d", "/a/", on(date(9, 14))),
+        ];
+        let slots = vec![
+            slot("a", 9 * 60, 120),
+            slot("b", 9 * 60 + 30, 90),
+            slot("c", 10 * 60, 90),
+            slot("d", 12 * 60, 30),
+        ];
+        let p = day_plan(&open, &slots, now());
+        assert_eq!(placed(&p, "a"), Some((9 * 60, 120, 0, 3)));
+        assert_eq!(placed(&p, "b"), Some((9 * 60 + 30, 90, 1, 3)));
+        assert_eq!(placed(&p, "c"), Some((10 * 60, 90, 2, 3)));
+        // d does not overlap anyone: its own column and width.
+        assert_eq!(placed(&p, "d"), Some((12 * 60, 30, 0, 1)));
+    }
+
+    #[test]
+    fn overlapping_groups_do_not_share_columns() {
+        // Two pairs, an hour apart: each pair packs into two columns of its
+        // own, and a block that only spans one of them still joins that
+        // group through the overlap.
+        let open = vec![
+            task("a", "/a/", on(date(9, 14))),
+            task("b", "/a/", on(date(9, 14))),
+            task("c", "/a/", on(date(9, 14))),
+            task("d", "/a/", on(date(9, 14))),
+        ];
+        let slots = vec![
+            slot("a", 9 * 60, 60),
+            slot("b", 9 * 60 + 30, 60),
+            slot("c", 11 * 60, 60),
+            slot("d", 11 * 60 + 30, 60),
+        ];
+        let p = day_plan(&open, &slots, now());
+        assert_eq!(placed(&p, "a"), Some((9 * 60, 60, 0, 2)));
+        assert_eq!(placed(&p, "b"), Some((9 * 60 + 30, 60, 1, 2)));
+        assert_eq!(placed(&p, "c"), Some((11 * 60, 60, 0, 2)));
+        assert_eq!(placed(&p, "d"), Some((11 * 60 + 30, 60, 1, 2)));
+    }
+
+    #[test]
+    fn place_moves_and_prunes_slots() {
+        let mut slots = Vec::new();
+        let today = date(9, 14);
+        place(&mut slots, "a", today, 9 * 60, 30);
+        place(&mut slots, "a", today, 10 * 60, 45);
+        place(&mut slots, "b", today, 11 * 60, 30);
+        place(&mut slots, "c", date(9, 15), 9 * 60, 30);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0].start, 10 * 60);
+        assert_eq!(slots[0].duration, 45);
+        // A live set without `b` drops only that slot, including other days.
+        let live: HashSet<&str> = ["a", "c"].into_iter().collect();
+        assert!(prune_slots(&mut slots, &live));
+        assert_eq!(slots.len(), 2);
+        assert!(slots.iter().all(|s| s.uid != "b"));
+        // Moving off the day takes the slot out.
+        unplace(&mut slots, "a", today);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].uid, "c");
+        // Durations are floored at the minimum, and kept inside the day.
+        let mut short = Vec::new();
+        place(&mut short, "a", today, 23 * 60 + 50, 5);
+        assert_eq!(short[0].duration, 10);
+        assert_eq!(short[0].start + short[0].duration, 24 * 60);
+        let mut floor = Vec::new();
+        place(&mut floor, "a", today, 9 * 60, 5);
+        assert_eq!(floor[0].duration, PLAN_MIN_DURATION);
     }
 }

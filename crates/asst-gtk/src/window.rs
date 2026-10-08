@@ -2459,7 +2459,7 @@ impl Window {
             completed: completed.as_deref(),
             sunday_first: self.prefs.sunday_first,
         };
-        let counts = Counts::new(&data, now);
+        let counts = Counts::new(&data, &self.prefs.plan, now);
         if let Some(tray) = &w.tray {
             tray.set(tray::State {
                 overdue: counts.overdue,

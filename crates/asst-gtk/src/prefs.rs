@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use asst_core::api::ListView;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Nav, ViewOpts};
+use crate::model::{Nav, PlanSlot, ViewOpts};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,6 +44,11 @@ pub struct Prefs {
     /// Completed, which always were. Read once, then written as `sidebar`.
     #[serde(skip_serializing)]
     filters: Vec<String>,
+    /// Day-plan slots, window-local: the iPhone has no planned slot, so
+    /// nothing of this goes near the VTODO. Keyed by task UID + date, with
+    /// the start (minutes from midnight) and the duration in minutes.
+    /// Cleared when the task goes.
+    pub plan: Vec<PlanSlot>,
     pub views: BTreeMap<String, ViewOpts>,
 }
 
@@ -66,15 +71,17 @@ impl Default for Prefs {
             read_dates: true,
             sidebar: None,
             filters: Vec::new(),
+            plan: Vec::new(),
             views: BTreeMap::new(),
         }
     }
 }
 
 /// The views a new sidebar has.
-const DEFAULT_SIDEBAR: [Nav; 6] = [
+const DEFAULT_SIDEBAR: [Nav; 7] = [
     Nav::Inbox,
     Nav::Today,
+    Nav::Plan,
     Nav::Matrix,
     Nav::Scheduled,
     Nav::Time,
@@ -114,6 +121,22 @@ impl Prefs {
             let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
             const BEFORE_TIME: [&str; 5] = ["inbox", "today", "matrix", "scheduled", "completed"];
             if !has_time && stock == BEFORE_TIME {
+                *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
+            }
+        }
+        // Same for Plan after the stock six: insert it after Today.
+        if let Some(keys) = &mut p.sidebar {
+            let has_plan = keys.iter().any(|k| k == "plan");
+            let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
+            const BEFORE_PLAN: [&str; 6] = [
+                "inbox",
+                "today",
+                "matrix",
+                "scheduled",
+                "time",
+                "completed",
+            ];
+            if !has_plan && stock == BEFORE_PLAN {
                 *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
             }
         }
@@ -157,6 +180,12 @@ impl Prefs {
         self.archived.iter().any(|a| a == href)
     }
 
+    /// Drop day-plan slots whose task is no longer open. `prefs.save` on
+    /// `true`, since the window writes this file whole.
+    pub fn prune_plan(&mut self, live: &std::collections::HashSet<&str>) -> bool {
+        crate::model::prune_slots(&mut self.plan, live)
+    }
+
     /// Lists as the sidebar shows them: archived ones out, in the order
     /// dragged into or by name.
     pub fn arrange(&self, lists: &[ListView]) -> Vec<ListView> {
@@ -194,6 +223,7 @@ mod tests {
             [
                 Nav::Inbox,
                 Nav::Today,
+                Nav::Plan,
                 Nav::Matrix,
                 Nav::Scheduled,
                 Nav::Time,
@@ -202,18 +232,23 @@ mod tests {
             ]
         );
         // A sidebar arranged before Matrix stays as it was; the stock four
-        // gain Matrix (and then Time).
+        // gain Matrix (and then Time, and Plan).
         let custom = Prefs::parse("sidebar = [\"today\", \"inbox\"]\n");
         assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
         let stock = Prefs::parse(
             "sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n",
         );
         assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
-        // Stock five with Matrix gains Time once.
+        // Stock five with Matrix gains Time and Plan once.
         let with_matrix = Prefs::parse(
             "sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"completed\"]\n",
         );
         assert_eq!(with_matrix.sidebar_views(), DEFAULT_SIDEBAR);
+        // Stock six with Time gains Plan once.
+        let with_time = Prefs::parse(
+            "sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"time\", \"completed\"]\n",
+        );
+        assert_eq!(with_time.sidebar_views(), DEFAULT_SIDEBAR);
         let text = toml::to_string(&old).unwrap();
         assert!(!text.contains("filters"));
         assert_eq!(Prefs::parse(&text).sidebar_views(), old.sidebar_views());
@@ -222,6 +257,24 @@ mod tests {
         none.set_sidebar_views(&[]);
         let text = toml::to_string(&none).unwrap();
         assert!(Prefs::parse(&text).sidebar_views().is_empty());
+    }
+
+    #[test]
+    fn plan_slots_round_trip_and_prune() {
+        use crate::model::place;
+        use chrono::NaiveDate;
+        let mut p = Prefs::default();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        place(&mut p.plan, "abc", day, 9 * 60, 30);
+        place(&mut p.plan, "def", day, 10 * 60, 60);
+        let text = toml::to_string(&p).unwrap();
+        let back = Prefs::parse(&text);
+        assert_eq!(back.plan, p.plan);
+        assert!(text.contains("uid = \"abc\""));
+        let live: std::collections::HashSet<&str> = ["abc"].into_iter().collect();
+        assert!(p.prune_plan(&live));
+        assert_eq!(p.plan.len(), 1);
+        assert!(!p.prune_plan(&live));
     }
 
     #[test]
