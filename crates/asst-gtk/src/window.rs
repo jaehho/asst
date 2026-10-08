@@ -2447,15 +2447,21 @@ impl Window {
             .and_then(|c| w.rows.iter().position(|(h, _)| h == c));
         let count = w.rows.len();
         // Moving on closes the task open in place; the rebuild then puts
-        // the keyboard on the row moved to.
+        // the keyboard on the row moved to. The cursor is painted here too:
+        // a walk does not rebuild, and `grab_focus` alone never sets
+        // `:focus-visible`, so the ring would otherwise stay invisible.
         let move_to = |i: usize, this: &mut Window| {
-            if let Some((href, row)) = w.rows.get(i) {
+            if let Some((href, row)) = w.rows.get(i).map(|(h, r)| (h.clone(), r.clone())) {
                 if this.close_editor(w, sender) {
                     this.refocus = Refocus::Row;
                 } else {
+                    for (_, other) in w.rows.iter() {
+                        other.remove_css_class("cursor");
+                    }
+                    row.add_css_class("cursor");
                     row.grab_focus();
                 }
-                this.cursor = Some(href.clone());
+                this.cursor = Some(href);
             }
         };
         match key {
@@ -2985,6 +2991,8 @@ impl Window {
                 let key = match arg {
                     "j" => Some(Key::Down),
                     "k" => Some(Key::Up),
+                    "g" => Some(Key::First),
+                    "G" => Some(Key::Last),
                     "x" => Some(Key::Toggle),
                     "e" => Some(Key::Open),
                     "a" => Some(Key::Add),
@@ -3237,14 +3245,42 @@ impl Window {
             "close-window" => {
                 w.window.close();
             }
-            // Whether the window shows and the tray is up, to window.log.
-            "state" => eprintln!(
-                "state: visible {} tray {}",
-                w.window.is_visible(),
-                w.tray
-                    .as_ref()
-                    .map_or("off", |t| if t.online() { "online" } else { "offline" }),
-            ),
+            // Whether the window shows, the tray, and the keyboard cursor.
+            "state" => {
+                eprintln!(
+                    "state: visible {} tray {} cursor {:?} rows {}",
+                    w.window.is_visible(),
+                    w.tray.as_ref().map_or("off", |t| if t.online() {
+                        "online"
+                    } else {
+                        "offline"
+                    }),
+                    self.cursor,
+                    w.rows.len(),
+                );
+                // Every mapped scroller, for scroll-to-now checks.
+                let mut stack = vec![w.clamp.clone().upcast::<gtk::Widget>()];
+                let mut n = 0;
+                while let Some(widget) = stack.pop() {
+                    if let Ok(s) = widget.clone().downcast::<gtk::ScrolledWindow>() {
+                        let a = s.vadjustment();
+                        eprintln!(
+                            "scroll[{n}]: mapped {} value {:.1} upper {:.1} page {:.1} css {}",
+                            s.is_mapped(),
+                            a.value(),
+                            a.upper(),
+                            a.page_size(),
+                            s.css_classes().join(","),
+                        );
+                        n += 1;
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(c) = child {
+                        child = c.next_sibling();
+                        stack.push(c);
+                    }
+                }
+            }
             // What has the keyboard, to window.log.
             "focus" => {
                 let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
