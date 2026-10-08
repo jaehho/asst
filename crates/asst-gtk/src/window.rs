@@ -32,7 +32,7 @@ use crate::prefs::Prefs;
 use crate::sidebar::{self, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
-use crate::{client, dialogs, find, settings};
+use crate::{client, dialogs, find, plan, settings};
 
 pub type Tx = relm4::Sender<Msg>;
 
@@ -153,6 +153,9 @@ pub enum Msg {
     PlanSet(String, u32, u32),
     /// Take a task off the day plan.
     PlanUnplace(String),
+    /// Undo a plan change: restore this slot, or take the task off when
+    /// there was none. Carries what the toast is holding.
+    PlanUndo(String, Option<(u32, u32)>),
     Add(Box<AddSpec>),
     ShowAdd(Option<Target>),
     HideAdd,
@@ -231,6 +234,10 @@ pub enum Key {
     Add,
     Find,
     Delete,
+    /// Place the focused tray task on the plan at now.
+    PlanPlace,
+    /// Nudge the focused block's start by ±15 minutes.
+    PlanNudge(i32),
     Priority(u8),
     Today,
     Tomorrow,
@@ -397,7 +404,7 @@ pub struct Widgets {
     header_title: gtk::Label,
     stack: gtk::Stack,
     clamp: adw::Clamp,
-    rows: Vec<(String, gtk::ListBoxRow)>,
+    rows: Vec<(String, gtk::Widget)>,
     editor: Rc<Editor>,
     /// The daemon's status for what counts the time since a sync as it
     /// passes: Preferences and the sync button's tooltip.
@@ -1189,6 +1196,10 @@ impl Component for Window {
             }
             Msg::PlanSet(href, start, duration) => {
                 let today = self.now().date_naive();
+                let prior = self.plan_slot(&href, today);
+                let Some(t) = self.find(&href).cloned() else {
+                    return;
+                };
                 if crate::plan::apply_slot(
                     &mut self.prefs,
                     &self.open,
@@ -1199,11 +1210,73 @@ impl Component for Window {
                 ) {
                     self.prefs.save();
                     self.shown = 0;
+                    let said = match prior {
+                        None => format!(
+                            "Planned {} at {}",
+                            quoted(&t.task.summary),
+                            plan::clock_label(start)
+                        ),
+                        Some((s, d)) if s == start && d == duration => return,
+                        Some(_) => format!(
+                            "Moved {} to {}",
+                            quoted(&t.task.summary),
+                            plan::clock_label(start)
+                        ),
+                    };
+                    let toast = adw::Toast::builder()
+                        .title(glib::markup_escape_text(&said))
+                        .button_label("Undo")
+                        .timeout(4)
+                        .build();
+                    {
+                        let (tx, h) = (tx.clone(), href.clone());
+                        toast.connect_button_clicked(move |_| {
+                            tx.emit(Msg::PlanUndo(h.clone(), prior));
+                        });
+                    }
+                    w.toasts.add_toast(toast);
                 }
             }
             Msg::PlanUnplace(href) => {
                 let today = self.now().date_naive();
+                let prior = self.plan_slot(&href, today);
+                let Some(t) = self.find(&href).cloned() else {
+                    return;
+                };
                 if crate::plan::drop_slot(&mut self.prefs, &self.open, &href, today) {
+                    self.prefs.save();
+                    self.shown = 0;
+                    let toast = adw::Toast::builder()
+                        .title(glib::markup_escape_text(&format!(
+                            "Removed {} from the plan",
+                            quoted(&t.task.summary)
+                        )))
+                        .button_label("Undo")
+                        .timeout(4)
+                        .build();
+                    {
+                        let (tx, h) = (tx.clone(), href.clone());
+                        toast.connect_button_clicked(move |_| {
+                            tx.emit(Msg::PlanUndo(h.clone(), prior));
+                        });
+                    }
+                    w.toasts.add_toast(toast);
+                }
+            }
+            Msg::PlanUndo(href, prior) => {
+                let today = self.now().date_naive();
+                let ok = match prior {
+                    Some((start, duration)) => crate::plan::apply_slot(
+                        &mut self.prefs,
+                        &self.open,
+                        &href,
+                        today,
+                        start,
+                        duration,
+                    ),
+                    None => crate::plan::drop_slot(&mut self.prefs, &self.open, &href, today),
+                };
+                if ok {
                     self.prefs.save();
                     self.shown = 0;
                 }
@@ -2344,6 +2417,16 @@ impl Window {
         self.find(href).cloned()
     }
 
+    /// Today's planned slot for `href`, for an undo toast to hold.
+    fn plan_slot(&self, href: &str, date: NaiveDate) -> Option<(u32, u32)> {
+        let t = self.find(href)?;
+        self.prefs
+            .plan
+            .iter()
+            .find(|s| s.uid == t.task.uid && s.date == date)
+            .map(|s| (s.start, s.duration))
+    }
+
     fn nav_order(&self) -> Vec<Nav> {
         let mut navs = self.prefs.sidebar_views();
         navs.extend(
@@ -2480,6 +2563,37 @@ impl Window {
                     }
                     _ => unreachable!(),
                 }
+            }
+            Key::PlanPlace => {
+                // The focused tray task goes on the plan at now, or at the
+                // hour of the focused block when that is what is under the
+                // cursor and a tray task is the one being placed.
+                let Some(t) = self.cursor_task() else { return };
+                if self.nav != Nav::Plan {
+                    return;
+                }
+                let today = self.now().date_naive();
+                if self.plan_slot(&t.href, today).is_some() {
+                    return;
+                }
+                let day = model::day_plan(&self.open, &self.prefs.plan, self.now());
+                let start = model::place_start(day.now_min, day.hour_start);
+                sender.input(Msg::PlanSet(t.href, start, model::PLAN_DEFAULT_DURATION));
+            }
+            Key::PlanNudge(delta) => {
+                let Some(t) = self.cursor_task() else { return };
+                if self.nav != Nav::Plan {
+                    return;
+                }
+                let today = self.now().date_naive();
+                let Some((start, duration)) = self.plan_slot(&t.href, today) else {
+                    return;
+                };
+                sender.input(Msg::PlanSet(
+                    t.href,
+                    model::nudge_start(start, delta),
+                    duration,
+                ));
             }
         }
     }
@@ -2879,6 +2993,9 @@ impl Window {
                     "t" => Some(Key::Today),
                     "m" => Some(Key::Tomorrow),
                     "v" => Some(Key::Select),
+                    "n" => Some(Key::PlanPlace),
+                    "left" => Some(Key::PlanNudge(-(model::PLAN_SNAP as i32))),
+                    "right" => Some(Key::PlanNudge(model::PLAN_SNAP as i32)),
                     "Escape" => Some(Key::Escape),
                     "ctrl+w" => Some(Key::Close),
                     "ctrl+q" => Some(Key::Quit),
@@ -2915,6 +3032,22 @@ impl Window {
             "planoff" => {
                 if let Some(h) = task(arg) {
                     sender.input(Msg::PlanUnplace(h));
+                }
+            }
+            // Open the slot popover on a placed block (devel, for snaps).
+            "slotpop" => {
+                if let Some(h) = task(arg) {
+                    let today = self.now().date_naive();
+                    if let Some((start, duration)) = self.plan_slot(&h, today) {
+                        let tx: Tx = sender.input_sender().clone();
+                        crate::plan::open_slot_popover(
+                            w.clamp.upcast_ref(),
+                            &h,
+                            start,
+                            duration,
+                            &tx,
+                        );
+                    }
                 }
             }
             // `planghost <words> at HH:MM [minutes]` poses the drop preview
@@ -3562,6 +3695,9 @@ fn key_action(
         gdk::Key::a | gdk::Key::o => Key::Add,
         gdk::Key::slash => Key::Find,
         gdk::Key::d | gdk::Key::Delete => Key::Delete,
+        gdk::Key::n => Key::PlanPlace,
+        gdk::Key::Left | gdk::Key::Up => Key::PlanNudge(-(model::PLAN_SNAP as i32)),
+        gdk::Key::Right | gdk::Key::Down => Key::PlanNudge(model::PLAN_SNAP as i32),
         gdk::Key::_1 => Key::Priority(1),
         gdk::Key::_2 => Key::Priority(2),
         gdk::Key::_3 => Key::Priority(3),
