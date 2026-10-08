@@ -16,6 +16,8 @@ window {
   --p1: #ff7066;
   --p2: #ff9a14;
   --p3: #5297ff;
+  /* Warm attention (peach): the now-line, worth a glance not alarm. */
+  --now: #ff7800;
 }
 
 window.dark {
@@ -26,6 +28,7 @@ window.dark {
   --due-today: #57e389;
   --due-overdue: #ff6a8c;
   --done: #ffa348;
+  --now: #ffa348;
 }
 
 @keyframes spin {
@@ -971,7 +974,6 @@ button.pill {
 
 .plan-tray {
   min-width: 220px;
-  max-width: 300px;
 }
 
 .plan-tray-scroll {
@@ -983,44 +985,66 @@ button.pill {
   margin-right: 2px;
 }
 
+.plan-block-focus {
+  background: transparent;
+  border-radius: 8px;
+}
+
+.plan-block-focus.cursor:focus-visible {
+  outline: 2px solid alpha(var(--accent-color), 0.6);
+  outline-offset: -2px;
+}
+
 .plan-block {
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 2px 6px;
-  border-left-width: 3px;
-  border-left-style: solid;
   background: alpha(@accent_color, 0.18);
-  border-left-color: @accent_color;
   color: #fff;
 }
 
 .plan-block.tint-orange {
   background: var(--event-orange);
-  border-left-color: var(--event-orange);
 }
 .plan-block.tint-purple {
   background: var(--event-purple);
-  border-left-color: var(--event-purple);
 }
 .plan-block.tint-blue {
   background: var(--event-blue);
-  border-left-color: var(--event-blue);
 }
 .plan-block.tint-green {
   background: var(--event-green);
-  border-left-color: var(--event-green);
 }
 
 .plan-block.running {
-  box-shadow: 0 0 0 2px alpha(@destructive_color, 0.7);
+  box-shadow: 0 0 0 2px alpha(var(--now), 0.7);
 }
 
-/* Provisional: the block a drag would drop, not one already placed. */
+/* Provisional: the block a drag would drop, not one already placed.
+   Fill is a darker hold of the event hue so full-ink title stays ≥4.5:1;
+   dashed outline keeps the 0.55/ghost character without dimming the text. */
 .plan-block.ghost {
-  opacity: 0.55;
   border-style: dashed;
   border-width: 1px;
-  border-left-width: 3px;
-  border-left-style: solid;
+  opacity: 1;
+}
+
+.plan-block.ghost.tint-orange {
+  background: alpha(#8b3c00, 0.88);
+}
+.plan-block.ghost.tint-purple {
+  background: alpha(#5c2b72, 0.88);
+}
+.plan-block.ghost.tint-blue {
+  background: alpha(#144e9c, 0.88);
+}
+.plan-block.ghost.tint-green {
+  background: alpha(#185c35, 0.88);
+}
+
+.plan-block.ghost .plan-block-title,
+.plan-block.ghost .plan-block-meta {
+  opacity: 1;
+  color: #fff;
 }
 
 .plan-block-title {
@@ -1032,14 +1056,14 @@ button.pill {
 .plan-block-meta {
   color: #fff;
   font-size: 10px;
-  opacity: 0.9;
+  opacity: 1;
 }
 
 .plan-block-edge {
   min-height: 4px;
   opacity: 0.5;
   background: alpha(#fff, 0.35);
-  border-radius: 0 0 6px 6px;
+  border-radius: 0 0 8px 8px;
 }
 
 .plan-view.focusing .plan-tray > row.task-row:not(.editing),
@@ -1048,6 +1072,11 @@ button.pill {
 }
 
 .plan-now {
-  background: @destructive_color;
+  background: var(--now);
   min-height: 3px;
+}
+
+.plan-time-label {
+  font-variant-numeric: tabular-nums;
+  min-width: 6ch;
 }
