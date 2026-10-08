@@ -1014,6 +1014,15 @@ button.pill {
   box-shadow: 0 0 0 2px alpha(@destructive_color, 0.7);
 }
 
+/* Provisional: the block a drag would drop, not one already placed. */
+.plan-block.ghost {
+  opacity: 0.55;
+  border-style: dashed;
+  border-width: 1px;
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+
 .plan-block-title {
   color: #fff;
   font-weight: 600;

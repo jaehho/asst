@@ -867,6 +867,11 @@ pub const PLAN_HOUR_END: u32 = 23;
 pub const PLAN_DEFAULT_DURATION: u32 = 30;
 /// Shortest slot the plan keeps. The grid may still draw one shorter higher.
 pub const PLAN_MIN_DURATION: u32 = 15;
+/// Pixels per hour on the Plan grid. Lives with the placement math so a
+/// pointer y has a tested meaning without a window.
+pub const PLAN_PX_PER_HOUR: f64 = 36.0;
+/// Minutes a drop or a drag snaps to.
+pub const PLAN_SNAP: u32 = 15;
 
 /// A window-local planned slot. The iPhone has no such thing, so this never
 /// reaches the VTODO: `window.toml` holds it, keyed by task UID + date, with
@@ -903,11 +908,70 @@ pub struct DayPlan {
     pub now_min: Option<u32>,
 }
 
+/// Snap `min` (minutes from midnight) to the plan grid.
+pub fn snap(min: i32) -> u32 {
+    let s = PLAN_SNAP as i32;
+    ((min + s / 2) / s * s).clamp(0, 24 * 60 - 1) as u32
+}
+
+/// Minutes `dy` pixels stand for on the plan grid. May be negative.
+fn dy_minutes(dy: f64) -> i32 {
+    (dy / PLAN_PX_PER_HOUR * 60.0) as i32
+}
+
+/// Minutes from midnight for a y position on the grid.
+pub fn minutes_at(y: f64, hour_start: u32) -> u32 {
+    let mins = f64::from(hour_start) * 60.0 + y / PLAN_PX_PER_HOUR * 60.0;
+    snap(mins as i32)
+}
+
+/// Start a block at `start` would move to, `dy` pixels down the grid.
+pub fn move_start(start: u32, dy: f64) -> u32 {
+    snap(start as i32 + dy_minutes(dy))
+}
+
+/// End minute a duration drag from `start`+`dur0` reaches, `dy` down.
+pub fn edge_end(start: u32, dur0: u32, dy: f64) -> u32 {
+    snap(start as i32 + dur0 as i32 + dy_minutes(dy))
+}
+
+/// Duration a slot at `start` keeps: floored and kept inside the day.
+pub fn slot_duration(start: u32, duration: u32) -> u32 {
+    let start = start.min(24 * 60 - 1);
+    let room = (24 * 60 - start).max(1);
+    duration.clamp(PLAN_MIN_DURATION.min(room), room)
+}
+
+/// The block a drop of `task` at `start` for `duration` would create.
+/// `blocks` are the ones already on the grid; `task`'s own block among
+/// them is left out, so a move previews without the old home. The ghost
+/// wears the same start, duration and overlap column the drop would.
+pub fn ghost_block(blocks: &[PlanBlock], task: &TaskView, start: u32, duration: u32) -> PlanBlock {
+    let start = start.min(24 * 60 - 1);
+    let duration = slot_duration(start, duration);
+    let mut with: Vec<PlanBlock> = blocks
+        .iter()
+        .filter(|b| b.task.task.uid != task.task.uid)
+        .cloned()
+        .collect();
+    with.push(PlanBlock {
+        task: task.clone(),
+        start,
+        duration,
+        col: 0,
+        cols: 1,
+    });
+    with.sort_by_key(|b| (b.start, b.duration, b.task.task.uid.clone()));
+    layout(&mut with);
+    with.into_iter()
+        .find(|b| b.task.task.uid == task.task.uid)
+        .expect("ghost is in the layout")
+}
+
 /// Upsert `uid`'s slot on `date`. One slot per task per day.
 pub fn place(slots: &mut Vec<PlanSlot>, uid: &str, date: NaiveDate, start: u32, duration: u32) {
     let start = start.min(24 * 60 - 1);
-    let room = (24 * 60 - start).max(1);
-    let duration = duration.clamp(PLAN_MIN_DURATION.min(room), room);
+    let duration = slot_duration(start, duration);
     match slots.iter_mut().find(|s| s.uid == uid && s.date == date) {
         Some(s) => {
             s.start = start;
@@ -2024,5 +2088,81 @@ mod tests {
         let mut floor = Vec::new();
         place(&mut floor, "a", today, 9 * 60, 5);
         assert_eq!(floor[0].duration, PLAN_MIN_DURATION);
+    }
+
+    #[test]
+    fn snap_points() {
+        assert_eq!(snap(0), 0);
+        assert_eq!(snap(7), 0);
+        assert_eq!(snap(8), PLAN_SNAP);
+        assert_eq!(snap(14), PLAN_SNAP);
+        assert_eq!(snap(15), 15);
+        assert_eq!(snap(22), 15);
+        assert_eq!(snap(23), 30);
+        assert_eq!(snap(9 * 60), 9 * 60);
+        assert_eq!(snap(9 * 60 + 7), 9 * 60);
+        assert_eq!(snap(9 * 60 + 8), 9 * 60 + 15);
+        assert_eq!(snap(-30), 0);
+        assert_eq!(snap(24 * 60), 24 * 60 - 1);
+    }
+
+    #[test]
+    fn pointer_y_snaps_to_the_grid() {
+        // 07:00 at the top of the grid.
+        assert_eq!(minutes_at(0.0, 7), 7 * 60);
+        assert_eq!(minutes_at(PLAN_PX_PER_HOUR, 7), 8 * 60);
+        // Half an hour, a quarter, and a point that snaps up.
+        assert_eq!(minutes_at(PLAN_PX_PER_HOUR / 2.0, 7), 7 * 60 + 30);
+        assert_eq!(minutes_at(PLAN_PX_PER_HOUR / 4.0, 7), 7 * 60 + 15);
+        assert_eq!(minutes_at(9.0, 7), 7 * 60 + 15);
+        // The move and edge drags share the same pixel scale.
+        assert_eq!(move_start(9 * 60, PLAN_PX_PER_HOUR), 10 * 60);
+        assert_eq!(move_start(9 * 60, -PLAN_PX_PER_HOUR / 2.0), 8 * 60 + 30);
+        assert_eq!(edge_end(9 * 60, 30, PLAN_PX_PER_HOUR / 2.0), 10 * 60);
+    }
+
+    #[test]
+    fn ghost_at_each_hour_boundary() {
+        let t = task("g", "/a/", on(date(9, 14)));
+        for hour in PLAN_HOUR_START..PLAN_HOUR_END {
+            let g = ghost_block(&[], &t, hour * 60, PLAN_DEFAULT_DURATION);
+            assert_eq!((g.start, g.duration, g.col, g.cols), (hour * 60, 30, 0, 1));
+        }
+        // The pointer path and the ghost agree at an hour.
+        let y = f64::from(10 * 60 - 7 * 60) / 60.0 * PLAN_PX_PER_HOUR;
+        let start = minutes_at(y, PLAN_HOUR_START);
+        let g = ghost_block(&[], &t, start, PLAN_DEFAULT_DURATION);
+        assert_eq!(g.start, 10 * 60);
+    }
+
+    #[test]
+    fn ghost_over_existing_blocks_takes_the_next_column() {
+        let open = vec![
+            task("a", "/a/", on(date(9, 14))),
+            task("g", "/a/", on(date(9, 14))),
+        ];
+        let slots = vec![slot("a", 9 * 60, 60)];
+        let p = day_plan(&open, &slots, now());
+        let t = task("g", "/a/", on(date(9, 14)));
+        // Overlapping `a` joins its group in the free column.
+        let g = ghost_block(&p.blocks, &t, 9 * 60 + 30, 30);
+        assert_eq!(
+            (g.start, g.duration, g.col, g.cols),
+            (9 * 60 + 30, 30, 1, 2)
+        );
+        // Next to `a`, not on it: alone, full width.
+        let g = ghost_block(&p.blocks, &t, 10 * 60, 30);
+        assert_eq!((g.start, g.duration, g.col, g.cols), (10 * 60, 30, 0, 1));
+        // A move: the old home is not in the layout, so the new one can
+        // take column 0 even while the original still sits on the grid.
+        let a = open[0].clone();
+        let g = ghost_block(&p.blocks, &a, 9 * 60 + 30, 60);
+        assert_eq!(
+            (g.start, g.duration, g.col, g.cols),
+            (9 * 60 + 30, 60, 0, 1)
+        );
+        // Durations clamp the same way a real drop would.
+        let g = ghost_block(&p.blocks, &t, 23 * 60 + 50, 30);
+        assert_eq!((g.start, g.duration), (23 * 60 + 50, 10));
     }
 }

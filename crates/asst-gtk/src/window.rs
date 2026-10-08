@@ -2793,7 +2793,9 @@ impl Window {
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
     /// `clear [list]` (asks), `clear! [list]`, `archive <list>`, `unarchive <list>`,
     /// `order <list>,<list>`, `opts sort=name|desc=true|due=week|hide=<list>|reset`,
-    /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`.
+    /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
+    /// `plan <words> at HH:MM [minutes]`, `planoff <words>`,
+    /// `planghost <words> at HH:MM [minutes]`, `planghostoff`.
     fn drive(&mut self, w: &mut Widgets, sender: &ComponentSender<Self>, command: &str) {
         let (verb, arg) = command.split_once(' ').unwrap_or((command, ""));
         let task = |text: &str| {
@@ -2915,6 +2917,25 @@ impl Window {
                     sender.input(Msg::PlanUnplace(h));
                 }
             }
+            // `planghost <words> at HH:MM [minutes]` poses the drop preview
+            // a drag would show; `planghostoff` clears it. Devel only.
+            "planghost" => {
+                let Some((words, rest)) = arg.split_once(" at ") else {
+                    return;
+                };
+                let Some(h) = task(words) else { return };
+                let mut parts = rest.split_whitespace();
+                let Some(at) = parts.next().and_then(model::parse_time) else {
+                    return;
+                };
+                let start = at.hour() * 60 + at.minute();
+                let duration = parts
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(model::PLAN_DEFAULT_DURATION);
+                crate::plan::ghost_at(&h, start, duration);
+            }
+            "planghostoff" => crate::plan::ghost_off(),
             // As Quick Find does: go to the task's list and open it.
             "reveal" => {
                 if let Some(h) = task(arg) {

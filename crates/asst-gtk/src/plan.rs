@@ -1,23 +1,27 @@
 //! The Plan view: today's tasks on an hour timeline, and an unscheduled
 //! tray to drag from. The day's shape is computed in `model::day_plan`;
-//! this module only draws it and turns drags into slot edits.
+//! this module only draws it and turns drags into slot edits. A drag also
+//! draws a ghost of the block the drop would create, at the same place a
+//! real drop would take.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use asst_core::api::TaskView;
 use relm4::gtk::{self, gdk, glib, prelude::*};
 
-use crate::model::{DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PlanBlock, place, unplace};
+use crate::model::{
+    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_PX_PER_HOUR, PlanBlock, place,
+    unplace,
+};
 use crate::row::DRAG_PREFIX;
 use crate::window::{Msg, Tx};
 use crate::{content, row, ui};
 
-/// Pixels per hour on the day grid. Lower than Time's 52 so the default
-/// day fits the column and reads at a glance.
-const HOUR_H: i32 = 36;
 /// Width of the hour-label gutter.
 const GUTTER: i32 = 56;
 /// Height floor so a short slot is still clickable.
 const MIN_BLOCK_H: i32 = 22;
-/// Minutes a drop or a drag snaps to.
-const SNAP: u32 = 15;
 
 fn hour_label(hour: u32) -> String {
     match hour {
@@ -32,11 +36,6 @@ fn clock(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
 }
 
-fn snap(min: i32) -> u32 {
-    let s = SNAP as i32;
-    ((min + s / 2) / s * s).clamp(0, 24 * 60 - 1) as u32
-}
-
 /// The tint a block wears: its priority's color, like the row's checkbox.
 fn tint_for(priority: u8) -> &'static str {
     match asst_core::task::priority_level(priority) {
@@ -48,18 +47,15 @@ fn tint_for(priority: u8) -> &'static str {
 }
 
 fn block_top(b: &PlanBlock, hour_start: u32) -> i32 {
-    (f64::from(b.start) / 60.0 * f64::from(HOUR_H) - f64::from(hour_start) * f64::from(HOUR_H))
-        as i32
+    (f64::from(b.start) / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR) as i32
 }
 
 fn block_height(b: &PlanBlock) -> i32 {
-    (b.duration as f64 / 60.0 * f64::from(HOUR_H)).max(MIN_BLOCK_H as f64) as i32
+    (f64::from(b.duration) / 60.0 * PLAN_PX_PER_HOUR).max(MIN_BLOCK_H as f64) as i32
 }
 
-/// One placed task: click opens the editor, drag moves, the edge resizes,
-/// right-click sets start and duration by hand. Equal-expand spacers put
-/// the chip in `col` of `cols` across the grid.
-fn block_widget(b: &PlanBlock, now_min: Option<u32>, tx: &Tx) -> gtk::Widget {
+/// The chip body both a placed block and the drag ghost wear.
+fn block_chip(b: &PlanBlock, now_min: Option<u32>) -> gtk::Box {
     let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
     chip.add_css_class("plan-block");
     chip.add_css_class(tint_for(b.task.task.priority));
@@ -91,8 +87,33 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, tx: &Tx) -> gtk::Widget {
         meta.set_xalign(0.0);
         chip.append(&meta);
     }
+    chip
+}
 
-    // Bottom edge: drag to change the duration.
+/// Equal-expand spacers put `chip` in `col` of `cols` across the grid.
+fn block_row(chip: &gtk::Box, col: usize, cols: usize) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class("plan-block-row");
+    row.set_hexpand(true);
+    let cols = cols.max(1);
+    for i in 0..cols {
+        if i == col {
+            row.append(chip);
+        } else {
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            row.append(&spacer);
+        }
+    }
+    row
+}
+
+/// One placed task: click opens the editor, drag moves, the edge resizes,
+/// right-click sets start and duration by hand.
+fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> gtk::Widget {
+    let chip = block_chip(b, now_min);
+
+    // Bottom edge: drag to change the duration, with a ghost of the new end.
     let edge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     edge.add_css_class("plan-block-edge");
     edge.set_height_request(6);
@@ -102,11 +123,21 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, tx: &Tx) -> gtk::Widget {
         let drag = gtk::GestureDrag::new();
         drag.set_button(1);
         let href = b.task.href.clone();
+        let task = b.task.clone();
         let start = b.start;
         let dur0 = b.duration;
-        let tx = tx.clone();
+        let (ghost, tx) = (ghost.clone(), tx.clone());
+        {
+            let (ghost, task) = (ghost.clone(), task.clone());
+            drag.connect_drag_update(move |_, _, dy| {
+                let end = model::edge_end(start, dur0, dy);
+                let duration = end.saturating_sub(start).max(PLAN_MIN_DURATION);
+                ghost.show(&task, start, duration);
+            });
+        }
         drag.connect_drag_end(move |_, _, dy| {
-            let end = snap(start as i32 + dur0 as i32 + (dy / f64::from(HOUR_H) * 60.0) as i32);
+            ghost.hide();
+            let end = model::edge_end(start, dur0, dy);
             let duration = end.saturating_sub(start).max(PLAN_MIN_DURATION);
             tx.emit(Msg::PlanSet(href.clone(), start, duration));
         });
@@ -119,17 +150,29 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, tx: &Tx) -> gtk::Widget {
         let drag = gtk::GestureDrag::new();
         drag.set_button(1);
         let href = b.task.href.clone();
+        let task = b.task.clone();
         let start = b.start;
         let dur = b.duration;
+        let (ghost, tx) = (ghost.clone(), tx.clone());
+        {
+            let (ghost, task, moved) = (ghost.clone(), task.clone(), moved.clone());
+            drag.connect_drag_update(move |_, _, dy| {
+                if dy.abs() < 3.0 {
+                    return;
+                }
+                moved.set(true);
+                ghost.show(&task, model::move_start(start, dy), dur);
+            });
+        }
         let moved = moved.clone();
-        let tx = tx.clone();
         drag.connect_drag_end(move |_, _, dy| {
+            ghost.hide();
             if dy.abs() < 3.0 {
                 moved.set(false);
                 return;
             }
             moved.set(true);
-            let to = snap(start as i32 + (dy / f64::from(HOUR_H) * 60.0) as i32);
+            let to = model::move_start(start, dy);
             tx.emit(Msg::PlanSet(href.clone(), to, dur));
         });
         chip.add_controller(drag);
@@ -166,20 +209,7 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, tx: &Tx) -> gtk::Widget {
         chip.add_controller(click);
     }
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    row.add_css_class("plan-block-row");
-    row.set_hexpand(true);
-    let cols = b.cols.max(1);
-    for i in 0..cols {
-        if i == b.col {
-            row.append(&chip);
-        } else {
-            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            spacer.set_hexpand(true);
-            row.append(&spacer);
-        }
-    }
-    row.upcast()
+    block_row(&chip, b.col, b.cols).upcast()
 }
 
 /// Start, duration and Take off the plan for one slot.
@@ -240,22 +270,109 @@ fn slot_popover(href: &str, start: u32, duration: u32, tx: &Tx) -> gtk::Popover 
     pop
 }
 
-/// Minutes from midnight for a y position on the grid.
-fn minutes_at(y: f64, hour_start: u32) -> u32 {
-    let mins = f64::from(hour_start) * 60.0 + y / f64::from(HOUR_H) * 60.0;
-    snap(mins as i32)
+/// The live drop preview: one overlay child the drag callbacks rewrite.
+/// It wears the block a drop would create, so the pointer movement is the
+/// only thing that changes it. The original stays put while a placed
+/// block is dragged; the ghost is the new home.
+#[derive(Clone)]
+struct Ghost {
+    wrap: gtk::Box,
+    hour_start: u32,
+    /// Blocks on the grid when this column was built, for overlap columns.
+    blocks: Vec<PlanBlock>,
+    /// Tray and placed tasks by href, for what a tray drag carries.
+    tasks: HashMap<String, TaskView>,
+}
+
+thread_local! {
+    /// The Plan grid's ghost, so the drive verbs can pose one.
+    static GHOST: RefCell<Option<Ghost>> = const { RefCell::new(None) };
+}
+
+impl Ghost {
+    /// Build the preview host. `attach` puts it on the grid last, so it
+    /// draws over the blocks it previews against.
+    fn new(p: &DayPlan) -> Self {
+        let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        wrap.set_halign(gtk::Align::Fill);
+        wrap.set_valign(gtk::Align::Start);
+        wrap.set_hexpand(true);
+        wrap.set_visible(false);
+        wrap.set_widget_name("plan-ghost");
+        let mut tasks = HashMap::new();
+        for b in &p.blocks {
+            tasks.insert(b.task.href.clone(), b.task.clone());
+        }
+        for t in &p.tray {
+            tasks.insert(t.href.clone(), t.clone());
+        }
+        let g = Ghost {
+            wrap,
+            hour_start: p.hour_start,
+            blocks: p.blocks.clone(),
+            tasks,
+        };
+        GHOST.with(|s| *s.borrow_mut() = Some(g.clone()));
+        g
+    }
+
+    fn attach(&self, overlay: &gtk::Overlay) {
+        overlay.add_overlay(&self.wrap);
+    }
+
+    fn show(&self, task: &TaskView, start: u32, duration: u32) {
+        let b = model::ghost_block(&self.blocks, task, start, duration);
+        while let Some(c) = self.wrap.first_child() {
+            self.wrap.remove(&c);
+        }
+        let chip = block_chip(&b, None);
+        chip.add_css_class("ghost");
+        let row = block_row(&chip, b.col, b.cols);
+        self.wrap.append(&row);
+        self.wrap.set_margin_top(block_top(&b, self.hour_start));
+        self.wrap.set_visible(true);
+    }
+
+    fn hide(&self) {
+        self.wrap.set_visible(false);
+        while let Some(c) = self.wrap.first_child() {
+            self.wrap.remove(&c);
+        }
+    }
+}
+
+/// Pose the drop preview the drive verbs ask for.
+pub fn ghost_at(href: &str, start: u32, duration: u32) {
+    GHOST.with(|s| {
+        let held = s.borrow();
+        let Some(g) = held.as_ref() else { return };
+        let Some(task) = g.tasks.get(href) else {
+            return;
+        };
+        g.show(task, start, duration);
+    });
+}
+
+/// Hide the drop preview (the drive verbs, and a rebuild of the column).
+pub fn ghost_off() {
+    GHOST.with(|s| {
+        if let Some(g) = s.borrow().as_ref() {
+            g.hide();
+        }
+    });
 }
 
 fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
     let hours = p.hour_end.saturating_sub(p.hour_start).max(1);
-    let height = i32::try_from(hours).unwrap_or(15) * HOUR_H;
+    let height = i32::try_from(hours).unwrap_or(15) * PLAN_PX_PER_HOUR as i32;
+    let hour_h = PLAN_PX_PER_HOUR as i32;
 
     let gutter = gtk::Box::new(gtk::Orientation::Vertical, 0);
     gutter.set_size_request(GUTTER, height);
     gutter.add_css_class("time-gutter");
     for h in p.hour_start..p.hour_end {
         let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        slot.set_size_request(GUTTER, HOUR_H);
+        slot.set_size_request(GUTTER, hour_h);
         let lab = gtk::Label::new(Some(&hour_label(h)));
         lab.add_css_class("time-hour");
         lab.add_css_class("dim-label");
@@ -274,7 +391,7 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
     for _ in 0..hours {
         let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         slot.set_hexpand(true);
-        slot.set_height_request(HOUR_H);
+        slot.set_height_request(hour_h);
         slot.add_css_class("time-hour-slot");
         rules.append(&slot);
     }
@@ -283,7 +400,7 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
     overlay.set_child(Some(&rules));
     {
         let y = p.now_min.map_or(200.0, |mins| {
-            f64::from(mins) / 60.0 * f64::from(HOUR_H) - f64::from(p.hour_start) * f64::from(HOUR_H)
+            f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(p.hour_start) * PLAN_PX_PER_HOUR
         });
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
@@ -298,26 +415,49 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
         wrap.append(&line);
         overlay.add_overlay(&wrap);
     }
+    let ghost = Ghost::new(p);
     for b in &p.blocks {
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
         wrap.set_hexpand(true);
         wrap.set_margin_top(block_top(b, p.hour_start));
-        wrap.append(&block_widget(b, p.now_min, tx));
+        wrap.append(&block_widget(b, p.now_min, &ghost, tx));
         overlay.add_overlay(&wrap);
     }
+    ghost.attach(&overlay);
 
     // Dropping a tray task (or a block dragged out and back) lands it at
-    // the pointer's time.
+    // the pointer's time. The ghost tracks that place while the drag is on.
     let target = gtk::DropTarget::new(
         glib::Type::STRING,
         gdk::DragAction::MOVE | gdk::DragAction::COPY,
     );
     {
-        let tx = tx.clone();
+        let (ghost, hour_start) = (ghost.clone(), p.hour_start);
+        target.connect_motion(move |_, _, y| {
+            match row::dragging().and_then(|href| ghost.tasks.get(&href).cloned()) {
+                Some(task) => {
+                    ghost.show(
+                        &task,
+                        model::minutes_at(y, hour_start),
+                        PLAN_DEFAULT_DURATION,
+                    );
+                }
+                None => ghost.hide(),
+            }
+            gdk::DragAction::MOVE | gdk::DragAction::COPY
+        });
+    }
+    {
+        let ghost = ghost.clone();
+        target.connect_leave(move |_| ghost.hide());
+    }
+    {
+        let (ghost, tx) = (ghost.clone(), tx.clone());
         let hour_start = p.hour_start;
         target.connect_drop(move |_, value, _, y| {
+            ghost.hide();
             let Ok(text) = value.get::<String>() else {
                 return false;
             };
@@ -326,7 +466,7 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
             };
             tx.emit(Msg::PlanSet(
                 href.to_string(),
-                minutes_at(y, hour_start),
+                model::minutes_at(y, hour_start),
                 PLAN_DEFAULT_DURATION,
             ));
             true

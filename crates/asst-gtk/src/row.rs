@@ -4,6 +4,8 @@
 //! span lists.
 //! Right-click for the task menu; drag it onto a list or a view.
 
+use std::cell::RefCell;
+
 use asst_core::api::{Change, ListView, TaskView};
 use asst_core::fmt;
 use asst_core::task::priority_level;
@@ -19,6 +21,17 @@ use crate::{model, motion};
 
 /// What a drag of a task carries.
 pub const DRAG_PREFIX: &str = "asst-task:";
+
+thread_local! {
+    /// The href a task drag is carrying, while one is in the air. Drop
+    /// targets that need the value before the drop (the Plan ghost) read it.
+    static DRAGGING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The task href a drag is carrying, if one is in the air.
+pub fn dragging() -> Option<String> {
+    DRAGGING.with(|d| d.borrow().clone())
+}
 
 pub struct RowOpts<'a> {
     pub now: DateTime<Tz>,
@@ -230,10 +243,15 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
             Some(gdk::ContentProvider::for_value(&payload.to_value()))
         });
         let item_weak = item.downgrade();
+        let href = t.href.clone();
         drag.connect_drag_begin(move |src, _| {
+            DRAGGING.with(|d| *d.borrow_mut() = Some(href.clone()));
             if let Some(item) = item_weak.upgrade() {
                 src.set_icon(Some(&gtk::WidgetPaintable::new(Some(&item))), 12, 12);
             }
+        });
+        drag.connect_drag_end(|_, _, _| {
+            DRAGGING.with(|d| *d.borrow_mut() = None);
         });
         row.add_controller(drag);
     }
