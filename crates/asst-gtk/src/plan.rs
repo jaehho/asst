@@ -11,8 +11,8 @@ use asst_core::api::TaskView;
 use relm4::gtk::{self, gdk, glib, prelude::*};
 
 use crate::model::{
-    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_PX_PER_HOUR, PlanBlock, place,
-    unplace,
+    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_PX_PER_HOUR, PLAN_SNAP,
+    PlanBlock, place, unplace,
 };
 use crate::row::DRAG_PREFIX;
 use crate::window::{Msg, Tx};
@@ -20,8 +20,10 @@ use crate::{content, row, ui};
 
 /// Width of the hour-label gutter.
 const GUTTER: i32 = 56;
-/// Height floor so a short slot is still clickable.
+/// Height floor so a short slot is still clickable. Below half an hour a
+/// lower floor keeps 15 min visibly shorter than 30.
 const MIN_BLOCK_H: i32 = 22;
+const MIN_BLOCK_H_SHORT: i32 = 12;
 
 fn hour_label(hour: u32) -> String {
     match hour {
@@ -34,6 +36,13 @@ fn hour_label(hour: u32) -> String {
 
 fn clock(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
+}
+
+/// Clock time in the app's voice: `9am`, `5:30pm`.
+pub fn clock_label(min: u32) -> String {
+    let t =
+        chrono::NaiveTime::from_hms_opt(min / 60, min % 60, 0).unwrap_or(chrono::NaiveTime::MIN);
+    asst_core::fmt::time_label(t)
 }
 
 /// The tint a block wears: its priority's color, like the row's checkbox.
@@ -51,7 +60,13 @@ fn block_top(b: &PlanBlock, hour_start: u32) -> i32 {
 }
 
 fn block_height(b: &PlanBlock) -> i32 {
-    (f64::from(b.duration) / 60.0 * PLAN_PX_PER_HOUR).max(MIN_BLOCK_H as f64) as i32
+    let natural = f64::from(b.duration) / 60.0 * PLAN_PX_PER_HOUR;
+    let floor = if b.duration < 30 {
+        MIN_BLOCK_H_SHORT
+    } else {
+        MIN_BLOCK_H
+    };
+    natural.max(floor as f64) as i32
 }
 
 /// The chip body both a placed block and the drag ghost wear.
@@ -77,7 +92,14 @@ fn block_chip(b: &PlanBlock, now_min: Option<u32>) -> gtk::Box {
     title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     chip.append(&title);
-    if block_height(b) >= 36 {
+    if b.duration < 30 {
+        // Short enough that the chip would read the same as a half hour:
+        // say the length so the difference is legible either way.
+        let meta = gtk::Label::new(Some(&format!("{}m", b.duration)));
+        meta.add_css_class("plan-block-meta");
+        meta.set_xalign(0.0);
+        chip.append(&meta);
+    } else if block_height(b) >= 36 {
         let meta = gtk::Label::new(Some(&format!(
             "{} – {}",
             clock(b.start),
@@ -109,14 +131,16 @@ fn block_row(chip: &gtk::Box, col: usize, cols: usize) -> gtk::Box {
 }
 
 /// One placed task: click opens the editor, drag moves, the edge resizes,
-/// right-click sets start and duration by hand.
+/// right-click sets start and duration by hand. The wrap is focusable so
+/// vim j/k can land on it like a list row.
 fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> gtk::Widget {
     let chip = block_chip(b, now_min);
 
     // Bottom edge: drag to change the duration, with a ghost of the new end.
+    // Thinner on a short chip so the floor can keep it short.
     let edge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     edge.add_css_class("plan-block-edge");
-    edge.set_height_request(6);
+    edge.set_height_request(if b.duration < 30 { 3 } else { 6 });
     edge.set_valign(gtk::Align::End);
     edge.set_cursor_from_name(Some("ns-resize"));
     {
@@ -209,10 +233,16 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> 
         chip.add_controller(click);
     }
 
-    block_row(&chip, b.col, b.cols).upcast()
+    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    wrap.set_widget_name(&b.task.href);
+    wrap.set_focusable(true);
+    wrap.add_css_class("plan-block-focus");
+    wrap.append(&block_row(&chip, b.col, b.cols));
+    wrap.upcast()
 }
 
-/// Start, duration and Take off the plan for one slot.
+/// Start, duration and Take off the plan for one slot. Start speaks clock
+/// time (`9am`), duration stays in minutes and is labeled as such.
 fn slot_popover(href: &str, start: u32, duration: u32, tx: &Tx) -> gtk::Popover {
     let href = href.to_string();
     let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -221,19 +251,68 @@ fn slot_popover(href: &str, start: u32, duration: u32, tx: &Tx) -> gtk::Popover 
     box_.set_margin_start(12);
     box_.set_margin_end(12);
 
+    // Start and duration as clock time and minutes, never raw 540.
+    let start_cell = std::rc::Rc::new(std::cell::Cell::new(start));
+    let dur_cell = std::rc::Rc::new(std::cell::Cell::new(duration));
+
     let start_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     start_row.append(&ui::label("Start", &["dim-label"]));
-    let start_spin = gtk::SpinButton::with_range(0.0, 23.0 * 60.0 + 45.0, 15.0);
-    start_spin.set_value(f64::from(start));
-    start_spin.set_numeric(true);
-    start_row.append(&start_spin);
+    let start_lab = ui::label(&clock_label(start), &["plan-time-label"]);
+    start_lab.set_widget_name("plan-start-clock");
+    let start_minus = gtk::Button::from_icon_name("list-remove-symbolic");
+    start_minus.add_css_class("flat");
+    let start_plus = gtk::Button::from_icon_name("list-add-symbolic");
+    start_plus.add_css_class("flat");
+    {
+        let (cell, lab) = (start_cell.clone(), start_lab.clone());
+        start_minus.connect_clicked(move |_| {
+            let v = cell.get().saturating_sub(PLAN_SNAP);
+            cell.set(v);
+            lab.set_text(&clock_label(v));
+        });
+    }
+    {
+        let (cell, lab) = (start_cell.clone(), start_lab.clone());
+        start_plus.connect_clicked(move |_| {
+            let v = (cell.get() + PLAN_SNAP).min(23 * 60 + 45);
+            cell.set(v);
+            lab.set_text(&clock_label(v));
+        });
+    }
+    start_row.append(&start_minus);
+    start_row.append(&start_lab);
+    start_row.append(&start_plus);
 
     let dur_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     dur_row.append(&ui::label("Duration", &["dim-label"]));
-    let dur_spin = gtk::SpinButton::with_range(f64::from(PLAN_MIN_DURATION), 12.0 * 60.0, 15.0);
-    dur_spin.set_value(f64::from(duration));
-    dur_spin.set_numeric(true);
-    dur_row.append(&dur_spin);
+    let dur_lab = ui::label(
+        &asst_core::fmt::minutes(u64::from(duration)),
+        &["plan-time-label"],
+    );
+    dur_lab.set_widget_name("plan-duration-label");
+    let dur_minus = gtk::Button::from_icon_name("list-remove-symbolic");
+    dur_minus.add_css_class("flat");
+    let dur_plus = gtk::Button::from_icon_name("list-add-symbolic");
+    dur_plus.add_css_class("flat");
+    {
+        let (cell, lab) = (dur_cell.clone(), dur_lab.clone());
+        dur_minus.connect_clicked(move |_| {
+            let v = cell.get().saturating_sub(PLAN_SNAP).max(PLAN_MIN_DURATION);
+            cell.set(v);
+            lab.set_text(&asst_core::fmt::minutes(u64::from(v)));
+        });
+    }
+    {
+        let (cell, lab) = (dur_cell.clone(), dur_lab.clone());
+        dur_plus.connect_clicked(move |_| {
+            let v = (cell.get() + PLAN_SNAP).min(12 * 60);
+            cell.set(v);
+            lab.set_text(&asst_core::fmt::minutes(u64::from(v)));
+        });
+    }
+    dur_row.append(&dur_minus);
+    dur_row.append(&dur_lab);
+    dur_row.append(&dur_plus);
 
     let apply = gtk::Button::with_label("Apply");
     apply.add_css_class("pill");
@@ -250,11 +329,11 @@ fn slot_popover(href: &str, start: u32, duration: u32, tx: &Tx) -> gtk::Popover 
     let pop = ui::popover(&box_);
     {
         let (href, tx) = (href.clone(), tx.clone());
-        let (start_spin, dur_spin) = (start_spin.clone(), dur_spin.clone());
+        let (start_cell, dur_cell) = (start_cell.clone(), dur_cell.clone());
         let pop = pop.clone();
         apply.connect_clicked(move |_| {
-            let s = start_spin.value() as u32;
-            let d = (dur_spin.value() as u32).max(PLAN_MIN_DURATION);
+            let s = start_cell.get();
+            let d = dur_cell.get().max(PLAN_MIN_DURATION);
             tx.emit(Msg::PlanSet(href.clone(), s, d));
             pop.popdown();
         });
@@ -268,6 +347,14 @@ fn slot_popover(href: &str, start: u32, duration: u32, tx: &Tx) -> gtk::Popover 
         });
     }
     pop
+}
+
+/// Open the slot popover on `parent` (devel drive, and the block's own
+/// right-click path shares `slot_popover`).
+pub fn open_slot_popover(parent: &gtk::Widget, href: &str, start: u32, duration: u32, tx: &Tx) {
+    let pop = slot_popover(href, start, duration, tx);
+    pop.set_parent(parent);
+    pop.popup();
 }
 
 /// The live drop preview: one overlay child the drag callbacks rewrite.
@@ -362,7 +449,7 @@ pub fn ghost_off() {
     });
 }
 
-fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
+fn day_grid(p: &DayPlan, tx: &Tx, rows: &mut Vec<(String, gtk::Widget)>) -> gtk::Widget {
     let hours = p.hour_end.saturating_sub(p.hour_start).max(1);
     let height = i32::try_from(hours).unwrap_or(15) * PLAN_PX_PER_HOUR as i32;
     let hour_h = PLAN_PX_PER_HOUR as i32;
@@ -378,7 +465,9 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
         lab.add_css_class("dim-label");
         lab.set_xalign(1.0);
         lab.set_yalign(0.0);
-        lab.set_margin_top(-8);
+        // Natural height: the label sits on the hour rule, not crushed
+        // into it by a negative margin.
+        lab.set_margin_top(0);
         lab.set_margin_end(8);
         slot.append(&lab);
         gutter.append(&slot);
@@ -398,10 +487,11 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&rules));
-    {
-        let y = p.now_min.map_or(200.0, |mins| {
-            f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(p.hour_start) * PLAN_PX_PER_HOUR
-        });
+    // The now-line only claims a place that is actually now: outside the
+    // grid it is gone, never pinned to the top rule.
+    if let Some(mins) = p.now_min {
+        let y =
+            f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(p.hour_start) * PLAN_PX_PER_HOUR;
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
@@ -422,7 +512,9 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
         wrap.set_valign(gtk::Align::Start);
         wrap.set_hexpand(true);
         wrap.set_margin_top(block_top(b, p.hour_start));
-        wrap.append(&block_widget(b, p.now_min, &ghost, tx));
+        let row = block_widget(b, p.now_min, &ghost, tx);
+        rows.push((b.task.href.clone(), row.clone()));
+        wrap.append(&row);
         overlay.add_overlay(&wrap);
     }
     ghost.attach(&overlay);
@@ -482,9 +574,16 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
     outer.upcast()
 }
 
-fn tray(p: &DayPlan, o: &content::Opts<'_>, tx: &Tx) -> gtk::Box {
+fn tray(
+    p: &DayPlan,
+    o: &content::Opts<'_>,
+    tx: &Tx,
+    rows: &mut Vec<(String, gtk::Widget)>,
+) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
     b.add_css_class("plan-tray");
+    b.set_size_request(220, -1);
+    b.set_hexpand(false);
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     head.add_css_class("section-header");
     head.append(&ui::label("Unscheduled", &["section-title"]));
@@ -519,7 +618,9 @@ fn tray(p: &DayPlan, o: &content::Opts<'_>, tx: &Tx) -> gtk::Box {
     }
     for t in &p.tray {
         if o.editing == Some(t.href.as_str()) {
-            list.append(&row::editor_row(&t.href, o.editor));
+            let r = row::editor_row(&t.href, o.editor);
+            list.append(&r);
+            rows.push((t.href.clone(), r.into()));
             continue;
         }
         let r = row::task_row(
@@ -540,6 +641,7 @@ fn tray(p: &DayPlan, o: &content::Opts<'_>, tx: &Tx) -> gtk::Box {
             tx,
         );
         list.append(&r);
+        rows.push((t.href.clone(), r.into()));
     }
     let scroll = gtk::ScrolledWindow::builder()
         .child(&list)
@@ -595,11 +697,14 @@ pub fn build_column(
     head.append(&text);
     root.append(&head);
 
+    let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
     if let Some(href) = o.editing {
         let list = gtk::ListBox::new();
         list.add_css_class("task-list");
         list.set_selection_mode(gtk::SelectionMode::None);
-        list.append(&row::editor_row(href, o.editor));
+        let r = row::editor_row(href, o.editor);
+        list.append(&r);
+        rows.push((href.to_string(), r.into()));
         root.append(&list);
     }
 
@@ -615,9 +720,9 @@ pub fn build_column(
     scroll.set_min_content_height(400);
     scroll.add_css_class("time-scroll");
     scroll.add_css_class("plan-scroll");
-    scroll.set_child(Some(&day_grid(p, tx)));
+    scroll.set_child(Some(&day_grid(p, tx, &mut rows)));
     cols.append(&scroll);
-    cols.append(&tray(p, o, tx));
+    cols.append(&tray(p, o, tx, &mut rows));
     root.append(&cols);
 
     {
@@ -629,10 +734,7 @@ pub fn build_column(
         });
     }
 
-    content::Built {
-        root,
-        rows: Vec::new(),
-    }
+    content::Built { root, rows }
 }
 
 /// Place or move `href`'s slot for `date` in the window's prefs.
