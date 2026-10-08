@@ -103,12 +103,16 @@ pub fn arrive(row: &gtk::ListBoxRow) {
 /// were: after the nearest row above them that stayed, or before the one
 /// below. A row with no neighbor left in its list (the whole section went)
 /// just goes. Whether any fold.
-pub fn leave(old: &[(String, gtk::ListBoxRow)], new: &[(String, gtk::ListBoxRow)]) -> bool {
-    let new: HashMap<&str, &gtk::ListBoxRow> = new.iter().map(|(h, r)| (h.as_str(), r)).collect();
+pub fn leave(old: &[(String, gtk::Widget)], new: &[(String, gtk::Widget)]) -> bool {
+    let new: HashMap<&str, &gtk::Widget> = new.iter().map(|(h, r)| (h.as_str(), r)).collect();
     // Where each goes, decided while the old lists are whole: a run of rows
     // leaving together keeps its order by following the one before it.
     let mut plan: Vec<(&str, &gtk::ListBoxRow, bool, String)> = Vec::new();
     for (href, row) in old {
+        // Only list rows fold; plan blocks are overlays without a ListBox.
+        let Some(row) = row.downcast_ref::<gtk::ListBoxRow>() else {
+            continue;
+        };
         // The open task's row holds the editor, which the new build has taken.
         if new.contains_key(href.as_str()) || row.has_css_class("editing") {
             continue;
@@ -129,10 +133,10 @@ pub fn leave(old: &[(String, gtk::ListBoxRow)], new: &[(String, gtk::ListBoxRow)
     }
     let mut placed: HashMap<&str, &gtk::ListBoxRow> = HashMap::new();
     for (href, row, after, neighbor) in plan {
-        let Some(neighbor) = new
-            .get(neighbor.as_str())
-            .or_else(|| placed.get(neighbor.as_str()))
-        else {
+        let Some(neighbor) = placed.get(neighbor.as_str()).copied().or_else(|| {
+            new.get(neighbor.as_str())
+                .and_then(|w| (*w).downcast_ref::<gtk::ListBoxRow>())
+        }) else {
             continue;
         };
         let (Some(from), Some(to)) = (

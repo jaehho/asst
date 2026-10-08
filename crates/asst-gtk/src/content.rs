@@ -66,7 +66,8 @@ pub struct Fresh<'a> {
 pub struct Built {
     pub root: gtk::Box,
     /// Every row, top to bottom, for moving through them with keys.
-    pub rows: Vec<(String, gtk::ListBoxRow)>,
+    /// Plan blocks are focusable boxes, not list rows.
+    pub rows: Vec<(String, gtk::Widget)>,
 }
 
 /// Where adding in a section puts the task.
@@ -163,7 +164,7 @@ fn matrix(
     sections: &[Section],
     o: &Opts,
     tx: &Tx,
-    rows: &mut Vec<(String, gtk::ListBoxRow)>,
+    rows: &mut Vec<(String, gtk::Widget)>,
 ) -> gtk::Box {
     let grid = gtk::Box::new(gtk::Orientation::Vertical, 12);
     grid.add_css_class("matrix");
@@ -180,7 +181,7 @@ fn matrix(
     grid
 }
 
-fn quadrant(s: &Section, o: &Opts, tx: &Tx, rows: &mut Vec<(String, gtk::ListBoxRow)>) -> gtk::Box {
+fn quadrant(s: &Section, o: &Opts, tx: &Tx, rows: &mut Vec<(String, gtk::Widget)>) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("matrix-quadrant");
     card.set_vexpand(true);
@@ -284,7 +285,7 @@ fn section(
     s: &Section,
     o: &Opts,
     tx: &Tx,
-    rows: &mut Vec<(String, gtk::ListBoxRow)>,
+    rows: &mut Vec<(String, gtk::Widget)>,
     list_max_height: Option<i32>,
 ) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -353,7 +354,7 @@ fn section(
         if o.editing == Some(t.href.as_str()) {
             let r = row::editor_row(&t.href, o.editor);
             list.append(&r);
-            rows.push((t.href.clone(), r));
+            rows.push((t.href.clone(), r.into()));
             continue;
         }
         let r = row::task_row(
@@ -377,7 +378,7 @@ fn section(
             motion::arrive(&r);
         }
         list.append(&r);
-        rows.push((t.href.clone(), r));
+        rows.push((t.href.clone(), r.into()));
     }
     match list_max_height {
         Some(max) => {

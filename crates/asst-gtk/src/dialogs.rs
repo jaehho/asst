@@ -200,7 +200,7 @@ pub fn delete_completed_dialog(
 
 pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
     let dialog = adw::ShortcutsDialog::new();
-    let sections: [(&str, &[(&str, &str)]); 4] = [
+    let sections: [(&str, &[(&str, &str)]); 5] = [
         (
             "Moving around",
             &[
@@ -232,6 +232,14 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                     "<Control>d <Control>r",
                 ),
                 ("Close the task or selection", "Escape"),
+            ],
+        ),
+        (
+            "Plan",
+            &[
+                ("Place the task on the plan at now", "n"),
+                ("Move the block start", "Left Right"),
+                ("Complete the block", "x space"),
             ],
         ),
         (
