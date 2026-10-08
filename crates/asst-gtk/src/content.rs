@@ -90,7 +90,7 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
     if o.fresh.view {
         root.add_css_class("view-enter");
     }
-    // Planify's focus on the task open in place: the rest steps back.
+    // Focus on the task open in place: the rest steps back.
     if o.editing.is_some() {
         root.add_css_class("focusing");
     }
@@ -399,7 +399,7 @@ fn section(
     b
 }
 
-/// Planify's Reschedule: one date for everything overdue, times kept.
+/// Reschedule: one date for everything overdue, times kept.
 fn reschedule(s: &Section, o: &Opts, tx: &Tx) -> gtk::MenuButton {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.append(&gtk::Image::from_icon_name("month-symbolic"));

@@ -428,7 +428,7 @@ impl CalDav {
     }
 
     /// Rename or recolor a list (a PROPPATCH per property). The color is
-    /// written as `#rrggbb`, as Nextcloud's web UI and Planify do.
+    /// written as `#rrggbb`, as Nextcloud's web UI does.
     pub async fn update_list(
         &self,
         href: &str,

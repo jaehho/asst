@@ -1,4 +1,4 @@
-//! Animations, as Planify has them: rows open up as they arrive and fold
+//! Animations: rows open up as they arrive and fold
 //! away as they go, a task grows into its card, a checked box pops.
 //!
 //! The view is rebuilt from scratch on every change, so nothing moves by

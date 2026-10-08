@@ -1,6 +1,6 @@
 # asst design
 
-Tasks and reminders on Nextcloud CalDAV for one setup: Arch + Hyprland laptop, iPhone (Apple Reminders), projects in `~/projects`. Planify is the reference, not the base (`UPSTREAM.md`).
+Tasks and reminders on Nextcloud CalDAV for one setup: Arch + Hyprland laptop, iPhone (Apple Reminders), projects in `~/projects`.
 
 ## Shape
 
@@ -27,12 +27,12 @@ The daemon, not the window, keeps sync and reminders alive, so closing the windo
 
 ## Window
 
-Planify's look and layout, rebuilt in relm4, because the first plain libadwaita list felt bare next to it:
+Libadwaita dressed up, because the first plain libadwaita list felt bare:
 - **Sidebar:** colored view tiles with counts, then lists with color rings.
 - **Views:** a big title, then sections under a rule. Matrix is the exception: four cards in a 2×2 (Do / Schedule / Delegate / Drop), from TickTick's Eisenhower view. Each card's list is a scroller capped at a fixed height, so the four stay equal without growing to the longest box. Placement is pure model: p1–p2 is important, due ≤ today is urgent. Dropping on a box edits only the axes on the wrong side (priority → p2/p3, due → today or none), never rewriting the task.
-- **Tasks open in place:** the row grows into a card with the title, notes and a bar of buttons, as in Planify. A pane on the right came first; the card was preferred.
-- **Pickers:** Planify's date picker (suggestions, three weeks, time, repeat), plus priority, list and reminder pickers.
-- **Also:** the task menu, the add card, Quick Find, selection, and Planify's colors and icons (GNOME Icon Development Kit, bundled as a GResource).
+- **Tasks open in place:** the row grows into a card with the title, notes and a bar of buttons. A pane on the right came first; the card was preferred.
+- **Pickers:** a date picker (suggestions, three weeks, time, repeat), plus priority, list and reminder pickers.
+- **Also:** the task menu, the add card, Quick Find, selection, and colors and icons (GNOME Icon Development Kit, bundled as a GResource).
 
 - **One model, no widget state.** `model.rs` works out views, sections and counts from the daemon's data, so it is unit-tested. The window rebuilds a view's rows when what it shows changes, but not while a popover is open over them.
 - **The editor and the add card outlive rebuilds.** Each is one widget moved into the new rows, keeping its text, cursor and the keyboard. The open task's own edits don't rebuild the view, and nothing does while its title or notes have the keyboard: taking the field away would end an input method's composition mid-word.
@@ -47,9 +47,9 @@ Planify's look and layout, rebuilt in relm4, because the first plain libadwaita 
   - A checked task is struck through for a moment and can be unchecked.
   - A deleted one hides at once and goes when its Undo toast does, or before the window closes.
   - Deleting a list asks first, because it takes its tasks on every device. So does deleting completed tasks, which the daemon does in one transaction, however many (the window only ever loads 500).
-- **Lists are ordered and archived in the window,** as Planify keeps them: `window.toml`, not the server's `calendar-order`, which shared and read-only lists couldn't take anyway. An archived list still syncs and its reminders still ring; it is only out of sight (sidebar, views, counts, the tray). The ring beside a list is its color, not progress: these lists are long-term projects, so a completed share would only grow toward 100% and mean nothing.
+- **Lists are ordered and archived in the window:** `window.toml`, not the server's `calendar-order`, which shared and read-only lists couldn't take anyway. An archived list still syncs and its reminders still ring; it is only out of sight (sidebar, views, counts, the tray). The ring beside a list is its color, not progress: these lists are long-term projects, so a completed share would only grow toward 100% and mean nothing.
 - **Notes stay plain text,** since the iPhone shows them as they are: Enter carries on `- `, `* `, `- [ ] ` and numbered lists, and links are drawn as links and open with Ctrl+click. No bold, headings or hidden markers, which would turn to clutter on the phone.
-- **What Planify does on the side, asst does too, small:** Quick Find reads notes and words for views; the add card has notes, reminders and `#` suggestions; Ctrl+V adds the clipboard; other rows step back while a task is open; a repeating task's new date lights up; a drag near the edge scrolls. Quick add remembers its last list in the state directory, apart from `window.toml`, which the window writes whole.
+- **Small conveniences:** Quick Find reads notes and words for views; the add card has notes, reminders and `#` suggestions; Ctrl+V adds the clipboard; other rows step back while a task is open; a repeating task's new date lights up; a drag near the edge scrolls. Quick add remembers its last list in the state directory, apart from `window.toml`, which the window writes whole.
 - **Window-only preferences** (sort, filters, sidebar views, completion delay, size) live in `window.toml` next to `config.toml`. The daemon's settings go through `Settings`/`SetSettings`.
 - **Development builds** (`ASST_DEVEL=1`) use the ID `dev.jaeho.Asst.Devel` and export `drive`/`snapshot` app actions. `scripts/dev` uses them to check the window without focusing it.
 
@@ -60,7 +60,7 @@ Planify's look and layout, rebuilt in relm4, because the first plain libadwaita 
 - **Push first, then pull.** Every write carries `If-Match` (or `If-None-Match: *` for a new task). On 412 the server copy is fetched and the stored edits are re-applied on top of it, so both sides' changes survive.
 - **Edits are operations, not diffs.** A lost response (write applied, answer never arrived) is detected by checking whether the server copy already shows the edit, so a repeating task is never advanced twice.
 - **A full listing once a day** per changed list: Nextcloud prunes old change history without invalidating tokens that point into it.
-- **Never rewrite a VTODO from scratch.** `ical.rs` round-trips byte for byte and edits touch only their own lines (Planify rebuilds the object on upload and drops what iOS wrote).
+- **Never rewrite a VTODO from scratch.** `ical.rs` round-trips byte for byte and edits touch only their own lines, so what other clients wrote survives.
 - Skipped collections: Nextcloud's trash bin (`deleted-calendar`) and Deck boards.
 - **List changes go to the server at once** (MKCOL, PROPPATCH, DELETE), not through the queue: making, renaming, recoloring or deleting a list needs a connection. A deleted list lands in Nextcloud's trash bin, and its tasks and unsent edits leave the cache with it.
 - **Credentials:** Nextcloud Login Flow v2 creates an app password for asst alone, kept in the Secret Service (`oo7`). `ASST_PASSWORD` overrides it for tests.

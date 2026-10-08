@@ -2,7 +2,6 @@
 
 Rust tasks app on Nextcloud CalDAV. Decisions and architecture: `DESIGN.md`.
 
-- **Planify is a reference, never a dependency.** Its clone is `~/projects/forks/planify`; read it for CalDAV/iCal edge cases, re-implement in Rust, and log ported fixes in `UPSTREAM.md` (`scripts/upstream-review`).
 - **Never rewrite a VTODO from scratch.** Patch the stored server copy so properties from iOS or other clients survive; `ical.rs` tests pin byte-for-byte round trips.
 - **The daemon owns sync and reminders.** The GUI, CLI and quick add are D-Bus clients; none of them talk to Nextcloud.
 - **Test against the real server only in a throwaway list.** `make nextcloud-test` creates and purges its own. The user's lists sync to their iPhone.

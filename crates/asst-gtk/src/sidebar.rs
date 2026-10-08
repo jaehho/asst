@@ -1,4 +1,4 @@
-//! The sidebar, after Planify's: colored tiles for the views chosen in
+//! The sidebar: colored tiles for the views chosen in
 //! Preferences, then the account's lists with their color rings and counts.
 //! Tasks dragged onto a tile or a list land there; lists dragged among
 //! themselves take a new order.

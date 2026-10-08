@@ -1,4 +1,4 @@
-//! Small widgets the window is made of, in Planify's idiom: menu items,
+//! Small widgets the window is made of: menu items,
 //! due chips, list color rings, text fields with a placeholder.
 
 use std::cell::{Cell, RefCell};
@@ -7,7 +7,7 @@ use std::f64::consts::PI;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{self, gdk, glib, pango};
 
-/// Planify's project colors, by name.
+/// Project colors, by name.
 pub const COLORS: [(&str, &str); 20] = [
     ("Berry Red", "#c42d78"),
     ("Red", "#e23d3d"),
@@ -156,7 +156,7 @@ pub fn popover(child: &impl IsA<gtk::Widget>) -> gtk::Popover {
     p
 }
 
-/// A popover of menu items, 250 px wide as Planify's are.
+/// A popover of menu items, 250 px wide.
 pub fn menu(items: &[gtk::Widget]) -> gtk::Popover {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
     b.set_margin_top(3);
@@ -302,8 +302,8 @@ pub fn chip(text: &str, class: &str, repeat: bool) -> gtk::Box {
     b
 }
 
-/// A list's color as Planify draws a project: a ring around a dot. Not a
-/// progress meter — these lists are long-term projects.
+/// A list's color: a ring around a dot, not a progress meter — these
+/// lists are long-term projects.
 pub fn ring(color: Option<&str>, size: i32) -> gtk::DrawingArea {
     let rgba = color
         .and_then(|c| gdk::RGBA::parse(c).ok())

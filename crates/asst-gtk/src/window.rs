@@ -558,9 +558,8 @@ impl Component for Window {
                 .connect_value_changed(move |a| title_revealer.set_reveal_child(a.value() > 48.0));
         }
         scroll_while_dragging(&scroller);
-        // A click on the column's background closes the open task, as a
-        // click outside Planify's card does. Rows, buttons and fields do
-        // their own thing (another row opens instead).
+        // A click on the column's background closes the open task. Rows,
+        // buttons and fields do their own thing (another row opens instead).
         {
             let click = gtk::GestureClick::new();
             click.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -2642,7 +2641,7 @@ impl Window {
             prefs: &self.prefs,
         });
         w.header_title.set_text(&self.nav.title(&self.lists));
-        // Planify marks the view button while a filter hides tasks.
+        // The view button is marked while a filter hides tasks.
         if self.prefs.view_opts(&self.nav).filtered() {
             w.view_button.add_css_class("filtered");
         } else {
@@ -3548,8 +3547,7 @@ thread_local! {
     static CURRENT_ARCHIVED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A list's menu, as Planify's project menu: select, edit, copy, archive,
-/// delete.
+/// A list's menu: select, edit, copy, archive, delete.
 fn more_menu(tx: Tx) -> gtk::Popover {
     let Some((nav, _)) = CURRENT_VIEW.with(|c| c.borrow().clone()) else {
         return ui::menu(&[]);
@@ -3621,7 +3619,7 @@ fn file_name(title: &str) -> String {
     }
 }
 
-/// Vim keys and Planify's shortcuts; typing in a field is left alone.
+/// Vim keys and shortcuts; typing in a field is left alone.
 fn key_action(
     window: &adw::ApplicationWindow,
     key: gdk::Key,

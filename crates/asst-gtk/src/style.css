@@ -1,4 +1,4 @@
-/* asst: libadwaita, dressed after Planify. */
+/* asst: libadwaita, dressed up. */
 
 window {
   --view-blue: #3584e4;
@@ -61,7 +61,7 @@ window.dark {
   to { opacity: 1; transform: none; }
 }
 
-/* Planify's check: the box pops, the row lights up and the title dims. */
+/* The check: the box pops, the row lights up and the title dims. */
 @keyframes check-pop {
   0% { transform: scale(0.7); }
   55% { transform: scale(1.25); }
@@ -78,7 +78,7 @@ window.dark {
   to { opacity: 0.55; }
 }
 
-/* Planify's focus on the task open in place: the rest steps back. */
+/* Focus on the task open in place: the rest steps back. */
 @keyframes step-back {
   from { opacity: 1; }
   to { opacity: 0.45; }
@@ -89,7 +89,7 @@ window.dark {
   to { opacity: 1; }
 }
 
-/* A checked repeating task's next date, lit up as Planify does. */
+/* A checked repeating task's next date, lit up. */
 @keyframes rolled {
   0%, 50% { background-color: alpha(var(--accent-color), 0.3); color: var(--accent-color); }
 }
@@ -352,7 +352,7 @@ list.task-list > row.task-row.cursor:focus-visible {
   margin: 6px 0 6px 10px;
 }
 
-/* Planify's checkbox: a small rounded square in the priority's color. */
+/* The checkbox: a small rounded square in the priority's color. */
 checkbutton.task-check {
   padding: 0;
 }
@@ -490,7 +490,7 @@ textview.add-notes {
 
 /* -- a task open in place ------------------------------------------------ */
 
-/* Planify's card: lifted off the list, with room above and below. */
+/* The card: lifted off the list, with room above and below. */
 list.task-list > row.task-row.editing,
 list.task-list > row.task-row.editing:hover {
   background: none;

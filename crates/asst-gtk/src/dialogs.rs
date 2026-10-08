@@ -285,9 +285,5 @@ pub fn about(parent: &impl IsA<gtk::Widget>) {
         .license_type(gtk::License::MitX11)
         .comments("Tasks and reminders on Nextcloud, in step with Apple Reminders on the iPhone.")
         .build();
-    dialog.add_credit_section(
-        Some("Inspired by"),
-        &["Planify by Alain M. https://github.com/alainm23/planify"],
-    );
     dialog.present(Some(parent));
 }

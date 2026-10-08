@@ -1,4 +1,4 @@
-//! Popovers that set a task's properties, after Planify's: dates (with time
+//! Popovers that set a task's properties: dates (with time
 //! and repeat), priority, list, reminders. Each takes the current value and
 //! a callback; the window turns the callback into an edit.
 
@@ -109,7 +109,7 @@ fn chip_box() -> adw::WrapBox {
         .build()
 }
 
-/// A day's icon, as Planify picks it.
+/// A day's icon.
 fn day_icon(d: NaiveDate, today: NaiveDate) -> &'static str {
     match (d - today).num_days() {
         0 => "star-outline-thick-symbolic",
@@ -176,7 +176,7 @@ fn set_option(parts: &(gtk::Label, gtk::Image, gtk::Button), value: Option<Strin
 type Changed = Rc<dyn Fn(Schedule)>;
 type Redraw = Rc<dyn Fn()>;
 
-/// Planify's date picker: suggestions, a typed date, three weeks to click,
+/// The date picker: suggestions, a typed date, three weeks to click,
 /// a full calendar, and rows for the time and the repeat.
 pub fn date_popover(
     start: Schedule,

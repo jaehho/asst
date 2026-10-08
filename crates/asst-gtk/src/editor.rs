@@ -1,4 +1,4 @@
-//! A task opened in place, as Planify opens one: its row grows into a card
+//! A task opened in place: its row grows into a card
 //! with the title to edit, notes under it, and a bar of buttons for the
 //! date, list, priority and reminders. There is one editor, and each rebuild
 //! of the view moves it into the open task's row, so what is being typed
@@ -66,7 +66,7 @@ fn text_of(view: &gtk::TextView) -> String {
     b.text(&b.start_iter(), &b.end_iter(), false).to_string()
 }
 
-/// A flat icon button with Planify's dot for "this has a value".
+/// A flat icon button with a dot for "this has a value".
 fn dotted(icon: &str, tooltip: &str) -> (gtk::MenuButton, gtk::Overlay, gtk::Widget) {
     let button = gtk::MenuButton::builder()
         .icon_name(icon)
@@ -350,7 +350,7 @@ impl Editor {
             clear.connect_clicked(move |_| clear_date());
         }
         {
-            // Planify's clear button shows while the pointer is over the date.
+            // The clear button shows while the pointer is over the date.
             let motion = gtk::EventControllerMotion::new();
             let enter = self.with(|e| {
                 let dated = e

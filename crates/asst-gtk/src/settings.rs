@@ -460,7 +460,7 @@ fn archived_group(
     group
 }
 
-/// Planify's "Run in background" and "Run on startup", in the tray.
+/// "Run in background" and "Run on startup", in the tray.
 fn background_group(
     dialog: &adw::PreferencesDialog,
     on: bool,
@@ -526,7 +526,7 @@ fn background_group(
     group
 }
 
-/// Planify's sidebar page: every view with a switch, dragged into order;
+/// The sidebar page: every view with a switch, dragged into order;
 /// how lists are ordered, and the ones archived.
 fn sidebar_page(
     lists: &[ListView],

@@ -1,4 +1,4 @@
-//! A task as a row, as Planify draws one: a checkbox in its priority's
+//! A task as a row: a checkbox in its priority's
 //! color, the due date in a colored chip, the title, small icons for notes,
 //! reminders, a link and linked notes, and the list's name in views that
 //! span lists.
@@ -198,7 +198,7 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
     }
     row.set_child(Some(&item));
 
-    // Ctrl+click selects, as in Planify.
+    // Ctrl+click selects.
     let click = gtk::GestureClick::new();
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
@@ -325,7 +325,7 @@ pub fn show_at(p: &gtk::Popover, parent: &impl IsA<gtk::Widget>, at: gdk::Rectan
     p.popup();
 }
 
-/// Planify's task menu: complete, dates, priority, move, duplicate, delete.
+/// The task menu: complete, dates, priority, move, duplicate, delete.
 pub fn task_menu(
     t: &TaskView,
     lists: &[ListView],
