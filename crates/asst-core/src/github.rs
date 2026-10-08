@@ -222,8 +222,7 @@ fn merge(p: &Pair, i: &Issue, t: &Ref) -> Option<Op> {
     if i.priority != priority {
         issue.labels = Some(labels_for(&i.labels, priority));
     }
-    let agreed =
-        title != p.title || open != p.open || body != p.body || priority != p.priority;
+    let agreed = title != p.title || open != p.open || body != p.body || priority != p.priority;
     (!task.is_empty() || !issue.is_empty() || agreed).then(|| Op::Merge {
         number: p.number,
         uid: p.uid.clone(),

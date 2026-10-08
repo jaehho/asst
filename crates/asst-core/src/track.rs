@@ -118,7 +118,9 @@ pub fn rules_path() -> PathBuf {
     if primary.exists() {
         return primary;
     }
-    let legacy = config::xdg_config_dir().join("aw-watchers").join("tags.toml");
+    let legacy = config::xdg_config_dir()
+        .join("aw-watchers")
+        .join("tags.toml");
     if legacy.exists() {
         return legacy;
     }
@@ -373,16 +375,11 @@ pub fn resolve_tag(cfg: &TagsConfig, sig: &Signals) -> Tag {
             source: TagSource::Field,
         };
     }
-    if let Some(p) = sig
-        .cwd
-        .as_deref()
-        .and_then(project_from_cwd)
-        .or_else(|| {
-            sig.title
-                .as_deref()
-                .and_then(|t| project_from_title(sig.app.as_deref(), t))
-        })
-    {
+    if let Some(p) = sig.cwd.as_deref().and_then(project_from_cwd).or_else(|| {
+        sig.title
+            .as_deref()
+            .and_then(|t| project_from_title(sig.app.as_deref(), t))
+    }) {
         return Tag {
             project: p,
             task_uid: None,
@@ -527,11 +524,7 @@ pub fn tagged_timeline(
                 end: b,
                 tag: best.tag.project.clone(),
                 task_uid: best.tag.task_uid.clone(),
-                source: format!(
-                    "aw:{}:{}",
-                    a.timestamp_millis(),
-                    best.tag.project
-                ),
+                source: format!("aw:{}:{}", a.timestamp_millis(), best.tag.project),
                 label: best.label.clone(),
                 untagged_kind: best.untagged_kind,
             }),
@@ -651,7 +644,9 @@ pub fn suggest_rules(spans: &[TaggedSpan]) -> String {
         if s.tag != "untagged" {
             continue;
         }
-        let Some(kind) = s.untagged_kind else { continue };
+        let Some(kind) = s.untagged_kind else {
+            continue;
+        };
         if s.label.is_empty() || s.label == "(none)" {
             continue;
         }
@@ -865,7 +860,12 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
 /// Replace actual (`planned=0`) blocks in [start, end) with `spans`.
 ///
 /// Window replace, not per-row upsert: AFK late data can move boundaries.
-pub fn ingest_spans(store: &mut Store, start: DateTime<Utc>, end: DateTime<Utc>, spans: &[TaggedSpan]) -> Result<usize> {
+pub fn ingest_spans(
+    store: &mut Store,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    spans: &[TaggedSpan],
+) -> Result<usize> {
     let rows: Vec<Block> = spans
         .iter()
         .map(|s| Block {
@@ -897,9 +897,7 @@ mod tests {
     use serde_json::json;
 
     fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s)
-            .unwrap()
-            .with_timezone(&Utc)
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
     fn span(a: &str, b: &str) -> Span {

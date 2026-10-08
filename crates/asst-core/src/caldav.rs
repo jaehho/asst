@@ -153,7 +153,8 @@ pub async fn send_as(
 ) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
     use http_body_util::BodyExt;
     let client = https_client()?;
-    req.headers_mut().insert(USER_AGENT, HeaderValue::from_static(agent));
+    req.headers_mut()
+        .insert(USER_AGENT, HeaderValue::from_static(agent));
     let resp = tokio::time::timeout(TIMEOUT, client.request(req))
         .await
         .map_err(|_| RemoteError::Network("timed out".into()))?

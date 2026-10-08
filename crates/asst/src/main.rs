@@ -11,11 +11,11 @@ use asst_core::api::{
     AddSpec, Added, AsstProxy, Change, LinkView, ListChange, ListSpec, ListView, Settings,
     SettingsChange, StatusView, SyncState, TaskView,
 };
+use asst_core::fmt;
 use asst_core::store::{Query, Store, View};
 use asst_core::sync::Report;
 use asst_core::task::priority_level;
 use asst_core::track;
-use asst_core::fmt;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
@@ -43,9 +43,7 @@ enum Cmd {
     /// Due after today
     Upcoming,
     /// Open tasks, in one list or all
-    Ls {
-        list: Option<String>,
-    },
+    Ls { list: Option<String> },
     /// Completed tasks, newest first
     Completed {
         list: Option<String>,

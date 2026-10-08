@@ -296,9 +296,7 @@ pub fn build_column(
     {
         let scroll = scroll.clone();
         glib::idle_add_local_once(move || {
-            scroll
-                .vadjustment()
-                .set_value(7.5 * f64::from(HOUR_H));
+            scroll.vadjustment().set_value(7.5 * f64::from(HOUR_H));
         });
     }
 

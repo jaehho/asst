@@ -11,10 +11,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use asst_core::api::{Change, ListView, TaskView};
-use asst_core::nominatim::Place;
-use asst_core::task::priority_level;
-use asst_core::task::LocationAlarm;
 use asst_core::fmt;
+use asst_core::nominatim::Place;
+use asst_core::task::LocationAlarm;
+use asst_core::task::priority_level;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{self, gdk, glib, pango};
 
@@ -468,7 +468,9 @@ impl Editor {
                             let weak = weak.clone();
                             Rc::new(move |place: Place| {
                                 let Some(e) = weak.upgrade() else { return };
-                                let Some(t) = e.task.borrow().clone() else { return };
+                                let Some(t) = e.task.borrow().clone() else {
+                                    return;
+                                };
                                 let mut list = t.task.location_alarms.clone();
                                 list.push(LocationAlarm {
                                     uid: String::new(),

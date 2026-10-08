@@ -3,8 +3,8 @@
 //! the app, and for no more than a request a second; a search is one request.
 
 use http::{Method, Request};
-use serde::Serialize;
 use serde::Deserialize;
+use serde::Serialize;
 
 use crate::caldav::{self, RemoteError};
 
@@ -28,7 +28,11 @@ struct RawPlace {
     lon: String,
 }
 
-const AGENT: &str = concat!("asst/", env!("CARGO_PKG_VERSION"), " (github.com/jaehho/asst)");
+const AGENT: &str = concat!(
+    "asst/",
+    env!("CARGO_PKG_VERSION"),
+    " (github.com/jaehho/asst)"
+);
 
 pub async fn search(query: &str) -> Result<Vec<Place>, RemoteError> {
     let query = query.trim();
@@ -48,15 +52,20 @@ pub async fn search(query: &str) -> Result<Vec<Place>, RemoteError> {
     if !status.is_success() {
         return Err(caldav::status_error(status));
     }
-    let raw: Vec<RawPlace> = serde_json::from_slice(&body)
-        .map_err(|e| RemoteError::Protocol(e.to_string()))?;
+    let raw: Vec<RawPlace> =
+        serde_json::from_slice(&body).map_err(|e| RemoteError::Protocol(e.to_string()))?;
     Ok(raw
         .into_iter()
         .filter_map(|p| {
             let short = p.name.is_empty();
             Some(Place {
                 name: if short {
-                    p.display_name.split(',').next().unwrap_or("").trim().to_string()
+                    p.display_name
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
                 } else {
                     p.name
                 },
@@ -89,7 +98,10 @@ mod tests {
 
     #[test]
     fn queries_escape_but_stay_readable() {
-        assert_eq!(urlencoding_lite("Main St 5, Springfield"), "Main+St+5%2C+Springfield");
+        assert_eq!(
+            urlencoding_lite("Main St 5, Springfield"),
+            "Main+St+5%2C+Springfield"
+        );
         assert_eq!(urlencoding_lite("a.b~c_d-e"), "a.b~c_d-e");
     }
 }

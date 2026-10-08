@@ -26,7 +26,10 @@ trait Manager {
     fn get_client(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
-#[zbus::proxy(interface = "org.freedesktop.GeoClue2.Client", default_service = "org.freedesktop.GeoClue2")]
+#[zbus::proxy(
+    interface = "org.freedesktop.GeoClue2.Client",
+    default_service = "org.freedesktop.GeoClue2"
+)]
 trait Client {
     #[zbus(property)]
     fn set_desktop_id(&self, id: String) -> zbus::Result<()>;
@@ -36,14 +39,13 @@ trait Client {
     fn set_distance_threshold(&self, metres: u32) -> zbus::Result<()>;
     fn start(&self) -> zbus::Result<()>;
     #[zbus(signal)]
-    fn location_updated(
-        &self,
-        old: OwnedObjectPath,
-        new: OwnedObjectPath,
-    ) -> zbus::Result<()>;
+    fn location_updated(&self, old: OwnedObjectPath, new: OwnedObjectPath) -> zbus::Result<()>;
 }
 
-#[zbus::proxy(interface = "org.freedesktop.GeoClue2.Location", default_service = "org.freedesktop.GeoClue2")]
+#[zbus::proxy(
+    interface = "org.freedesktop.GeoClue2.Location",
+    default_service = "org.freedesktop.GeoClue2"
+)]
 trait Location {
     #[zbus(property)]
     fn latitude(&self) -> zbus::Result<f64>;
@@ -103,19 +105,21 @@ async fn one_round(
     inside: &Inside,
 ) -> Result<(), String> {
     // GeoClue sits on the system bus; the session one carries notifications.
-    let conn = zbus::Connection::system().await.map_err(|e| e.to_string())?;
-    let manager = ManagerProxy::new(&conn).await.map_err(|e| e.to_string())?;
-    let path = manager
-        .get_client()
+    let conn = zbus::Connection::system()
         .await
         .map_err(|e| e.to_string())?;
+    let manager = ManagerProxy::new(&conn).await.map_err(|e| e.to_string())?;
+    let path = manager.get_client().await.map_err(|e| e.to_string())?;
     let client = ClientProxy::builder(&conn)
         .path(path)
         .map_err(|e| e.to_string())?
         .build()
         .await
         .map_err(|e| e.to_string())?;
-    client.set_desktop_id("asst".into()).await.map_err(|e| e.to_string())?;
+    client
+        .set_desktop_id("asst".into())
+        .await
+        .map_err(|e| e.to_string())?;
     client
         .set_requested_accuracy_level(4)
         .await

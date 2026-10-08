@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use asst_core::api::{
-    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings,
-    SettingsChange, StatusView, SyncState, TaskView, short_ids,
+    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings, SettingsChange,
+    StatusView, SyncState, TaskView, short_ids,
 };
 use asst_core::caldav::{self, Account, CalDav, RemoteError};
 use asst_core::config::{self, AccountConfig, Config};

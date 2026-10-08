@@ -1347,12 +1347,8 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
                 now(),
             )
             .unwrap();
-        s.create(
-            "work",
-            &[Edit::Summary("Someday".into())],
-            now(),
-        )
-        .unwrap();
+        s.create("work", &[Edit::Summary("Someday".into())], now())
+            .unwrap();
         s.put_server("/cal/inbox/", "/cal/inbox/a.ics", "\"e1\"", SERVER, now())
             .unwrap();
 

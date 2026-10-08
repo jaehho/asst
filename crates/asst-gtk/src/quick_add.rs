@@ -84,11 +84,7 @@ impl Component for QuickAdd {
         window
     }
 
-    fn init(
-        _: (),
-        root: gtk::Window,
-        sender: ComponentSender<Self>,
-    ) -> ComponentParts<Self> {
+    fn init(_: (), root: gtk::Window, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let card = {
             let (add, close) = (sender.clone(), sender.clone());
             AddCard::new(

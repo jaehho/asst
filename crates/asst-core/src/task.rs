@@ -253,11 +253,7 @@ fn location_alarm(alarm: &Component) -> Option<LocationAlarm> {
             .find_map(|kv| kv.strip_prefix("u="))
             .and_then(|u| u.trim_end_matches('m').parse::<u32>().ok())
             .unwrap_or(100);
-        (
-            lat.trim().parse().ok()?,
-            lon.trim().parse().ok()?,
-            radius,
-        )
+        (lat.trim().parse().ok()?, lon.trim().parse().ok()?, radius)
     };
     Some(LocationAlarm {
         uid: alarm
@@ -298,8 +294,22 @@ fn location_valarm(a: &LocationAlarm) -> Component {
         format!("geo:{},{}?u={}", a.lat, a.lon, a.radius),
     )
     .with_param("VALUE", "URI")
-    .with_param("X-ADDRESS", if a.address.is_empty() { &a.title } else { &a.address })
-    .with_param("X-TITLE", if a.title.is_empty() { "Location" } else { &a.title });
+    .with_param(
+        "X-ADDRESS",
+        if a.address.is_empty() {
+            &a.title
+        } else {
+            &a.address
+        },
+    )
+    .with_param(
+        "X-TITLE",
+        if a.title.is_empty() {
+            "Location"
+        } else {
+            &a.title
+        },
+    );
     alarm.set(loc);
     alarm
 }
@@ -783,7 +793,10 @@ UID:6C2F3A0B\r\nX-WR-ALARMUID:6C2F3A0B\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALEND
                 date: NaiveDate::from_ymd_opt(2026, 9, 20).unwrap()
             })
         );
-        assert!(ical.to_string().contains("DTSTART;TZID=America/New_York:20260915T090000\r\n"));
+        assert!(
+            ical.to_string()
+                .contains("DTSTART;TZID=America/New_York:20260915T090000\r\n")
+        );
     }
 
     #[test]
@@ -1061,7 +1074,10 @@ X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Home:geo:40.7,-74.0\r\nEND:VALARM\
         assert!(t.location_alarms[1].uid.len() == 36, "a new UID");
         let out = ical.to_string();
         assert!(out.contains("u=250"), "{out}");
-        assert!(out.contains("UID:6C2F3A0B\r\n"), "the timed alarm stays: {out}");
+        assert!(
+            out.contains("UID:6C2F3A0B\r\n"),
+            "the timed alarm stays: {out}"
+        );
         assert_eq!(out.matches("X-APPLE-PROXIMITY:ARRIVE\r\n").count(), 2);
         // Saving the same list again changes nothing.
         let (again, _) = edited(&out, &[Edit::LocationAlarms(t.location_alarms)]);
