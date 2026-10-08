@@ -175,11 +175,6 @@ impl Nav {
             _ => Sort::Due,
         }
     }
-
-    /// The day plan draws its own timeline; the others are lists of rows.
-    pub fn is_timeline(&self) -> bool {
-        matches!(self, Nav::Time | Nav::Plan)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -397,7 +392,10 @@ pub fn retarget(task: &Task, q: Quadrant, today: NaiveDate, zone: Tz) -> Change 
     if q.important() != is_important {
         c.priority = Some(if q.important() { 2 } else { 3 });
     }
-    let is_urgent = task.due.as_ref().is_some_and(|d| d.local_date(zone) <= today);
+    let is_urgent = task
+        .due
+        .as_ref()
+        .is_some_and(|d| d.local_date(zone) <= today);
     if q.urgent() != is_urgent {
         if q.urgent() {
             c.due = Some(Some(on_date(task.due.as_ref(), today, zone)));
@@ -616,17 +614,13 @@ pub fn plan(nav: &Nav, data: &Data, opts: &ViewOpts, now: DateTime<Tz>) -> Vec<S
         Nav::Time => {
             // The day timeline is drawn from `blocks`, not tasks. One empty
             // kept section so the column still has a day header.
-            out.push(
-                Section::new(Kind::Day(today), Some("Tracked".into()), Vec::new()).keep(),
-            );
+            out.push(Section::new(Kind::Day(today), Some("Tracked".into()), Vec::new()).keep());
         }
         Nav::Plan => {
             // The timeline is drawn from `day_plan`; the tray is its own
             // column beside it. One kept section so the day still has a
             // header in the shared shape.
-            out.push(
-                Section::new(Kind::Day(today), Some("Plan".into()), Vec::new()).keep(),
-            );
+            out.push(Section::new(Kind::Day(today), Some("Plan".into()), Vec::new()).keep());
         }
         Nav::Matrix => {
             let mut boxes: [Vec<TaskView>; 4] = Default::default();
@@ -968,14 +962,17 @@ pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> Day
     let day = |t: &TaskView| t.task.due.as_ref().map(|d| d.local_date(zone));
     let mut tray: Vec<TaskView> = open
         .iter()
-        .filter(|t| {
-            !placed.contains(t.task.uid.as_str()) && day(t).is_some_and(|d| d <= today)
-        })
+        .filter(|t| !placed.contains(t.task.uid.as_str()) && day(t).is_some_and(|d| d <= today))
         .cloned()
         .collect();
     tray.sort_by_key(|t| {
         let d = day(t);
-        (d.is_none(), d, priority_level(t.task.priority), t.task.uid.clone())
+        (
+            d.is_none(),
+            d,
+            priority_level(t.task.priority),
+            t.task.uid.clone(),
+        )
     });
 
     DayPlan {
@@ -984,9 +981,7 @@ pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> Day
         blocks,
         tray,
         now_min: Some(
-            u32::from(now.time().hour()) * 60
-                + u32::from(now.time().minute())
-                + u32::from(now.time().second() > 30),
+            now.time().hour() * 60 + now.time().minute() + u32::from(now.time().second() > 30),
         ),
     }
 }

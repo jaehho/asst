@@ -128,14 +128,8 @@ impl Prefs {
         if let Some(keys) = &mut p.sidebar {
             let has_plan = keys.iter().any(|k| k == "plan");
             let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
-            const BEFORE_PLAN: [&str; 6] = [
-                "inbox",
-                "today",
-                "matrix",
-                "scheduled",
-                "time",
-                "completed",
-            ];
+            const BEFORE_PLAN: [&str; 6] =
+                ["inbox", "today", "matrix", "scheduled", "time", "completed"];
             if !has_plan && stock == BEFORE_PLAN {
                 *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
             }
@@ -235,9 +229,8 @@ mod tests {
         // gain Matrix (and then Time, and Plan).
         let custom = Prefs::parse("sidebar = [\"today\", \"inbox\"]\n");
         assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
-        let stock = Prefs::parse(
-            "sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n",
-        );
+        let stock =
+            Prefs::parse("sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n");
         assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
         // Stock five with Matrix gains Time and Plan once.
         let with_matrix = Prefs::parse(

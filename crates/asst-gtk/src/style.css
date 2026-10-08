@@ -959,3 +959,81 @@ button.pill {
 .time-hour-slot {
   border-top: 1px solid alpha(@borders, 0.55);
 }
+
+/* Plan view: the day timeline and the unscheduled tray. */
+.plan-columns {
+  min-height: 320px;
+}
+
+.plan-scroll {
+  min-width: 280px;
+}
+
+.plan-tray {
+  min-width: 220px;
+  max-width: 300px;
+}
+
+.plan-tray-scroll {
+  margin-top: 4px;
+}
+
+.plan-block-row {
+  margin-left: 2px;
+  margin-right: 2px;
+}
+
+.plan-block {
+  border-radius: 6px;
+  padding: 2px 6px;
+  border-left-width: 3px;
+  border-left-style: solid;
+  background: alpha(@accent_color, 0.18);
+  border-left-color: @accent_color;
+  color: #fff;
+}
+
+.plan-block.tint-orange {
+  background: var(--event-orange);
+  border-left-color: var(--event-orange);
+}
+.plan-block.tint-purple {
+  background: var(--event-purple);
+  border-left-color: var(--event-purple);
+}
+.plan-block.tint-blue {
+  background: var(--event-blue);
+  border-left-color: var(--event-blue);
+}
+.plan-block.tint-green {
+  background: var(--event-green);
+  border-left-color: var(--event-green);
+}
+
+.plan-block.running {
+  box-shadow: 0 0 0 2px alpha(@destructive_color, 0.7);
+}
+
+.plan-block-title {
+  color: #fff;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.plan-block-meta {
+  color: #fff;
+  font-size: 10px;
+  opacity: 0.9;
+}
+
+.plan-block-edge {
+  min-height: 4px;
+  opacity: 0.5;
+  background: alpha(#fff, 0.35);
+  border-radius: 0 0 6px 6px;
+}
+
+.plan-view.focusing .plan-tray > row.task-row:not(.editing),
+.plan-view.focusing .plan-block {
+  opacity: 0.55;
+}

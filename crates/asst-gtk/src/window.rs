@@ -9,13 +9,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use asst_core::api::{
-    AddSpec, Added, Change, ListChange, ListSpec, ListView, Settings, SettingsChange,
-    StatusView, SyncState, TaskView, query,
+    AddSpec, Added, Change, ListChange, ListSpec, ListView, Settings, SettingsChange, StatusView,
+    SyncState, TaskView, query,
 };
 use asst_core::fmt;
 use asst_core::store::{Query, View};
 use asst_core::time::When;
-use chrono::{DateTime, Duration as Days, NaiveDate, Utc};
+use chrono::{DateTime, Duration as Days, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use futures_util::StreamExt;
 use relm4::adw::prelude::*;
@@ -149,6 +149,10 @@ pub enum Msg {
     DropTask(String, Nav),
     /// Dropped on a matrix box: move priority and due so it lands there.
     DropQuadrant(String, Quadrant),
+    /// Place or move a day-plan slot: href, start minutes, duration minutes.
+    PlanSet(String, u32, u32),
+    /// Take a task off the day plan.
+    PlanUnplace(String),
     Add(Box<AddSpec>),
     ShowAdd(Option<Target>),
     HideAdd,
@@ -1149,6 +1153,24 @@ impl Component for Window {
                         ));
                     }
                     Nav::Completed => sender.input(Msg::Complete(href)),
+                    // Dropped on Plan: give it the next free half hour.
+                    Nav::Plan => {
+                        let today = self.now().date_naive();
+                        let start = self
+                            .prefs
+                            .plan
+                            .iter()
+                            .filter(|s| s.date == today)
+                            .map(|s| s.start + s.duration)
+                            .max()
+                            .unwrap_or(9 * 60)
+                            .max(7 * 60);
+                        sender.input(Msg::PlanSet(
+                            href,
+                            start.min(22 * 60),
+                            model::PLAN_DEFAULT_DURATION,
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -1164,6 +1186,27 @@ impl Component for Window {
                 sender.oneshot_command(async move {
                     Cmd::Toast(client::edit(&href, &change).await.map(|_| said))
                 });
+            }
+            Msg::PlanSet(href, start, duration) => {
+                let today = self.now().date_naive();
+                if crate::plan::apply_slot(
+                    &mut self.prefs,
+                    &self.open,
+                    &href,
+                    today,
+                    start,
+                    duration,
+                ) {
+                    self.prefs.save();
+                    self.shown = 0;
+                }
+            }
+            Msg::PlanUnplace(href) => {
+                let today = self.now().date_naive();
+                if crate::plan::drop_slot(&mut self.prefs, &self.open, &href, today) {
+                    self.prefs.save();
+                    self.shown = 0;
+                }
             }
             Msg::Add(spec) => {
                 sender.oneshot_command(async move { Cmd::Added(client::add(&spec).await) });
@@ -2452,6 +2495,16 @@ impl Window {
         self.dirty = false;
         let tx: Tx = sender.input_sender().clone();
         let now = self.now();
+        // A slot is window-local and follows its task: when the task goes,
+        // the slot goes. Only once the open set is real, or a start-up
+        // with nothing loaded would clear every slot.
+        if self.loaded {
+            let live: std::collections::HashSet<&str> =
+                self.open.iter().map(|t| t.task.uid.as_str()).collect();
+            if self.prefs.prune_plan(&live) {
+                self.prefs.save();
+            }
+        }
         let (lists, open, completed) = self.view_data();
         let data = Data {
             lists: &lists,
@@ -2460,6 +2513,7 @@ impl Window {
             sunday_first: self.prefs.sunday_first,
         };
         let counts = Counts::new(&data, &self.prefs.plan, now);
+        let day = model::day_plan(&open, &self.prefs.plan, now);
         if let Some(tray) = &w.tray {
             tray.set(tray::State {
                 overdue: counts.overdue,
@@ -2518,7 +2572,9 @@ impl Window {
             }
             let here = sections
                 .iter()
-                .any(|s| s.tasks.iter().any(|t| t.href == href));
+                .any(|s| s.tasks.iter().any(|t| t.href == href))
+                || day.blocks.iter().any(|b| b.task.href == href)
+                || day.tray.iter().any(|t| t.href == href);
             if !here && !typing {
                 self.close_editor(w, sender);
             }
@@ -2559,6 +2615,23 @@ impl Window {
                 for b in &self.blocks {
                     (b.start, b.end, &b.label, b.planned).hash(&mut h);
                 }
+            }
+            // Plan blocks come from the window's slots.
+            if self.nav == Nav::Plan {
+                for s in &self.prefs.plan {
+                    (&s.uid, s.date, s.start, s.duration).hash(&mut h);
+                }
+                for b in &day.blocks {
+                    (&b.task.href, b.start, b.duration, b.col, b.cols).hash(&mut h);
+                }
+                for t in &day.tray {
+                    if self.editing.as_deref() == Some(t.href.as_str()) {
+                        t.href.hash(&mut h);
+                    } else {
+                        serde_json::to_string(t).unwrap_or_default().hash(&mut h);
+                    }
+                }
+                day.now_min.hash(&mut h);
             }
             counts.of(&self.nav).hash(&mut h);
             for s in &sections {
@@ -2634,6 +2707,7 @@ impl Window {
                     lists: &self.lists,
                     blocks: &self.blocks,
                     time_day: self.time_day,
+                    plan: &day,
                     archived: self.nav_archived(),
                     now,
                     completing: &self.completing.keys().cloned().collect(),
@@ -2816,6 +2890,29 @@ impl Window {
             "open" => {
                 if let Some(h) = task(arg) {
                     sender.input(Msg::Open(h));
+                }
+            }
+            // `plan <words> at HH:MM [minutes]` places it; `planoff <words>`
+            // takes it off the day plan.
+            "plan" => {
+                let Some((words, rest)) = arg.split_once(" at ") else {
+                    return;
+                };
+                let Some(h) = task(words) else { return };
+                let mut parts = rest.split_whitespace();
+                let Some(at) = parts.next().and_then(model::parse_time) else {
+                    return;
+                };
+                let start = at.hour() * 60 + at.minute();
+                let duration = parts
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(model::PLAN_DEFAULT_DURATION);
+                sender.input(Msg::PlanSet(h, start, duration));
+            }
+            "planoff" => {
+                if let Some(h) = task(arg) {
+                    sender.input(Msg::PlanUnplace(h));
                 }
             }
             // As Quick Find does: go to the task's list and open it.

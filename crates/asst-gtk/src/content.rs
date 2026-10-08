@@ -11,7 +11,7 @@ use relm4::adw::prelude::*;
 use relm4::gtk::{self, gdk, glib};
 
 use crate::addcard::Target;
-use crate::model::{Kind, Nav, Quadrant, Section};
+use crate::model::{DayPlan, Kind, Nav, Quadrant, Section};
 use crate::pickers::{self, DateOpts};
 use crate::row::{self, RowOpts};
 use crate::window::{Msg, Tx};
@@ -24,6 +24,8 @@ pub struct Opts<'a> {
     pub blocks: &'a [asst_core::api::BlockView],
     /// Day the Time view is showing.
     pub time_day: chrono::NaiveDate,
+    /// Placed slots, the tray and the now-line, for the Plan view.
+    pub plan: &'a DayPlan,
     /// The view is a list that was archived.
     pub archived: bool,
     pub now: DateTime<Tz>,
@@ -77,8 +79,10 @@ pub fn section_target(kind: &Kind) -> Option<Target> {
 }
 
 pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Built {
-    if matches!(o.nav, Nav::Time) {
-        return crate::time::build_column(o, sections, tx);
+    match o.nav {
+        Nav::Time => return crate::time::build_column(o, sections, tx),
+        Nav::Plan => return crate::plan::build_column(o, sections, tx),
+        _ => {}
     }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("view-column");

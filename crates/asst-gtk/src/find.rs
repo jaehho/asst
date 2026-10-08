@@ -288,7 +288,7 @@ pub fn open(
             let tasks: Vec<&TaskView> = open
                 .iter()
                 .filter(|t| {
-                    matches(&t.task.summary) || t.task.description.as_deref().is_some_and(&matches)
+                    matches(&t.task.summary) || t.task.description.as_deref().is_some_and(matches)
                 })
                 .take(40)
                 .collect();

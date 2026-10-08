@@ -13,6 +13,7 @@ mod model;
 mod motion;
 mod notes;
 mod pickers;
+mod plan;
 mod prefs;
 mod quick_add;
 mod row;
