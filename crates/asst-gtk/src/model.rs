@@ -858,11 +858,11 @@ pub fn reorder(tasks: &[TaskView], moved: &str, target: &str, after: bool) -> Ve
 // -- day plan ----------------------------------------------------------------
 
 /// First hour row of the Plan grid (inclusive).
-pub const PLAN_HOUR_START: u32 = 7;
+pub const PLAN_HOUR_START: u32 = 0;
 /// End of the Plan grid (exclusive): rows run `PLAN_HOUR_START..PLAN_HOUR_END`.
-/// 23 so a now-line after 22:00 still sits on the grid; the day still
-/// reads as 07:00–22:00 because the last labeled hour is 10 PM.
-pub const PLAN_HOUR_END: u32 = 23;
+/// The whole day, so an early or late hour is on the grid and the now-line
+/// always has a place; the column scrolls rather than cropping the day.
+pub const PLAN_HOUR_END: u32 = 24;
 /// Minutes a newly placed task holds until its edge is dragged.
 pub const PLAN_DEFAULT_DURATION: u32 = 30;
 /// Shortest slot the plan keeps. The grid may still draw one shorter higher.
@@ -925,6 +925,13 @@ pub fn minutes_at(y: f64, hour_start: u32) -> u32 {
     snap(mins as i32)
 }
 
+/// y on the grid for `mins` minutes from midnight. The inverse of
+/// `minutes_at` before snapping; widgets draw from this so the grid and
+/// the placement math cannot drift apart.
+pub fn y_at(mins: u32, hour_start: u32) -> f64 {
+    f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR
+}
+
 /// Start a block at `start` would move to, `dy` pixels down the grid.
 pub fn move_start(start: u32, dy: f64) -> u32 {
     snap(start as i32 + dy_minutes(dy))
@@ -954,10 +961,27 @@ pub fn place_start(now_min: Option<u32>, hour_start: u32) -> u32 {
 }
 
 /// `now` in minutes if it falls on the grid `hour_start..hour_end`, else
-/// none: the now-line must not pin itself to a rule it is not on.
+/// none: the now-line must not pin itself to a rule it is not on. The
+/// minute is capped at 24:00 − 1 so a rounding past midnight still lands
+/// on the last rule of a full-day grid.
 pub fn now_on_grid(now: DateTime<Tz>, hour_start: u32, hour_end: u32) -> Option<u32> {
     let mins = now.time().hour() * 60 + now.time().minute() + u32::from(now.time().second() > 30);
+    let mins = mins.min(24 * 60 - 1);
     (mins >= hour_start * 60 && mins < hour_end * 60).then_some(mins)
+}
+
+/// Grid height in pixels for hours `hour_start..hour_end`.
+pub fn grid_height(hour_start: u32, hour_end: u32) -> f64 {
+    f64::from(hour_end.saturating_sub(hour_start).max(1)) * PLAN_PX_PER_HOUR
+}
+
+/// Scroll offset that keeps `mins` in a viewport of `view_h` pixels,
+/// slightly above center so the hours after it stay visible. Clamped to
+/// the grid. `hour_start` is the grid's first hour, as in `minutes_at`.
+pub fn scroll_to_min(mins: u32, hour_start: u32, hour_end: u32, view_h: f64) -> f64 {
+    let y = f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR;
+    let max = (grid_height(hour_start, hour_end) - view_h.max(0.0)).max(0.0);
+    (y - view_h / 3.0).clamp(0.0, max)
 }
 
 /// The block a drop of `task` at `start` for `duration` would create.
@@ -2134,11 +2158,41 @@ mod tests {
         assert_eq!(now_on_grid(on(23, 0, 0), 7, 23), None);
         // Seconds round the minute the same way the grid does.
         assert_eq!(now_on_grid(on(10, 0, 40), 7, 23), Some(10 * 60 + 1));
+        // A full-day grid holds every minute, including the round past midnight.
+        assert_eq!(now_on_grid(on(0, 0, 0), 0, 24), Some(0));
+        assert_eq!(now_on_grid(on(0, 59, 0), 0, 24), Some(59));
+        assert_eq!(now_on_grid(on(23, 59, 0), 0, 24), Some(23 * 60 + 59));
+        assert_eq!(now_on_grid(on(23, 59, 40), 0, 24), Some(24 * 60 - 1));
         // day_plan carries the rule through.
         let p = day_plan(&[], &[], on(0, 59, 0));
-        assert_eq!(p.now_min, None);
+        assert_eq!(p.now_min, Some(59));
         let p = day_plan(&[], &[], on(10, 0, 0));
         assert_eq!(p.now_min, Some(10 * 60));
+    }
+
+    #[test]
+    fn scroll_keeps_now_in_view_without_leaving_the_grid() {
+        // 00:00–24:00 is 864 px tall at the shared scale.
+        assert_eq!(grid_height(0, 24), 24.0 * PLAN_PX_PER_HOUR);
+        assert_eq!(grid_height(7, 23), 16.0 * PLAN_PX_PER_HOUR);
+        let day = grid_height(0, 24);
+        // Morning: already in view from the top, never a negative offset.
+        assert_eq!(scroll_to_min(0, 0, 24, 400.0), 0.0);
+        // The line sits a third down the viewport so the hours after it show.
+        let y = scroll_to_min(10 * 60, 0, 24, 400.0);
+        let want = 10.0 * PLAN_PX_PER_HOUR - 400.0 / 3.0;
+        assert_eq!(y, want);
+        // Late enough that the bottom of the day is the limit.
+        assert_eq!(scroll_to_min(24 * 60 - 1, 0, 24, 400.0), day - 400.0);
+        // A viewport taller than the day has nowhere to scroll.
+        assert_eq!(scroll_to_min(12 * 60, 0, 24, day + 10.0), 0.0);
+        // An hour_start offset moves y, as minutes_at does. 10:00 on a
+        // 07:00 grid is 3 h in, less than the third-viewport lift, so the
+        // top rule is where the scroller rests.
+        let y7 = scroll_to_min(10 * 60, 7, 23, 400.0);
+        assert_eq!(y7, (3.0 * PLAN_PX_PER_HOUR - 400.0 / 3.0).max(0.0));
+        let y7 = scroll_to_min(14 * 60, 7, 23, 400.0);
+        assert_eq!(y7, 7.0 * PLAN_PX_PER_HOUR - 400.0 / 3.0);
     }
 
     #[test]
@@ -2155,7 +2209,7 @@ mod tests {
 
     #[test]
     fn pointer_y_snaps_to_the_grid() {
-        // 07:00 at the top of the grid.
+        // 07:00 at the top of a grid that starts at 7.
         assert_eq!(minutes_at(0.0, 7), 7 * 60);
         assert_eq!(minutes_at(PLAN_PX_PER_HOUR, 7), 8 * 60);
         // Half an hour, a quarter, and a point that snaps up.
@@ -2166,6 +2220,13 @@ mod tests {
         assert_eq!(move_start(9 * 60, PLAN_PX_PER_HOUR), 10 * 60);
         assert_eq!(move_start(9 * 60, -PLAN_PX_PER_HOUR / 2.0), 8 * 60 + 30);
         assert_eq!(edge_end(9 * 60, 30, PLAN_PX_PER_HOUR / 2.0), 10 * 60);
+        // y_at is the same mapping the widgets use: midnight at y 0 on a
+        // full-day grid, and each hour one PLAN_PX_PER_HOUR further down.
+        assert_eq!(y_at(0, 0), 0.0);
+        assert_eq!(y_at(10 * 60, 0), 10.0 * PLAN_PX_PER_HOUR);
+        assert_eq!(y_at(10 * 60, 7), 3.0 * PLAN_PX_PER_HOUR);
+        // A snapped minute round-trips through the shared scale.
+        assert_eq!(minutes_at(y_at(9 * 60, 0), 0), 9 * 60);
     }
 
     #[test]
@@ -2176,7 +2237,7 @@ mod tests {
             assert_eq!((g.start, g.duration, g.col, g.cols), (hour * 60, 30, 0, 1));
         }
         // The pointer path and the ghost agree at an hour.
-        let y = f64::from(10 * 60 - 7 * 60) / 60.0 * PLAN_PX_PER_HOUR;
+        let y = y_at(10 * 60, PLAN_HOUR_START);
         let start = minutes_at(y, PLAN_HOUR_START);
         let g = ghost_block(&[], &t, start, PLAN_DEFAULT_DURATION);
         assert_eq!(g.start, 10 * 60);

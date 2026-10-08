@@ -56,7 +56,7 @@ fn tint_for(priority: u8) -> &'static str {
 }
 
 fn block_top(b: &PlanBlock, hour_start: u32) -> i32 {
-    (f64::from(b.start) / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR) as i32
+    model::y_at(b.start, hour_start) as i32
 }
 
 fn block_height(b: &PlanBlock) -> i32 {
@@ -451,7 +451,7 @@ pub fn ghost_off() {
 
 fn day_grid(p: &DayPlan, tx: &Tx, rows: &mut Vec<(String, gtk::Widget)>) -> gtk::Widget {
     let hours = p.hour_end.saturating_sub(p.hour_start).max(1);
-    let height = i32::try_from(hours).unwrap_or(15) * PLAN_PX_PER_HOUR as i32;
+    let height = i32::try_from(hours).unwrap_or(24) * PLAN_PX_PER_HOUR as i32;
     let hour_h = PLAN_PX_PER_HOUR as i32;
 
     let gutter = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -487,11 +487,10 @@ fn day_grid(p: &DayPlan, tx: &Tx, rows: &mut Vec<(String, gtk::Widget)>) -> gtk:
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&rules));
-    // The now-line only claims a place that is actually now: outside the
-    // grid it is gone, never pinned to the top rule.
+    // On a full-day grid the now-line is always at its minute. It only
+    // stays off the widget when `now` is not on the viewed day at all.
     if let Some(mins) = p.now_min {
-        let y =
-            f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(p.hour_start) * PLAN_PX_PER_HOUR;
+        let y = model::y_at(mins, p.hour_start);
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
@@ -538,7 +537,8 @@ fn day_grid(p: &DayPlan, tx: &Tx, rows: &mut Vec<(String, gtk::Widget)>) -> gtk:
                 }
                 None => ghost.hide(),
             }
-            gdk::DragAction::MOVE | gdk::DragAction::COPY
+            // One preferred action: the gesture itself is a move of the slot.
+            gdk::DragAction::MOVE
         });
     }
     {
@@ -656,6 +656,14 @@ fn tray(
     b
 }
 
+// Where the timeline scroller sits, and for which local day. A rebuild
+// keeps the reader's place; opening Plan or stepping onto a new day
+// re-centers on now instead.
+thread_local! {
+    static SCROLL: std::cell::Cell<(f64, Option<chrono::NaiveDate>)> =
+        const { std::cell::Cell::new((f64::NAN, None)) };
+}
+
 /// The Plan column: timeline on the left, unscheduled tray on the right,
 /// and the open task's card under the header when one is open.
 pub fn build_column(
@@ -726,12 +734,52 @@ pub fn build_column(
     root.append(&cols);
 
     {
-        let scroll = scroll.clone();
-        glib::idle_add_local_once(move || {
-            // 07:00 at the top: the day is meant to be read at a glance,
-            // and the 07:00–22:00 grid nearly fits as it is.
-            scroll.vadjustment().set_value(0.0);
-        });
+        // Keep the reader's place across rebuilds; only open and a new day
+        // ask for the now-line. The adjustment only knows its page once the
+        // scroller is allocated, so placement waits on `upper` and retries.
+        let today = o.now.date_naive();
+        let recenter = o.fresh.view || SCROLL.with(|s| s.get().1) != Some(today);
+        let now_min = p.now_min;
+        let (hour_start, hour_end) = (p.hour_start, p.hour_end);
+        let placed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let place = {
+            let (scroll, placed) = (scroll.clone(), placed.clone());
+            move || {
+                if placed.get() {
+                    return;
+                }
+                let vadj = scroll.vadjustment();
+                let view_h = vadj.page_size();
+                // A recenter needs the real page; restoring does too, so
+                // that the value lands in the same coordinate space.
+                if view_h <= 0.0 {
+                    return;
+                }
+                let y = if recenter {
+                    now_min.map_or(0.0, |m| {
+                        model::scroll_to_min(m, hour_start, hour_end, view_h)
+                    })
+                } else {
+                    let kept = SCROLL.with(|s| s.get().0);
+                    if kept.is_finite() { kept } else { 0.0 }
+                };
+                vadj.set_value(y);
+                SCROLL.with(|s| s.set((y, Some(today))));
+                placed.set(true);
+            }
+        };
+        {
+            let place = place.clone();
+            scroll.vadjustment().connect_upper_notify(move |_| place());
+        }
+        {
+            let place = place.clone();
+            scroll.connect_map(move |_| place());
+        }
+        glib::idle_add_local_once(place);
+        scroll
+            .vadjustment()
+            .connect_value_changed(move |a| SCROLL.with(|s| s.set((a.value(), Some(today)))));
     }
 
     content::Built { root, rows }
