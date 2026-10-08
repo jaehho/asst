@@ -9,8 +9,9 @@ use crate::row::DRAG_PREFIX;
 use crate::window::{Msg, Tx};
 use crate::{content, row, ui};
 
-/// Pixels per hour on the day grid (as in Time).
-const HOUR_H: i32 = 52;
+/// Pixels per hour on the day grid. Lower than Time's 52 so the default
+/// day fits the column and reads at a glance.
+const HOUR_H: i32 = 36;
 /// Width of the hour-label gutter.
 const GUTTER: i32 = 56;
 /// Height floor so a short slot is still clickable.
@@ -156,6 +157,9 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, tx: &Tx) -> gtk::Widget {
         let tx = tx.clone();
         click.connect_pressed(move |gesture, _, _, _| {
             let pop = slot_popover(&href, start, duration, &tx);
+            if let Some(w) = gesture.widget() {
+                pop.set_parent(&w);
+            }
             gesture.set_state(gtk::EventSequenceState::Claimed);
             pop.popup();
         });
@@ -277,6 +281,23 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&rules));
+    {
+        let y = p.now_min.map_or(200.0, |mins| {
+            f64::from(mins) / 60.0 * f64::from(HOUR_H) - f64::from(p.hour_start) * f64::from(HOUR_H)
+        });
+        let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        wrap.set_halign(gtk::Align::Fill);
+        wrap.set_valign(gtk::Align::Start);
+        wrap.set_hexpand(true);
+        wrap.set_margin_top(y.clamp(0.0, f64::from(height) - 8.0) as i32);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        line.add_css_class("time-now");
+        line.add_css_class("plan-now");
+        line.set_hexpand(true);
+        line.set_height_request(3);
+        wrap.append(&line);
+        overlay.add_overlay(&wrap);
+    }
     for b in &p.blocks {
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
@@ -312,28 +333,6 @@ fn day_grid(p: &DayPlan, tx: &Tx) -> gtk::Widget {
         });
     }
     overlay.add_controller(target);
-
-    if let Some(mins) = p.now_min {
-        let y = f64::from(mins) / 60.0 * f64::from(HOUR_H)
-            - f64::from(p.hour_start) * f64::from(HOUR_H);
-        if y >= 0.0 && y <= f64::from(height) {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            row.add_css_class("time-now-row");
-            row.set_halign(gtk::Align::Fill);
-            row.set_valign(gtk::Align::Start);
-            row.set_margin_top((y - 7.0) as i32);
-            let dot = gtk::Label::new(Some("●"));
-            dot.add_css_class("time-now-dot");
-            row.append(&dot);
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            line.add_css_class("time-now");
-            line.set_valign(gtk::Align::Center);
-            line.set_hexpand(true);
-            line.set_height_request(2);
-            row.append(&line);
-            overlay.add_overlay(&row);
-        }
-    }
 
     let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     outer.add_css_class("plan-planner");
@@ -466,10 +465,14 @@ pub fn build_column(
 
     let cols = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     cols.add_css_class("plan-columns");
+    cols.set_vexpand(true);
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_hexpand(true);
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    // The day grid is taller than a short column; ask for most of a window
+    // so the overlay (blocks and the now-line) is allocated the full grid.
+    scroll.set_min_content_height(400);
     scroll.add_css_class("time-scroll");
     scroll.add_css_class("plan-scroll");
     scroll.set_child(Some(&day_grid(p, tx)));
@@ -479,11 +482,10 @@ pub fn build_column(
 
     {
         let scroll = scroll.clone();
-        let start = p.hour_start;
         glib::idle_add_local_once(move || {
-            // Center the morning, or follow the now-line when it is on screen.
-            let y = f64::from(start) * f64::from(HOUR_H);
-            scroll.vadjustment().set_value(y);
+            // 07:00 at the top: the day is meant to be read at a glance,
+            // and the 07:00–22:00 grid nearly fits as it is.
+            scroll.vadjustment().set_value(0.0);
         });
     }
 

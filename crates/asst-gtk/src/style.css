@@ -1037,3 +1037,8 @@ button.pill {
 .plan-view.focusing .plan-block {
   opacity: 0.55;
 }
+
+.plan-now {
+  background: @destructive_color;
+  min-height: 3px;
+}

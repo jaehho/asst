@@ -860,7 +860,9 @@ pub fn reorder(tasks: &[TaskView], moved: &str, target: &str, after: bool) -> Ve
 /// First hour row of the Plan grid (inclusive).
 pub const PLAN_HOUR_START: u32 = 7;
 /// End of the Plan grid (exclusive): rows run `PLAN_HOUR_START..PLAN_HOUR_END`.
-pub const PLAN_HOUR_END: u32 = 22;
+/// 23 so a now-line after 22:00 still sits on the grid; the day still
+/// reads as 07:00–22:00 because the last labeled hour is 10 PM.
+pub const PLAN_HOUR_END: u32 = 23;
 /// Minutes a newly placed task holds until its edge is dragged.
 pub const PLAN_DEFAULT_DURATION: u32 = 30;
 /// Shortest slot the plan keeps. The grid may still draw one shorter higher.
