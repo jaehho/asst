@@ -16,8 +16,6 @@ window {
   --p1: #ff7066;
   --p2: #ff9a14;
   --p3: #5297ff;
-  /* Warm attention (peach): the now-line, worth a glance not alarm. */
-  --now: #ff7800;
 }
 
 window.dark {
@@ -28,7 +26,6 @@ window.dark {
   --due-today: #57e389;
   --due-overdue: #ff6a8c;
   --done: #ffa348;
-  --now: #ffa348;
 }
 
 @keyframes spin {
@@ -856,7 +853,7 @@ menubutton.filtered > button {
   margin: 2px;
 }
 
-/* Time view: Google Calendar–style day planner. */
+/* Shared day grid (Time and Plan): hour rows, labels, now-line, day header. */
 .time-planner {
   margin-top: 8px;
 }
@@ -871,15 +868,52 @@ menubutton.filtered > button {
   opacity: 0.7;
 }
 
-.time-hour-line {
-  color: alpha(@borders, 0.55);
-  min-height: 1px;
-}
-
 .time-grid {
   background: transparent;
 }
 
+.time-hour-slot {
+  border-top: 1px solid alpha(@borders, 0.55);
+}
+
+/* The now-line is a steady-state violation of the red rule ("never spend
+   red on a steady state") — kept because the user asked for Time's red
+   line on both views. One style everywhere; the peach overlay is gone. */
+.time-now-row {
+  min-height: 12px;
+}
+
+.time-now {
+  color: @destructive_color;
+  min-height: 2px;
+  background: @destructive_color;
+}
+
+.time-now-dot {
+  color: @destructive_color;
+  font-size: 10px;
+  min-width: 10px;
+}
+
+.time-date {
+  font-weight: 600;
+  opacity: 0.9;
+}
+
+button.pill {
+  border-radius: 999px;
+  padding: 4px 12px;
+}
+
+.time-head {
+  margin-bottom: 2px;
+}
+
+.time-controls {
+  margin-left: 8px;
+}
+
+/* Time view chips: tracked blocks, tinted by label. */
 .time-block {
   border-radius: 6px;
   padding: 2px 6px;
@@ -925,44 +959,6 @@ menubutton.filtered > button {
   color: #fff;
   font-size: 10px;
   opacity: 0.9;
-}
-
-.time-now-row {
-  min-height: 12px;
-}
-
-.time-now {
-  color: @destructive_color;
-  min-height: 2px;
-  background: @destructive_color;
-}
-
-.time-now-dot {
-  color: @destructive_color;
-  font-size: 10px;
-  min-width: 10px;
-}
-
-.time-date {
-  font-weight: 600;
-  opacity: 0.9;
-}
-
-button.pill {
-  border-radius: 999px;
-  padding: 4px 12px;
-}
-
-.time-head {
-  margin-bottom: 2px;
-}
-
-.time-controls {
-  margin-left: 8px;
-}
-
-.time-hour-slot {
-  border-top: 1px solid alpha(@borders, 0.55);
 }
 
 /* Plan view: the day timeline and the unscheduled tray. */
@@ -1018,7 +1014,7 @@ button.pill {
 }
 
 .plan-block.running {
-  box-shadow: 0 0 0 2px alpha(var(--now), 0.7);
+  box-shadow: 0 0 0 2px alpha(@destructive_color, 0.7);
 }
 
 /* Provisional: the block a drag would drop, not one already placed.
@@ -1071,11 +1067,6 @@ button.pill {
 .plan-view.focusing .plan-tray > row.task-row:not(.editing),
 .plan-view.focusing .plan-block {
   opacity: 0.55;
-}
-
-.plan-now {
-  background: var(--now);
-  min-height: 3px;
 }
 
 .plan-time-label {

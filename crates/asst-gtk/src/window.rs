@@ -117,6 +117,8 @@ pub enum Msg {
     Navigate(Nav),
     /// Step the Time view by whole days (−1 yesterday, +1 tomorrow).
     TimeStep(i32),
+    /// Step the Plan view's day the same way.
+    PlanStep(i32),
     ToggleSidebar,
     Refresh,
     Tick,
@@ -153,9 +155,9 @@ pub enum Msg {
     PlanSet(String, u32, u32),
     /// Take a task off the day plan.
     PlanUnplace(String),
-    /// Undo a plan change: restore this slot, or take the task off when
-    /// there was none. Carries what the toast is holding.
-    PlanUndo(String, Option<(u32, u32)>),
+    /// Undo a plan change: restore this slot on `date`, or take the task
+    /// off when there was none. Carries what the toast is holding.
+    PlanUndo(String, chrono::NaiveDate, Option<(u32, u32)>),
     Add(Box<AddSpec>),
     ShowAdd(Option<Target>),
     HideAdd,
@@ -344,6 +346,9 @@ pub struct Window {
     blocks: Vec<asst_core::api::BlockView>,
     /// Which local day the Time view shows.
     time_day: chrono::NaiveDate,
+    /// Which local day the Plan view shows. Slots are keyed by date, so
+    /// this is just the cursor the grid is looking at.
+    plan_day: chrono::NaiveDate,
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
@@ -840,6 +845,7 @@ impl Component for Window {
             completed: None,
             blocks: Vec::new(),
             time_day: chrono::Local::now().date_naive(),
+            plan_day: chrono::Local::now().date_naive(),
             status: None,
             settings: None,
             error: None,
@@ -912,6 +918,10 @@ impl Component for Window {
             Msg::TimeStep(delta) => {
                 let day = self.time_day + chrono::Duration::days(i64::from(delta));
                 self.reload_blocks(&sender, day);
+            }
+            Msg::PlanStep(delta) => {
+                self.plan_day += chrono::Duration::days(i64::from(delta));
+                self.shown = 0;
             }
             Msg::Navigate(nav) => {
                 if nav != self.nav {
@@ -1159,14 +1169,15 @@ impl Component for Window {
                         ));
                     }
                     Nav::Completed => sender.input(Msg::Complete(href)),
-                    // Dropped on Plan: give it the next free half hour.
+                    // Dropped on Plan: give it the next free half hour
+                    // on the day the view is showing.
                     Nav::Plan => {
-                        let today = self.now().date_naive();
+                        let day = self.plan_day;
                         let start = self
                             .prefs
                             .plan
                             .iter()
-                            .filter(|s| s.date == today)
+                            .filter(|s| s.date == day)
                             .map(|s| s.start + s.duration)
                             .max()
                             .unwrap_or(9 * 60)
@@ -1194,19 +1205,13 @@ impl Component for Window {
                 });
             }
             Msg::PlanSet(href, start, duration) => {
-                let today = self.now().date_naive();
-                let prior = self.plan_slot(&href, today);
+                let day = self.plan_day;
+                let prior = self.plan_slot(&href, day);
                 let Some(t) = self.find(&href).cloned() else {
                     return;
                 };
-                if crate::plan::apply_slot(
-                    &mut self.prefs,
-                    &self.open,
-                    &href,
-                    today,
-                    start,
-                    duration,
-                ) {
+                if crate::plan::apply_slot(&mut self.prefs, &self.open, &href, day, start, duration)
+                {
                     self.prefs.save();
                     self.shown = 0;
                     let said = match prior {
@@ -1230,19 +1235,19 @@ impl Component for Window {
                     {
                         let (tx, h) = (tx.clone(), href.clone());
                         toast.connect_button_clicked(move |_| {
-                            tx.emit(Msg::PlanUndo(h.clone(), prior));
+                            tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
                     w.toasts.add_toast(toast);
                 }
             }
             Msg::PlanUnplace(href) => {
-                let today = self.now().date_naive();
-                let prior = self.plan_slot(&href, today);
+                let day = self.plan_day;
+                let prior = self.plan_slot(&href, day);
                 let Some(t) = self.find(&href).cloned() else {
                     return;
                 };
-                if crate::plan::drop_slot(&mut self.prefs, &self.open, &href, today) {
+                if crate::plan::drop_slot(&mut self.prefs, &self.open, &href, day) {
                     self.prefs.save();
                     self.shown = 0;
                     let toast = adw::Toast::builder()
@@ -1256,24 +1261,23 @@ impl Component for Window {
                     {
                         let (tx, h) = (tx.clone(), href.clone());
                         toast.connect_button_clicked(move |_| {
-                            tx.emit(Msg::PlanUndo(h.clone(), prior));
+                            tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
                     w.toasts.add_toast(toast);
                 }
             }
-            Msg::PlanUndo(href, prior) => {
-                let today = self.now().date_naive();
+            Msg::PlanUndo(href, day, prior) => {
                 let ok = match prior {
                     Some((start, duration)) => crate::plan::apply_slot(
                         &mut self.prefs,
                         &self.open,
                         &href,
-                        today,
+                        day,
                         start,
                         duration,
                     ),
-                    None => crate::plan::drop_slot(&mut self.prefs, &self.open, &href, today),
+                    None => crate::plan::drop_slot(&mut self.prefs, &self.open, &href, day),
                 };
                 if ok {
                     self.prefs.save();
@@ -2577,12 +2581,12 @@ impl Window {
                 if self.nav != Nav::Plan {
                     return;
                 }
-                let today = self.now().date_naive();
-                if self.plan_slot(&t.href, today).is_some() {
+                let day = self.plan_day;
+                if self.plan_slot(&t.href, day).is_some() {
                     return;
                 }
-                let day = model::day_plan(&self.open, &self.prefs.plan, self.now());
-                let start = model::place_start(day.now_min, day.hour_start);
+                let plan = model::day_plan(&self.open, &self.prefs.plan, self.now(), day);
+                let start = model::place_start(plan.now_min, plan.hour_start);
                 sender.input(Msg::PlanSet(t.href, start, model::PLAN_DEFAULT_DURATION));
             }
             Key::PlanNudge(delta) => {
@@ -2590,8 +2594,8 @@ impl Window {
                 if self.nav != Nav::Plan {
                     return;
                 }
-                let today = self.now().date_naive();
-                let Some((start, duration)) = self.plan_slot(&t.href, today) else {
+                let day = self.plan_day;
+                let Some((start, duration)) = self.plan_slot(&t.href, day) else {
                     return;
                 };
                 sender.input(Msg::PlanSet(
@@ -2632,7 +2636,7 @@ impl Window {
             sunday_first: self.prefs.sunday_first,
         };
         let counts = Counts::new(&data, &self.prefs.plan, now);
-        let day = model::day_plan(&open, &self.prefs.plan, now);
+        let day = model::day_plan(&open, &self.prefs.plan, now, self.plan_day);
         if let Some(tray) = &w.tray {
             tray.set(tray::State {
                 overdue: counts.overdue,
@@ -2702,11 +2706,11 @@ impl Window {
         let key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             self.nav.key().hash(&mut h);
-            // Time steps change `time_day`, not the wall-clock date.
-            if self.nav == Nav::Time {
-                self.time_day.hash(&mut h);
-            } else {
-                now.date_naive().hash(&mut h);
+            // Day steps change `time_day`/`plan_day`, not the wall-clock date.
+            match self.nav {
+                Nav::Time => self.time_day.hash(&mut h),
+                Nav::Plan => self.plan_day.hash(&mut h),
+                _ => now.date_naive().hash(&mut h),
             }
             format!(
                 "{:?}{:?}{:?}{:?}{:?}{:?}{}{}",
@@ -2914,7 +2918,8 @@ impl Window {
     /// `order <list>,<list>`, `opts sort=name|desc=true|due=week|hide=<list>|reset`,
     /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
     /// `plan <words> at HH:MM [minutes]`, `planoff <words>`,
-    /// `planghost <words> at HH:MM [minutes]`, `planghostoff`.
+    /// `planghost <words> at HH:MM [minutes]`, `planghostoff`,
+    /// `daystep ±N` (the view's day cursor), `daytoday`.
     fn drive(&mut self, w: &mut Widgets, sender: &ComponentSender<Self>, command: &str) {
         let (verb, arg) = command.split_once(' ').unwrap_or((command, ""));
         let task = |text: &str| {
@@ -3044,8 +3049,8 @@ impl Window {
             // Open the slot popover on a placed block (devel, for snaps).
             "slotpop" => {
                 if let Some(h) = task(arg) {
-                    let today = self.now().date_naive();
-                    if let Some((start, duration)) = self.plan_slot(&h, today) {
+                    let day = self.plan_day;
+                    if let Some((start, duration)) = self.plan_slot(&h, day) {
                         let tx: Tx = sender.input_sender().clone();
                         crate::plan::open_slot_popover(
                             w.clamp.upcast_ref(),
@@ -3076,6 +3081,32 @@ impl Window {
                 crate::plan::ghost_at(&h, start, duration);
             }
             "planghostoff" => crate::plan::ghost_off(),
+            // Step the day cursor of the view that is up (Time or Plan).
+            "daystep" => {
+                if let Ok(delta) = arg.trim().parse::<i32>() {
+                    if self.nav == Nav::Time {
+                        sender.input(Msg::TimeStep(delta));
+                    } else if self.nav == Nav::Plan {
+                        sender.input(Msg::PlanStep(delta));
+                    }
+                }
+            }
+            "daytoday" => {
+                let today = self.now().date_naive();
+                let showing = match self.nav {
+                    Nav::Time => self.time_day,
+                    Nav::Plan => self.plan_day,
+                    _ => return,
+                };
+                let delta = showing.signed_duration_since(today).num_days() as i32;
+                if delta != 0 {
+                    if self.nav == Nav::Time {
+                        sender.input(Msg::TimeStep(-delta));
+                    } else {
+                        sender.input(Msg::PlanStep(-delta));
+                    }
+                }
+            }
             // As Quick Find does: go to the task's list and open it.
             "reveal" => {
                 if let Some(h) = task(arg) {
@@ -3247,8 +3278,9 @@ impl Window {
             }
             // Whether the window shows, the tray, and the keyboard cursor.
             "state" => {
+                let now = self.now();
                 eprintln!(
-                    "state: visible {} tray {} cursor {:?} rows {}",
+                    "state: visible {} tray {} cursor {:?} rows {} now {} time_day {} plan_day {}",
                     w.window.is_visible(),
                     w.tray.as_ref().map_or("off", |t| if t.online() {
                         "online"
@@ -3257,6 +3289,9 @@ impl Window {
                     }),
                     self.cursor,
                     w.rows.len(),
+                    now.to_rfc3339(),
+                    self.time_day,
+                    self.plan_day,
                 );
                 // Every mapped scroller, for scroll-to-now checks.
                 let mut stack = vec![w.clamp.clone().upcast::<gtk::Widget>()];
