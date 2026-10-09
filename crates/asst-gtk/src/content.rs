@@ -20,11 +20,9 @@ use crate::{motion, ui};
 pub struct Opts<'a> {
     pub nav: &'a Nav,
     pub lists: &'a [ListView],
-    /// Tracked blocks for the Time view.
+    /// Tracked blocks for the Day view's time lane.
     pub blocks: &'a [asst_core::api::BlockView],
-    /// Day the Time view is showing.
-    pub time_day: chrono::NaiveDate,
-    /// Placed slots, the tray and the now-line, for the Plan view.
+    /// Placed slots, the tray and the now-line, for the Day view.
     pub plan: &'a DayPlan,
     /// Day-grid zoom in pixels per hour.
     pub px_per_hour: f64,
@@ -84,10 +82,8 @@ pub fn section_target(kind: &Kind) -> Option<Target> {
 }
 
 pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Built {
-    match o.nav {
-        Nav::Time => return crate::time::build_column(o, sections, tx),
-        Nav::Plan => return crate::plan::build_column(o, sections, tx),
-        _ => {}
+    if o.nav == &Nav::Day {
+        return crate::day::build_column(o, sections, tx);
     }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("view-column");

@@ -235,7 +235,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             ],
         ),
         (
-            "Plan",
+            "Day",
             &[
                 ("Place the task on the plan at now", "n"),
                 ("Move the block start", "Left Right"),

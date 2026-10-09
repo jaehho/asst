@@ -1,13 +1,13 @@
-//! The Time view: a Google Calendar–style day planner of tracked blocks.
-//! The grid chrome lives in `daygrid`; this module only lays the tracked
-//! chips on it.
+//! Tracked ActivityWatch chips for the Day view's left lane. The shared
+//! chrome lives in `daygrid`; this module only lays the chips on it.
 
 use asst_core::api::BlockView;
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use relm4::gtk::{self, prelude::*};
 
-use crate::daygrid::{self, DayStep};
+use crate::daygrid;
+use crate::model;
 
 fn dur_label(secs: f64) -> String {
     let s = secs.max(0.0).round() as i64;
@@ -59,7 +59,7 @@ pub fn day_note(blocks: &[BlockView]) -> String {
 }
 
 /// Earliest tracked minute on `day`, for scroll-to-first on other days.
-fn first_min(blocks: &[BlockView], day: NaiveDate, zone: Tz) -> Option<f64> {
+pub fn first_min(blocks: &[BlockView], day: NaiveDate, zone: Tz) -> Option<f64> {
     blocks
         .iter()
         .filter(|b| !b.planned)
@@ -69,9 +69,16 @@ fn first_min(blocks: &[BlockView], day: NaiveDate, zone: Tz) -> Option<f64> {
         })
 }
 
-/// Event chips over the rules. Each chip is its own overlay (the Plan
-/// blocks' pattern) so a sibling overlay like the now-line still measures.
-fn chips(blocks: &[BlockView], day: NaiveDate, zone: Tz, overlay: &gtk::Overlay, px_per_hour: f64) {
+/// Tracked chips over the rules in the time lane. Each chip is its own
+/// overlay (the Plan blocks' pattern) so a sibling overlay like the
+/// now-line still measures. Overlaps stack in columns inside the lane.
+pub fn fill_lane(
+    blocks: &[BlockView],
+    day: NaiveDate,
+    zone: Tz,
+    overlay: &gtk::Overlay,
+    px_per_hour: f64,
+) {
     let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
     for b in blocks {
         if b.planned {
@@ -88,8 +95,11 @@ fn chips(blocks: &[BlockView], day: NaiveDate, zone: Tz, overlay: &gtk::Overlay,
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     });
+    let spans: Vec<(f64, f64)> = placed.iter().map(|(s, e, _)| (*s, *e)).collect();
+    let cols = model::span_columns(&spans);
 
-    for (s, e, b) in placed.iter() {
+    for (i, (s, e, b)) in placed.iter().enumerate() {
+        let (col, ncol) = cols[i];
         let top = s / 60.0 * px_per_hour;
         let height_px = ((e - s) / 60.0 * px_per_hour).max(18.0);
         let label = b.label.as_deref().unwrap_or("untagged");
@@ -117,75 +127,26 @@ fn chips(blocks: &[BlockView], day: NaiveDate, zone: Tz, overlay: &gtk::Overlay,
             chip.append(&meta);
         }
 
+        // Equal-expand spacers put the chip in its overlap column.
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.set_hexpand(true);
+        for c in 0..ncol.max(1) {
+            if c == col {
+                row.append(&chip);
+            } else {
+                let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                spacer.set_hexpand(true);
+                row.append(&spacer);
+            }
+        }
+
         // One overlay per chip, positioned by margin like Plan's blocks.
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
         wrap.set_hexpand(true);
         wrap.set_margin_top(top as i32);
-        wrap.append(&chip);
+        wrap.append(&row);
         overlay.add_overlay(&wrap);
-    }
-}
-
-/// The Time view column: shared day header + planner.
-pub fn build_column(
-    o: &crate::content::Opts<'_>,
-    _sections: &[crate::model::Section],
-    tx: &crate::window::Tx,
-) -> crate::content::Built {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("view-column");
-    if o.fresh.view {
-        root.add_css_class("view-enter");
-    }
-
-    let today = o.now.date_naive();
-    let note = day_note(o.blocks);
-    root.append(&daygrid::day_header(
-        "Time",
-        o.time_day,
-        &note,
-        today,
-        DayStep::Time,
-        tx,
-    ));
-
-    let zone = o.now.timezone();
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_vexpand(true);
-    scroll.set_hexpand(true);
-    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scroll.add_css_class("time-scroll");
-    scroll.set_child(Some(&daygrid::day_grid(
-        o.time_day,
-        o.now,
-        o.px_per_hour,
-        |overlay| {
-            chips(o.blocks, o.time_day, zone, overlay, o.px_per_hour);
-        },
-    )));
-
-    let now_min = (o.time_day == today)
-        .then(|| daygrid::minutes_from_midnight(o.now.timestamp_millis(), o.time_day, zone));
-    daygrid::attach_scroll(
-        &scroll,
-        daygrid::ScrollRest {
-            step: DayStep::Time,
-            day: o.time_day,
-            today,
-            now_min,
-            first_min: first_min(o.blocks, o.time_day, zone),
-            fresh_view: o.fresh.view,
-            hold: o.hold,
-            px_per_hour: o.px_per_hour,
-        },
-    );
-    daygrid::attach_zoom(&scroll, tx, o.px_per_hour);
-    root.append(&scroll);
-
-    crate::content::Built {
-        root,
-        rows: Vec::new(),
     }
 }

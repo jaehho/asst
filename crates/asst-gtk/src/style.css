@@ -963,9 +963,17 @@ button.pill {
   opacity: 0.9;
 }
 
-/* Plan view: the day timeline and the unscheduled tray. */
-.plan-columns {
+/* Day view: two lanes on one time axis, and the unscheduled tray. */
+.day-columns {
   min-height: 320px;
+}
+
+.day-lanes > overlay {
+  min-width: 120px;
+}
+
+.day-scroll {
+  min-width: 360px;
 }
 
 .plan-scroll {

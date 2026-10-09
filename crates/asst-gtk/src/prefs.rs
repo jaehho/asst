@@ -82,13 +82,12 @@ impl Default for Prefs {
 }
 
 /// The views a new sidebar has.
-const DEFAULT_SIDEBAR: [Nav; 7] = [
+const DEFAULT_SIDEBAR: [Nav; 6] = [
     Nav::Inbox,
     Nav::Today,
-    Nav::Plan,
+    Nav::Day,
     Nav::Matrix,
     Nav::Scheduled,
-    Nav::Time,
     Nav::Completed,
 ];
 
@@ -137,6 +136,17 @@ impl Prefs {
                 ["inbox", "today", "matrix", "scheduled", "time", "completed"];
             if !has_plan && stock == BEFORE_PLAN {
                 *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
+            }
+        }
+        // Time and Plan are one Day view now: keep one `day` where either
+        // was, so a sidebar the user arranged does not grow a second tile.
+        if let Some(keys) = &mut p.sidebar {
+            let first = keys
+                .iter()
+                .position(|k| k == "time" || k == "plan" || k == "day");
+            if let Some(at) = first {
+                keys.retain(|k| k != "time" && k != "plan" && k != "day");
+                keys.insert(at, "day".into());
             }
         }
         p
@@ -222,31 +232,39 @@ mod tests {
             [
                 Nav::Inbox,
                 Nav::Today,
-                Nav::Plan,
+                Nav::Day,
                 Nav::Matrix,
                 Nav::Scheduled,
-                Nav::Time,
                 Nav::Completed,
                 Nav::Tomorrow
             ]
         );
         // A sidebar arranged before Matrix stays as it was; the stock four
-        // gain Matrix (and then Time, and Plan).
+        // gain Matrix (and then Day).
         let custom = Prefs::parse("sidebar = [\"today\", \"inbox\"]\n");
         assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
         let stock =
             Prefs::parse("sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n");
         assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
-        // Stock five with Matrix gains Time and Plan once.
+        // Stock five with Matrix gains Day once.
         let with_matrix = Prefs::parse(
             "sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"completed\"]\n",
         );
         assert_eq!(with_matrix.sidebar_views(), DEFAULT_SIDEBAR);
-        // Stock six with Time gains Plan once.
-        let with_time = Prefs::parse(
-            "sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"time\", \"completed\"]\n",
+        // Time and Plan become one Day tile at the first of the two.
+        let merged = Prefs::parse(
+            "sidebar = [\"inbox\", \"today\", \"time\", \"plan\", \"scheduled\", \"completed\"]\n",
         );
-        assert_eq!(with_time.sidebar_views(), DEFAULT_SIDEBAR);
+        assert_eq!(
+            merged.sidebar_views(),
+            [
+                Nav::Inbox,
+                Nav::Today,
+                Nav::Day,
+                Nav::Scheduled,
+                Nav::Completed
+            ]
+        );
         let text = toml::to_string(&old).unwrap();
         assert!(!text.contains("filters"));
         assert_eq!(Prefs::parse(&text).sidebar_views(), old.sidebar_views());

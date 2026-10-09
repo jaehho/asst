@@ -1,9 +1,10 @@
-//! The Plan view: a day's tasks on an hour timeline, and an unscheduled
-//! tray to drag from. The day's shape is computed in `model::day_plan`;
-//! this module only draws it and turns drags into slot edits. A drag also
-//! draws a ghost of the block the drop would create, at the same place a
-//! real drop would take. The grid chrome (hour rows, now-line, day header,
-//! scroller) is `daygrid`, shared with Time.
+//! Plan slots for the Day view's right lane: placed blocks on the hour
+//! timeline, and an unscheduled tray to drag from. The day's shape is
+//! computed in `model::day_plan`; this module only draws it and turns
+//! drags into slot edits. A drag also draws a ghost of the block the drop
+//! would create, at the same place a real drop would take. The grid chrome
+//! (hour rows, now-line, day header, scroller) is `daygrid`, shared with
+//! the tracked-time lane.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use asst_core::api::TaskView;
 use chrono::NaiveDate;
 use relm4::gtk::{self, gdk, glib, prelude::*};
 
-use crate::daygrid::{self, DayStep};
+use crate::daygrid;
 use crate::model::{
     self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_SNAP, PlanBlock, place, unplace,
 };
@@ -446,81 +447,81 @@ pub fn ghost_off() {
     });
 }
 
-/// Plan's blocks and drop target on the shared grid. The ghost goes last
-/// so it draws over what it previews against.
-fn plan_grid(
+/// Plan's blocks and drop target on the right lane. The ghost goes last so
+/// it draws over what it previews against.
+pub fn fill_lane(
     p: &DayPlan,
-    now: chrono::DateTime<chrono_tz::Tz>,
     tx: &Tx,
     rows: &mut Vec<(String, gtk::Widget)>,
     px_per_hour: f64,
-) -> gtk::Widget {
-    daygrid::day_grid(p.day, now, px_per_hour, |overlay| {
-        let ghost = Ghost::new(p, px_per_hour);
-        for b in &p.blocks {
-            let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            wrap.set_halign(gtk::Align::Fill);
-            wrap.set_valign(gtk::Align::Start);
-            wrap.set_hexpand(true);
-            wrap.set_margin_top(block_top(b, px_per_hour));
-            let row = block_widget(b, p.now_min, &ghost, tx, px_per_hour);
-            rows.push((b.task.href.clone(), row.clone()));
-            wrap.append(&row);
-            overlay.add_overlay(&wrap);
-        }
-        ghost.attach(overlay);
+    overlay: &gtk::Overlay,
+) {
+    let ghost = Ghost::new(p, px_per_hour);
+    for b in &p.blocks {
+        let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        wrap.set_halign(gtk::Align::Fill);
+        wrap.set_valign(gtk::Align::Start);
+        wrap.set_hexpand(true);
+        wrap.set_margin_top(block_top(b, px_per_hour));
+        let row = block_widget(b, p.now_min, &ghost, tx, px_per_hour);
+        rows.push((b.task.href.clone(), row.clone()));
+        wrap.append(&row);
+        overlay.add_overlay(&wrap);
+    }
+    ghost.attach(overlay);
 
-        // Dropping a tray task (or a block dragged out and back) lands it
-        // at the pointer's time. The ghost tracks that place while the drag
-        // is on.
-        let target = gtk::DropTarget::new(
-            glib::Type::STRING,
-            gdk::DragAction::MOVE | gdk::DragAction::COPY,
-        );
-        {
-            let ghost = ghost.clone();
-            target.connect_motion(move |_, _, y| {
-                match row::dragging().and_then(|href| ghost.tasks.get(&href).cloned()) {
-                    Some(task) => {
-                        ghost.show(
-                            &task,
-                            model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
-                            PLAN_DEFAULT_DURATION,
-                        );
-                    }
-                    None => ghost.hide(),
+    // Dropping a tray task (or a block dragged out and back) lands it
+    // at the pointer's time. The ghost tracks that place while the drag
+    // is on.
+    let target = gtk::DropTarget::new(
+        glib::Type::STRING,
+        gdk::DragAction::MOVE | gdk::DragAction::COPY,
+    );
+    {
+        let ghost = ghost.clone();
+        target.connect_motion(move |_, _, y| {
+            match row::dragging().and_then(|href| ghost.tasks.get(&href).cloned()) {
+                Some(task) => {
+                    ghost.show(
+                        &task,
+                        model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
+                        PLAN_DEFAULT_DURATION,
+                    );
                 }
-                // One preferred action: the gesture itself is a move of the slot.
-                gdk::DragAction::MOVE
-            });
-        }
-        {
-            let ghost = ghost.clone();
-            target.connect_leave(move |_| ghost.hide());
-        }
-        {
-            let (ghost, tx) = (ghost.clone(), tx.clone());
-            target.connect_drop(move |_, value, _, y| {
-                ghost.hide();
-                let Ok(text) = value.get::<String>() else {
-                    return false;
-                };
-                let Some(href) = text.strip_prefix(DRAG_PREFIX) else {
-                    return false;
-                };
-                tx.emit(Msg::PlanSet(
-                    href.to_string(),
-                    model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
-                    PLAN_DEFAULT_DURATION,
-                ));
-                true
-            });
-        }
-        overlay.add_controller(target);
-    })
+                None => ghost.hide(),
+            }
+            // One preferred action: the gesture itself is a move of the slot.
+            gdk::DragAction::MOVE
+        });
+    }
+    {
+        let ghost = ghost.clone();
+        target.connect_leave(move |_| ghost.hide());
+    }
+    {
+        let (ghost, tx) = (ghost.clone(), tx.clone());
+        target.connect_drop(move |_, value, _, y| {
+            ghost.hide();
+            let Ok(text) = value.get::<String>() else {
+                return false;
+            };
+            let Some(href) = text.strip_prefix(DRAG_PREFIX) else {
+                return false;
+            };
+            tx.emit(Msg::PlanSet(
+                href.to_string(),
+                model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
+                PLAN_DEFAULT_DURATION,
+            ));
+            true
+        });
+    }
+    overlay.add_controller(target);
 }
 
-fn tray(
+/// The unscheduled tray beside the day grid. On a non-today day it is the
+/// open/overdue backlog minus what sits on that day; today unchanged.
+pub fn tray(
     p: &DayPlan,
     o: &content::Opts<'_>,
     tx: &Tx,
@@ -602,89 +603,6 @@ fn tray(
     scroll.add_css_class("plan-tray-scroll");
     b.append(&scroll);
     b
-}
-
-/// The Plan column: timeline on the left, unscheduled tray on the right,
-/// and the open task's card under the header when one is open.
-pub fn build_column(
-    o: &content::Opts<'_>,
-    _sections: &[crate::model::Section],
-    tx: &Tx,
-) -> content::Built {
-    let p = o.plan;
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("view-column");
-    root.add_css_class("plan-view");
-    if o.fresh.view {
-        root.add_css_class("view-enter");
-    }
-    if o.editing.is_some() {
-        root.add_css_class("focusing");
-    }
-
-    let today = o.now.date_naive();
-    let note = format!("{} planned · {} unscheduled", p.blocks.len(), p.tray.len());
-    root.append(&daygrid::day_header(
-        "Plan",
-        p.day,
-        &note,
-        today,
-        DayStep::Plan,
-        tx,
-    ));
-
-    let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
-    if let Some(href) = o.editing {
-        let list = gtk::ListBox::new();
-        list.add_css_class("task-list");
-        list.set_selection_mode(gtk::SelectionMode::None);
-        let r = row::editor_row(href, o.editor);
-        list.append(&r);
-        rows.push((href.to_string(), r.into()));
-        root.append(&list);
-    }
-
-    let cols = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    cols.add_css_class("plan-columns");
-    cols.set_vexpand(true);
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_vexpand(true);
-    scroll.set_hexpand(true);
-    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    // The day grid is taller than a short column; ask for most of a window
-    // so the overlay (blocks and the now-line) is allocated the full grid.
-    scroll.set_min_content_height(400);
-    scroll.add_css_class("time-scroll");
-    scroll.add_css_class("plan-scroll");
-    scroll.set_child(Some(&plan_grid(p, o.now, tx, &mut rows, o.px_per_hour)));
-    cols.append(&scroll);
-    cols.append(&tray(p, o, tx, &mut rows));
-    root.append(&cols);
-
-    let now_min = p.now_min.map(f64::from);
-    let first_min = p
-        .blocks
-        .iter()
-        .map(|b| f64::from(b.start))
-        .fold(None, |acc: Option<f64>, m| {
-            Some(acc.map_or(m, |a| a.min(m)))
-        });
-    daygrid::attach_scroll(
-        &scroll,
-        daygrid::ScrollRest {
-            step: DayStep::Plan,
-            day: p.day,
-            today,
-            now_min,
-            first_min,
-            fresh_view: o.fresh.view,
-            hold: o.hold,
-            px_per_hour: o.px_per_hour,
-        },
-    );
-    daygrid::attach_zoom(&scroll, tx, o.px_per_hour);
-
-    content::Built { root, rows }
 }
 
 /// Place or move `href`'s slot for `date` in the window's prefs.

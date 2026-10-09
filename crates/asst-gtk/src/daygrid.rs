@@ -151,7 +151,25 @@ fn grid_width(fixed: &gtk::Fixed) -> f64 {
     f64::from(fixed.width().max(MIN_GRID_W))
 }
 
-/// The hour grid, now-line, and whatever the view draws on top.
+/// Two content lanes on one time axis: tracked time on the left, the plan
+/// on the right. Each is its own Overlay so chips and blocks stack only
+/// within their half.
+pub struct Lanes {
+    pub time: gtk::Overlay,
+    pub plan: gtk::Overlay,
+}
+
+fn lane() -> gtk::Overlay {
+    let overlay = gtk::Overlay::new();
+    overlay.set_hexpand(true);
+    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    box_.set_hexpand(true);
+    box_.set_size_request(120, 1);
+    overlay.set_child(Some(&box_));
+    overlay
+}
+
+/// The hour grid, now-line, and whatever the view draws on its two lanes.
 /// Rules sit under the view's overlays and span the full width (gutter
 /// included, the calendar convention); the now-line is a Fixed child
 /// beside the column so it always paints over those overlays at a real y.
@@ -162,7 +180,7 @@ pub fn day_grid(
     day: NaiveDate,
     now: chrono::DateTime<Tz>,
     px_per_hour: f64,
-    content: impl FnOnce(&gtk::Overlay),
+    content: impl FnOnce(&Lanes),
 ) -> gtk::Widget {
     let px_per_hour = model::clamp_px_per_hour(px_per_hour);
     let height = ((HOUR_END - HOUR_START) as f64 * px_per_hour).round() as i32;
@@ -171,66 +189,88 @@ pub fn day_grid(
     // the now-line share one extent.
     let rules = rules(height, px_per_hour);
 
-    // Content area (view chips and blocks) over the rules, beside the gutter.
-    let overlay = gtk::Overlay::new();
-    overlay.set_hexpand(true);
-    let lane = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    lane.set_hexpand(true);
-    lane.set_size_request(240, height);
-    overlay.set_child(Some(&lane));
-    content(&overlay);
+    // Time on the left, plan on the right: one axis, two lanes.
+    let lanes = Lanes {
+        time: lane(),
+        plan: lane(),
+    };
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class("day-lanes");
+    row.set_hexpand(true);
+    row.append(&lanes.time);
+    row.append(&lanes.plan);
+    content(&lanes);
 
     let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     column.add_css_class("time-planner");
+    column.set_hexpand(true);
     column.set_size_request(MIN_GRID_W, height);
     column.append(&gutter(height, px_per_hour));
-    column.append(&overlay);
+    column.append(&row);
 
     let fixed = gtk::Fixed::new();
     fixed.set_size_request(MIN_GRID_W, height);
     fixed.put(&rules, 0.0, 0.0);
     fixed.put(&column, 0.0, 0.0);
-    if let Some((line, dot, y)) = now_line(now, day, px_per_hour) {
+    let line_dot = now_line(now, day, px_per_hour);
+    if let Some((_, _, y)) = &line_dot {
         // Both centers on `y`: the rule's and the dot's midpoints meet.
-        center_at(&fixed, line.upcast_ref(), y, LINE_H);
-        center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
-        let place = {
-            let (weak, line, dot, rules) =
-                (fixed.downgrade(), line.clone(), dot.clone(), rules.clone());
-            move || {
-                let Some(fixed) = weak.upgrade() else { return };
-                let w = grid_width(&fixed) as i32;
+        center_at(
+            &fixed,
+            line_dot.as_ref().unwrap().0.upcast_ref(),
+            *y,
+            LINE_H,
+        );
+        center_at(
+            &fixed,
+            line_dot.as_ref().unwrap().1.upcast_ref(),
+            *y,
+            DOT_SIZE,
+        );
+    }
+    let place = {
+        let (weak, line_dot, rules, column) = (
+            fixed.downgrade(),
+            line_dot.clone(),
+            rules.clone(),
+            column.clone(),
+        );
+        move || {
+            let Some(fixed) = weak.upgrade() else { return };
+            // One width for rules, line, and the lane row: they cannot
+            // drift apart, and the lanes fill the same extent.
+            let w = grid_width(&fixed) as i32;
+            rules.set_size_request(w, height);
+            column.set_size_request(w, height);
+            if let Some((line, dot, y)) = &line_dot {
                 line.set_size_request(w, LINE_H as i32);
-                rules.set_size_request(w, height);
-                center_at(&fixed, line.upcast_ref(), y, LINE_H);
-                center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
+                center_at(&fixed, line.upcast_ref(), *y, LINE_H);
+                center_at(&fixed, dot.upcast_ref(), *y, DOT_SIZE);
                 line.queue_draw();
                 dot.queue_draw();
             }
-        };
-        glib::timeout_add_local_once(std::time::Duration::from_millis(50), {
-            let place = place.clone();
-            move || place()
-        });
-        // Map runs after the first real allocation, so a rebuild of an
-        // already-sized Fixed still re-centers.
-        fixed.connect_map(move |_| place());
-    }
+        }
+    };
+    glib::timeout_add_local_once(std::time::Duration::from_millis(50), {
+        let place = place.clone();
+        move || place()
+    });
+    // Map runs after the first real allocation, so a rebuild of an
+    // already-sized Fixed still re-centers.
+    fixed.connect_map(move |_| place());
     fixed.upcast()
 }
 
-/// Which view's day cursor the header steps.
+/// The one day cursor the header steps.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DayStep {
-    Time,
-    Plan,
+    Day,
 }
 
 impl DayStep {
     fn msg(self, delta: i32) -> Msg {
         match self {
-            DayStep::Time => Msg::TimeStep(delta),
-            DayStep::Plan => Msg::PlanStep(delta),
+            DayStep::Day => Msg::DayStep(delta),
         }
     }
 }

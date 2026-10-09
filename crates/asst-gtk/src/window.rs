@@ -115,10 +115,8 @@ pub enum Batch {
 #[derive(Debug)]
 pub enum Msg {
     Navigate(Nav),
-    /// Step the Time view by whole days (−1 yesterday, +1 tomorrow).
-    TimeStep(i32),
-    /// Step the Plan view's day the same way.
-    PlanStep(i32),
+    /// Step the Day view by whole days (−1 yesterday, +1 tomorrow).
+    DayStep(i32),
     /// Change the day-grid zoom (pixels per hour). `hold` pins a minute at
     /// a y from the top of the viewport so the view does not jump.
     Zoom(f64, Option<(f64, f64)>),
@@ -296,7 +294,7 @@ impl std::fmt::Debug for Loaded {
 pub enum Cmd {
     Loaded(u64, client::Result<Loaded>),
     CompletedLoaded(u64, client::Result<Vec<TaskView>>),
-    /// Tracked blocks for the Time view.
+    /// Tracked blocks for the Day view.
     BlocksLoaded(u64, client::Result<Vec<asst_core::api::BlockView>>),
     Changed,
     Status(StatusView),
@@ -350,13 +348,12 @@ enum Completing {
 
 pub struct Window {
     nav: Nav,
-    /// Tracked blocks for the Time view (today).
+    /// Tracked blocks for the Day view.
     blocks: Vec<asst_core::api::BlockView>,
-    /// Which local day the Time view shows.
-    time_day: chrono::NaiveDate,
-    /// Which local day the Plan view shows. Slots are keyed by date, so
-    /// this is just the cursor the grid is looking at.
-    plan_day: chrono::NaiveDate,
+    /// Which local day the Day view shows. Tracked blocks and plan slots
+    /// both follow this cursor; slots are keyed by date, so this is just
+    /// the day the grid is looking at.
+    day_day: chrono::NaiveDate,
     /// Minute pinned at a viewport y across the next zoom rebuild.
     zoom_hold: Option<(f64, f64)>,
     lists: Vec<ListView>,
@@ -854,8 +851,7 @@ impl Component for Window {
             open: Vec::new(),
             completed: None,
             blocks: Vec::new(),
-            time_day: chrono::Local::now().date_naive(),
-            plan_day: chrono::Local::now().date_naive(),
+            day_day: chrono::Local::now().date_naive(),
             zoom_hold: None,
             status: None,
             settings: None,
@@ -926,12 +922,10 @@ impl Component for Window {
         // an animation.
         let passive = matches!(msg, Msg::Resume | Msg::Tick | Msg::Focused);
         match msg {
-            Msg::TimeStep(delta) => {
-                let day = self.time_day + chrono::Duration::days(i64::from(delta));
+            Msg::DayStep(delta) => {
+                let day = self.day_day + chrono::Duration::days(i64::from(delta));
+                self.day_day = day;
                 self.reload_blocks(&sender, day);
-            }
-            Msg::PlanStep(delta) => {
-                self.plan_day += chrono::Duration::days(i64::from(delta));
                 self.shown = 0;
             }
             Msg::Zoom(px, hold) => {
@@ -961,8 +955,8 @@ impl Component for Window {
                     if self.needs_completed() && self.completed.is_none() {
                         self.reload_completed(&sender);
                     }
-                    if self.nav == Nav::Time {
-                        let day = self.time_day;
+                    if self.nav == Nav::Day {
+                        let day = self.day_day;
                         self.reload_blocks(&sender, day);
                     }
                     self.close_editor(w, &sender);
@@ -1193,10 +1187,10 @@ impl Component for Window {
                         ));
                     }
                     Nav::Completed => sender.input(Msg::Complete(href)),
-                    // Dropped on Plan: give it the next free half hour
+                    // Dropped on Day: give it the next free half hour
                     // on the day the view is showing.
-                    Nav::Plan => {
-                        let day = self.plan_day;
+                    Nav::Day => {
+                        let day = self.day_day;
                         let start = self
                             .prefs
                             .plan
@@ -1229,7 +1223,7 @@ impl Component for Window {
                 });
             }
             Msg::PlanSet(href, start, duration) => {
-                let day = self.plan_day;
+                let day = self.day_day;
                 let prior = self.plan_slot(&href, day);
                 let Some(t) = self.find(&href).cloned() else {
                     return;
@@ -1266,7 +1260,7 @@ impl Component for Window {
                 }
             }
             Msg::PlanUnplace(href) => {
-                let day = self.plan_day;
+                let day = self.day_day;
                 let prior = self.plan_slot(&href, day);
                 let Some(t) = self.find(&href).cloned() else {
                     return;
@@ -1953,12 +1947,7 @@ impl Window {
 
     /// The top-visible minute of the day scroller, to pin across a zoom.
     fn top_visible_hold(&self) -> Option<(f64, f64)> {
-        let step = match self.nav {
-            Nav::Time => crate::daygrid::DayStep::Time,
-            Nav::Plan => crate::daygrid::DayStep::Plan,
-            _ => return None,
-        };
-        crate::daygrid::scroll_top_minute(step, self.prefs.day_zoom)
+        crate::daygrid::scroll_top_minute(crate::daygrid::DayStep::Day, self.prefs.day_zoom)
     }
 
     /// What the views are made of: the lists, the sidebar's in its order
@@ -2039,8 +2028,8 @@ impl Window {
         if self.needs_completed() || self.completed.is_some() {
             self.reload_completed(sender);
         }
-        if self.nav == Nav::Time {
-            let day = self.time_day;
+        if self.nav == Nav::Day {
+            let day = self.day_day;
             self.reload_blocks(sender, day);
         }
     }
@@ -2057,12 +2046,12 @@ impl Window {
         });
     }
 
-    /// Pull the day from ActivityWatch, then load `blocks` for the Time view.
+    /// Pull the day from ActivityWatch, then load `blocks` for the Day view.
     fn reload_blocks(&mut self, sender: &ComponentSender<Self>, day: chrono::NaiveDate) {
         use asst_core::api::BlockRange;
         use asst_core::track::day_window;
 
-        self.time_day = day;
+        self.day_day = day;
         self.blocks_generation += 1;
         let generation = self.blocks_generation;
         sender.oneshot_command(async move {
@@ -2612,10 +2601,10 @@ impl Window {
                 // hour of the focused block when that is what is under the
                 // cursor and a tray task is the one being placed.
                 let Some(t) = self.cursor_task() else { return };
-                if self.nav != Nav::Plan {
+                if self.nav != Nav::Day {
                     return;
                 }
-                let day = self.plan_day;
+                let day = self.day_day;
                 if self.plan_slot(&t.href, day).is_some() {
                     return;
                 }
@@ -2635,10 +2624,10 @@ impl Window {
             }
             Key::PlanNudge(delta) => {
                 let Some(t) = self.cursor_task() else { return };
-                if self.nav != Nav::Plan {
+                if self.nav != Nav::Day {
                     return;
                 }
-                let day = self.plan_day;
+                let day = self.day_day;
                 let Some((start, duration)) = self.plan_slot(&t.href, day) else {
                     return;
                 };
@@ -2680,7 +2669,7 @@ impl Window {
             sunday_first: self.prefs.sunday_first,
         };
         let counts = Counts::new(&data, &self.prefs.plan, now);
-        let day = model::day_plan(&open, &self.prefs.plan, now, self.plan_day);
+        let day = model::day_plan(&open, &self.prefs.plan, now, self.day_day);
         if let Some(tray) = &w.tray {
             tray.set(tray::State {
                 overdue: counts.overdue,
@@ -2750,10 +2739,9 @@ impl Window {
         let key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             self.nav.key().hash(&mut h);
-            // Day steps change `time_day`/`plan_day`, not the wall-clock date.
+            // Day steps change `day_day`, not the wall-clock date.
             match self.nav {
-                Nav::Time => self.time_day.hash(&mut h),
-                Nav::Plan => self.plan_day.hash(&mut h),
+                Nav::Day => self.day_day.hash(&mut h),
                 _ => now.date_naive().hash(&mut h),
             }
             format!(
@@ -2778,14 +2766,12 @@ impl Window {
             for l in &self.lists {
                 (&l.href, &l.name, &l.color).hash(&mut h);
             }
-            // Time chips come from `blocks`, not from task sections.
-            if self.nav == Nav::Time {
+            // Day's chips come from `blocks` and the window's slots, not
+            // from task sections.
+            if self.nav == Nav::Day {
                 for b in &self.blocks {
                     (b.start, b.end, &b.label, b.planned).hash(&mut h);
                 }
-            }
-            // Plan blocks come from the window's slots.
-            if self.nav == Nav::Plan {
                 for s in &self.prefs.plan {
                     (&s.uid, s.date, s.start, s.duration).hash(&mut h);
                 }
@@ -2874,7 +2860,6 @@ impl Window {
                     nav: &self.nav,
                     lists: &self.lists,
                     blocks: &self.blocks,
-                    time_day: self.time_day,
                     plan: &day,
                     px_per_hour: self.prefs.day_zoom,
                     hold: self.zoom_hold,
@@ -3098,7 +3083,7 @@ impl Window {
             // Open the slot popover on a placed block (devel, for snaps).
             "slotpop" => {
                 if let Some(h) = task(arg) {
-                    let day = self.plan_day;
+                    let day = self.day_day;
                     if let Some((start, duration)) = self.plan_slot(&h, day) {
                         let tx: Tx = sender.input_sender().clone();
                         crate::plan::open_slot_popover(
@@ -3130,14 +3115,10 @@ impl Window {
                 crate::plan::ghost_at(&h, start, duration);
             }
             "planghostoff" => crate::plan::ghost_off(),
-            // Step the day cursor of the view that is up (Time or Plan).
+            // Step the Day view's cursor.
             "daystep" => {
                 if let Ok(delta) = arg.trim().parse::<i32>() {
-                    if self.nav == Nav::Time {
-                        sender.input(Msg::TimeStep(delta));
-                    } else if self.nav == Nav::Plan {
-                        sender.input(Msg::PlanStep(delta));
-                    }
+                    sender.input(Msg::DayStep(delta));
                 }
             }
             // `zoom <px>` sets the scale; `zoomby <factor>` multiplies it.
@@ -3164,18 +3145,9 @@ impl Window {
             }
             "daytoday" => {
                 let today = self.now().date_naive();
-                let showing = match self.nav {
-                    Nav::Time => self.time_day,
-                    Nav::Plan => self.plan_day,
-                    _ => return,
-                };
-                let delta = showing.signed_duration_since(today).num_days() as i32;
+                let delta = self.day_day.signed_duration_since(today).num_days() as i32;
                 if delta != 0 {
-                    if self.nav == Nav::Time {
-                        sender.input(Msg::TimeStep(-delta));
-                    } else {
-                        sender.input(Msg::PlanStep(-delta));
-                    }
+                    sender.input(Msg::DayStep(-delta));
                 }
             }
             // As Quick Find does: go to the task's list and open it.
@@ -3351,7 +3323,7 @@ impl Window {
             "state" => {
                 let now = self.now();
                 eprintln!(
-                    "state: visible {} tray {} cursor {:?} rows {} now {} time_day {} plan_day {}",
+                    "state: visible {} tray {} cursor {:?} rows {} now {} day {} zoom {}",
                     w.window.is_visible(),
                     w.tray.as_ref().map_or("off", |t| if t.online() {
                         "online"
@@ -3361,8 +3333,8 @@ impl Window {
                     self.cursor,
                     w.rows.len(),
                     now.to_rfc3339(),
-                    self.time_day,
-                    self.plan_day,
+                    self.day_day,
+                    self.prefs.day_zoom,
                 );
                 // Every mapped scroller, for scroll-to-now checks.
                 let mut stack = vec![w.clamp.clone().upcast::<gtk::Widget>()];

@@ -18,13 +18,12 @@ use serde::{Deserialize, Serialize};
 pub enum Nav {
     Inbox,
     Today,
-    /// Today's tasks on an hour timeline: the day plan.
-    Plan,
+    /// One day on an hour timeline: tracked time on the left, the plan on
+    /// the right, one cursor and one zoom.
+    Day,
     /// Eisenhower's four boxes: important × urgent.
     Matrix,
     Scheduled,
-    /// One day of tracked time, by tag.
-    Time,
     Completed,
     Tomorrow,
     Anytime,
@@ -35,14 +34,13 @@ pub enum Nav {
 
 impl Nav {
     /// The smart views, in sidebar order.
-    pub fn filters() -> [Nav; 11] {
+    pub fn filters() -> [Nav; 10] {
         [
             Nav::Inbox,
             Nav::Today,
-            Nav::Plan,
+            Nav::Day,
             Nav::Matrix,
             Nav::Scheduled,
-            Nav::Time,
             Nav::Completed,
             Nav::Tomorrow,
             Nav::Anytime,
@@ -55,10 +53,9 @@ impl Nav {
         match self {
             Nav::Inbox => "Inbox".into(),
             Nav::Today => "Today".into(),
-            Nav::Plan => "Plan".into(),
+            Nav::Day => "Day".into(),
             Nav::Matrix => "Matrix".into(),
             Nav::Scheduled => "Scheduled".into(),
-            Nav::Time => "Time".into(),
             Nav::Completed => "Completed".into(),
             Nav::Tomorrow => "Tomorrow".into(),
             Nav::Anytime => "Anytime".into(),
@@ -75,10 +72,12 @@ impl Nav {
     pub fn keywords(&self) -> &'static [&'static str] {
         match self {
             Nav::Today => &["overdue"],
-            Nav::Plan => &["timebox", "day plan", "agenda", "timeline", "schedule"],
+            Nav::Day => &[
+                "timebox", "day plan", "agenda", "timeline", "schedule", "tracked", "activity",
+                "blocks", "plan", "time",
+            ],
             Nav::Matrix => &["eisenhower", "urgent", "important", "quadrant"],
             Nav::Scheduled => &["upcoming", "later"],
-            Nav::Time => &["tracked", "timeline", "activity", "blocks"],
             Nav::Completed => &["done", "logbook", "finished"],
             Nav::Anytime => &["no date", "someday", "unscheduled"],
             Nav::Repeating => &["recurring"],
@@ -97,10 +96,9 @@ impl Nav {
         match self {
             Nav::Inbox => "The inbox list",
             Nav::Today => "Due today, and overdue",
-            Nav::Plan => "Today's tasks on a timeline",
+            Nav::Day => "Tracked time and the plan, side by side",
             Nav::Matrix => "Important and urgent, in four boxes",
             Nav::Scheduled => "Everything with a date, by day",
-            Nav::Time => "Tracked time, by day",
             Nav::Completed => "Done, by the day",
             Nav::Tomorrow => "Due tomorrow",
             Nav::Anytime => "Tasks with no date",
@@ -114,10 +112,9 @@ impl Nav {
         match self {
             Nav::Inbox => "mailbox-symbolic",
             Nav::Today => "star-outline-thick-symbolic",
-            Nav::Plan => "calendar-hollow-symbolic",
+            Nav::Day => "calendar-hollow-symbolic",
             Nav::Matrix => "flag-outline-thick-symbolic",
             Nav::Scheduled => "month-symbolic",
-            Nav::Time => "stopwatch-symbolic",
             Nav::Completed => "check-round-outline-symbolic",
             Nav::Tomorrow => "today-calendar-symbolic",
             Nav::Anytime => "grid-large-symbolic",
@@ -131,10 +128,9 @@ impl Nav {
     pub fn tint(&self) -> &'static str {
         match self {
             Nav::Inbox | Nav::All | Nav::List(_) => "tint-blue",
-            Nav::Today | Nav::Plan => "tint-green",
+            Nav::Today | Nav::Day => "tint-green",
             Nav::Matrix => "tint-orange",
             Nav::Scheduled | Nav::Tomorrow | Nav::Anytime | Nav::Repeating => "tint-purple",
-            Nav::Time => "tint-blue",
             Nav::Completed => "tint-orange",
         }
     }
@@ -144,10 +140,9 @@ impl Nav {
         match self {
             Nav::Inbox => "inbox".into(),
             Nav::Today => "today".into(),
-            Nav::Plan => "plan".into(),
+            Nav::Day => "day".into(),
             Nav::Matrix => "matrix".into(),
             Nav::Scheduled => "scheduled".into(),
-            Nav::Time => "time".into(),
             Nav::Completed => "completed".into(),
             Nav::Tomorrow => "tomorrow".into(),
             Nav::Anytime => "anytime".into(),
@@ -611,16 +606,11 @@ pub fn plan(nav: &Nav, data: &Data, opts: &ViewOpts, now: DateTime<Tz>) -> Vec<S
             pick(&|t| t.task.due.is_none()),
             &|tasks| sorted(tasks, sort, zone),
         )),
-        Nav::Time => {
-            // The day timeline is drawn from `blocks`, not tasks. One empty
-            // kept section so the column still has a day header.
-            out.push(Section::new(Kind::Day(today), Some("Tracked".into()), Vec::new()).keep());
-        }
-        Nav::Plan => {
-            // The timeline is drawn from `day_plan`; the tray is its own
-            // column beside it. One kept section so the day still has a
-            // header in the shared shape.
-            out.push(Section::new(Kind::Day(today), Some("Plan".into()), Vec::new()).keep());
+        Nav::Day => {
+            // The timeline is drawn from `blocks` (tracked) and `day_plan`
+            // (placed slots), not task sections. One kept section so the
+            // column still has a header in the shared shape.
+            out.push(Section::new(Kind::Day(today), Some("Day".into()), Vec::new()).keep());
         }
         Nav::Matrix => {
             let mut boxes: [Vec<TaskView>; 4] = Default::default();
@@ -909,7 +899,7 @@ pub struct PlanBlock {
     pub cols: usize,
 }
 
-/// What the Plan view draws: placed blocks, the tray, and the now-line.
+/// What the Day view draws: placed blocks, the tray, and the now-line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayPlan {
     /// The local day this plan is for (the day the view is showing).
@@ -1193,6 +1183,59 @@ fn layout(blocks: &mut [PlanBlock]) {
     }
 }
 
+/// Overlap columns for half-open minute spans `(start, end)`, in input
+/// order. Each span takes the leftmost free column among the ones before
+/// it that it overlaps; a connected group shares one width. Time's tracked
+/// chips and Plan's blocks both pack this way inside their lane.
+pub fn span_columns(spans: &[(f64, f64)]) -> Vec<(usize, usize)> {
+    let n = spans.len();
+    let mut col_of = vec![0usize; n];
+    for i in 0..n {
+        let (s, e) = spans[i];
+        let mut taken = HashSet::new();
+        for j in 0..i {
+            let (os, oe) = spans[j];
+            if s < oe && os < e {
+                taken.insert(col_of[j]);
+            }
+        }
+        let mut col = 0;
+        while taken.contains(&col) {
+            col += 1;
+        }
+        col_of[i] = col;
+    }
+    let mut group = vec![usize::MAX; n];
+    let mut out = vec![(0, 1); n];
+    for i in 0..n {
+        if group[i] != usize::MAX {
+            continue;
+        }
+        let mut stack = vec![i];
+        let mut members = Vec::new();
+        group[i] = i;
+        while let Some(k) = stack.pop() {
+            members.push(k);
+            let (s, e) = spans[k];
+            for j in 0..n {
+                if group[j] != usize::MAX {
+                    continue;
+                }
+                let (os, oe) = spans[j];
+                if s < oe && os < e {
+                    group[j] = i;
+                    stack.push(j);
+                }
+            }
+        }
+        let cols = members.iter().map(|&m| col_of[m]).max().unwrap_or(0) + 1;
+        for m in members {
+            out[m] = (col_of[m], cols);
+        }
+    }
+    out
+}
+
 // -- counts -----------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1206,7 +1249,7 @@ pub struct Counts {
     pub repeating: usize,
     pub all: usize,
     /// Open tasks with a planned slot today.
-    pub plan: usize,
+    pub day: usize,
     pub lists: HashMap<String, usize>,
 }
 
@@ -1240,7 +1283,7 @@ impl Counts {
                 }
             }
         }
-        c.plan = day_plan(data.open, slots, now, today).blocks.len();
+        c.day = day_plan(data.open, slots, now, today).blocks.len();
         c
     }
 
@@ -1249,11 +1292,10 @@ impl Counts {
         match nav {
             Nav::Inbox => Some(self.inbox),
             Nav::Today => Some(self.today),
-            Nav::Plan => Some(self.plan),
+            Nav::Day => Some(self.day),
             // Every open task sits in some box.
             Nav::Matrix => Some(self.all),
             Nav::Scheduled => Some(self.scheduled),
-            Nav::Time => None,
             Nav::Completed => None,
             Nav::Tomorrow => Some(self.tomorrow),
             Nav::Anytime => Some(self.anytime),
@@ -2101,7 +2143,7 @@ mod tests {
             &slots,
             now(),
         );
-        assert_eq!(c.plan, 1);
+        assert_eq!(c.day, 1);
     }
 
     #[test]
@@ -2316,6 +2358,19 @@ mod tests {
         assert_eq!(clamp_px_per_hour(1000.0), PX_PER_HOUR_MAX);
         assert_eq!(clamp_px_per_hour(f64::NAN), PLAN_PX_PER_HOUR);
         assert_eq!(clamp_px_per_hour(PLAN_PX_PER_HOUR), PLAN_PX_PER_HOUR);
+    }
+
+    #[test]
+    fn span_columns_pack_each_lane_on_its_own() {
+        // One span alone: full width.
+        assert_eq!(span_columns(&[(0.0, 60.0)]), [(0, 1)]);
+        // Two overlapping spans: side by side, shared width.
+        assert_eq!(span_columns(&[(0.0, 60.0), (30.0, 90.0)]), [(0, 2), (1, 2)]);
+        // Separate groups do not share columns.
+        assert_eq!(
+            span_columns(&[(0.0, 60.0), (30.0, 90.0), (120.0, 180.0)]),
+            [(0, 2), (1, 2), (0, 1)]
+        );
     }
 
     #[test]
