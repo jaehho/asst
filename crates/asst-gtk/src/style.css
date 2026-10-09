@@ -885,14 +885,16 @@ menubutton.filtered > button {
 
 .time-now {
   color: @destructive_color;
-  min-height: 2px;
+  min-height: 3px;
   background: @destructive_color;
 }
 
+/* A drawn circle, not a glyph: size is the allocation the layout uses. */
 .time-now-dot {
-  color: @destructive_color;
-  font-size: 10px;
   min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  background: @destructive_color;
 }
 
 .time-date {

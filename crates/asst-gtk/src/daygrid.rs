@@ -14,10 +14,18 @@ use crate::window::{Msg, Tx};
 /// Width of the hour-label gutter.
 pub const GUTTER: i32 = 56;
 
+/// Minimum width of the day grid (gutter + a usable lane).
+pub const MIN_GRID_W: i32 = GUTTER + 240;
+
 /// Hours the grid shows: the whole day, so an early or late hour has a row
 /// and the now-line always has a place.
 pub const HOUR_START: u32 = PLAN_HOUR_START;
 pub const HOUR_END: u32 = PLAN_HOUR_END;
+
+/// Nominal now-line thickness and dot diameter. Placement uses the widgets'
+/// measured allocation, so these are the sizes CSS also asks for.
+const LINE_H: f64 = 3.0;
+const DOT_SIZE: f64 = 10.0;
 
 /// Pixels per hour. The same scale the placement math in `model` uses, so
 /// a y on screen and a minute in a slot cannot drift apart.
@@ -27,6 +35,7 @@ pub fn px_per_hour() -> f64 {
 
 /// y on the shared full-day grid for `mins` minutes from midnight.
 /// Delegates to `model::y_at` so drawing and placement share one mapping.
+/// The value is a line's center, not its top edge.
 pub fn y_at(mins: f64) -> f64 {
     model::y_at(mins, HOUR_START)
 }
@@ -81,11 +90,13 @@ fn gutter(height: i32) -> gtk::Box {
 }
 
 /// Hour rules for the full day, as stacked rows (reliable allocation).
+/// Spans the same extent as the now-line: the full grid width, gutter
+/// included (the calendar convention), from one width source below.
 fn rules(height: i32) -> gtk::Box {
     let hours = HOUR_END - HOUR_START;
     let rules = gtk::Box::new(gtk::Orientation::Vertical, 0);
     rules.set_hexpand(true);
-    rules.set_size_request(240, height);
+    rules.set_size_request(MIN_GRID_W, height);
     rules.add_css_class("time-grid");
     let hour_h = PLAN_PX_PER_HOUR as i32;
     for _ in 0..hours {
@@ -98,11 +109,12 @@ fn rules(height: i32) -> gtk::Box {
     rules
 }
 
-/// Time's now-line: a red rule on a dot, so the rule sits on the dot's
-/// center. Both views draw this one; the peach overlay is gone. Only when
-/// `now` falls on `day`. Sized Fixed children: a 2px box measures to
-/// zero here.
-fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk::Label, f64)> {
+/// The now-line: a red rule on a drawn dot. Both centers sit on `y` (the
+/// minute's line center), so the dot's bottom edge is not what the rule
+/// rides. Only when `now` falls on `day`. The dot is a sized circle, not a
+/// glyph: a Label's box is not its ink. Sized Fixed children: a 2px box
+/// measures to zero here.
+fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk::Box, f64)> {
     if now.date_naive() != day {
         return None;
     }
@@ -112,17 +124,42 @@ fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk:
     let y = y_at(mins);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     line.add_css_class("time-now");
-    line.set_size_request(GUTTER + 240, 3);
-    let dot = gtk::Label::new(Some("●"));
+    line.set_size_request(MIN_GRID_W, LINE_H as i32);
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("time-now-dot");
+    dot.set_size_request(DOT_SIZE as i32, DOT_SIZE as i32);
     Some((line, dot, y))
 }
 
+/// Place `child` so its vertical center is `y`, using its measured size
+/// when it has one and `nominal` before allocation. Adds the child the
+/// first time; later calls only move it, and a child that has left the
+/// Fixed (a rebuild) is left alone.
+fn center_at(fixed: &gtk::Fixed, child: &gtk::Widget, y: f64, nominal: f64) {
+    let h = child.height();
+    let h = if h > 0 { h as f64 } else { nominal };
+    let at = y - h / 2.0;
+    if child.parent().as_ref() == Some(fixed.upcast_ref()) {
+        fixed.move_(child, 0.0, at);
+    } else {
+        fixed.put(child, 0.0, at);
+    }
+}
+
+/// One width for the rules and the now-line, so they cannot drift apart.
+/// Full grid width, gutter included. After allocation that is the Fixed's
+/// width; before it, the minimum.
+fn grid_width(fixed: &gtk::Fixed) -> f64 {
+    f64::from(fixed.width().max(MIN_GRID_W))
+}
+
 /// The hour grid, now-line, and whatever the view draws on top.
-/// Rules sit under the view's overlays; the now-line is a Fixed child
+/// Rules sit under the view's overlays and span the full width (gutter
+/// included, the calendar convention); the now-line is a Fixed child
 /// beside the column so it always paints over those overlays at a real y.
-/// Its place is reapplied after allocation: the first build's put lands,
-/// a rebuild's does not until the Fixed has been sized once.
+/// Both take their width from `grid_width`. Placement is reapplied after
+/// allocation: the first build's put lands, a rebuild's does not until the
+/// Fixed has been sized once.
 pub fn day_grid(
     day: NaiveDate,
     now: chrono::DateTime<Tz>,
@@ -130,32 +167,54 @@ pub fn day_grid(
 ) -> gtk::Widget {
     let height = (HOUR_END - HOUR_START) as i32 * PLAN_PX_PER_HOUR as i32;
 
+    // Rules under everything, including the gutter, so the hour ticks and
+    // the now-line share one extent.
+    let rules = rules(height);
+
+    // Content area (view chips and blocks) over the rules, beside the gutter.
     let overlay = gtk::Overlay::new();
     overlay.set_hexpand(true);
-    overlay.set_child(Some(&rules(height)));
+    let lane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    lane.set_hexpand(true);
+    lane.set_size_request(240, height);
+    overlay.set_child(Some(&lane));
     content(&overlay);
 
     let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     column.add_css_class("time-planner");
-    column.set_size_request(GUTTER + 240, height);
+    column.set_size_request(MIN_GRID_W, height);
     column.append(&gutter(height));
     column.append(&overlay);
 
     let fixed = gtk::Fixed::new();
-    fixed.set_size_request(GUTTER + 240, height);
+    fixed.set_size_request(MIN_GRID_W, height);
+    fixed.put(&rules, 0.0, 0.0);
     fixed.put(&column, 0.0, 0.0);
     if let Some((line, dot, y)) = now_line(now, day) {
-        fixed.put(&line, 0.0, y);
-        fixed.put(&dot, 0.0, y - 6.0);
-        let (fixed, line, dot) = (fixed.clone(), line.clone(), dot.clone());
-        glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-            let w = fixed.width().max(GUTTER + 240);
-            line.set_size_request(w, 3);
-            fixed.move_(&line, 0.0, y);
-            fixed.move_(&dot, 0.0, y - 6.0);
-            line.queue_draw();
-            dot.queue_draw();
+        // Both centers on `y`: the rule's and the dot's midpoints meet.
+        center_at(&fixed, line.upcast_ref(), y, LINE_H);
+        center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
+        let place = {
+            let (weak, line, dot, rules) =
+                (fixed.downgrade(), line.clone(), dot.clone(), rules.clone());
+            move || {
+                let Some(fixed) = weak.upgrade() else { return };
+                let w = grid_width(&fixed) as i32;
+                line.set_size_request(w, LINE_H as i32);
+                rules.set_size_request(w, height);
+                center_at(&fixed, line.upcast_ref(), y, LINE_H);
+                center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
+                line.queue_draw();
+                dot.queue_draw();
+            }
+        };
+        glib::timeout_add_local_once(std::time::Duration::from_millis(50), {
+            let place = place.clone();
+            move || place()
         });
+        // Map runs after the first real allocation, so a rebuild of an
+        // already-sized Fixed still re-centers.
+        fixed.connect_map(move |_| place());
     }
     fixed.upcast()
 }
