@@ -71,7 +71,7 @@ fn first_min(blocks: &[BlockView], day: NaiveDate, zone: Tz) -> Option<f64> {
 
 /// Event chips over the rules. Each chip is its own overlay (the Plan
 /// blocks' pattern) so a sibling overlay like the now-line still measures.
-fn chips(blocks: &[BlockView], day: NaiveDate, zone: Tz, overlay: &gtk::Overlay) {
+fn chips(blocks: &[BlockView], day: NaiveDate, zone: Tz, overlay: &gtk::Overlay, px_per_hour: f64) {
     let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
     for b in blocks {
         if b.planned {
@@ -89,10 +89,9 @@ fn chips(blocks: &[BlockView], day: NaiveDate, zone: Tz, overlay: &gtk::Overlay)
             .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    let hour_h = daygrid::px_per_hour();
     for (s, e, b) in placed.iter() {
-        let top = s / 60.0 * hour_h;
-        let height_px = ((e - s) / 60.0 * hour_h).max(18.0);
+        let top = s / 60.0 * px_per_hour;
+        let height_px = ((e - s) / 60.0 * px_per_hour).max(18.0);
         let label = b.label.as_deref().unwrap_or("untagged");
         let start_s = local_of(b.start, zone).format("%H:%M").to_string();
         let end_s = local_of(b.end, zone).format("%H:%M").to_string();
@@ -158,21 +157,31 @@ pub fn build_column(
     scroll.set_hexpand(true);
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroll.add_css_class("time-scroll");
-    scroll.set_child(Some(&daygrid::day_grid(o.time_day, o.now, |overlay| {
-        chips(o.blocks, o.time_day, zone, overlay);
-    })));
+    scroll.set_child(Some(&daygrid::day_grid(
+        o.time_day,
+        o.now,
+        o.px_per_hour,
+        |overlay| {
+            chips(o.blocks, o.time_day, zone, overlay, o.px_per_hour);
+        },
+    )));
 
     let now_min = (o.time_day == today)
         .then(|| daygrid::minutes_from_midnight(o.now.timestamp_millis(), o.time_day, zone));
     daygrid::attach_scroll(
         &scroll,
-        DayStep::Time,
-        o.time_day,
-        today,
-        now_min,
-        first_min(o.blocks, o.time_day, zone),
-        o.fresh.view,
+        daygrid::ScrollRest {
+            step: DayStep::Time,
+            day: o.time_day,
+            today,
+            now_min,
+            first_min: first_min(o.blocks, o.time_day, zone),
+            fresh_view: o.fresh.view,
+            hold: o.hold,
+            px_per_hour: o.px_per_hour,
+        },
     );
+    daygrid::attach_zoom(&scroll, tx, o.px_per_hour);
     root.append(&scroll);
 
     crate::content::Built {

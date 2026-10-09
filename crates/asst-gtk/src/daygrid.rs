@@ -8,7 +8,7 @@ use chrono::{NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
 
-use crate::model::{self, PLAN_HOUR_END, PLAN_HOUR_START, PLAN_PX_PER_HOUR, scroll_to_min};
+use crate::model::{self, PLAN_HOUR_END, PLAN_HOUR_START, scroll_to_min};
 use crate::window::{Msg, Tx};
 
 /// Width of the hour-label gutter.
@@ -27,17 +27,11 @@ pub const HOUR_END: u32 = PLAN_HOUR_END;
 const LINE_H: f64 = 3.0;
 const DOT_SIZE: f64 = 10.0;
 
-/// Pixels per hour. The same scale the placement math in `model` uses, so
-/// a y on screen and a minute in a slot cannot drift apart.
-pub fn px_per_hour() -> f64 {
-    PLAN_PX_PER_HOUR
-}
-
-/// y on the shared full-day grid for `mins` minutes from midnight.
-/// Delegates to `model::y_at` so drawing and placement share one mapping.
-/// The value is a line's center, not its top edge.
-pub fn y_at(mins: f64) -> f64 {
-    model::y_at(mins, HOUR_START)
+/// y on the shared full-day grid for `mins` minutes from midnight at
+/// `px_per_hour`. Delegates to `model::y_at` so drawing and placement share
+/// one mapping. The value is a line's center, not its top edge.
+pub fn y_at(mins: f64, px_per_hour: f64) -> f64 {
+    model::y_at(mins, HOUR_START, px_per_hour)
 }
 
 /// Minutes from midnight for `ms`, clipped to `day`'s edges.
@@ -67,11 +61,11 @@ pub fn hour_label(hour: u32) -> String {
 }
 
 /// The hour-label gutter for the full day.
-fn gutter(height: i32) -> gtk::Box {
+fn gutter(height: i32, px_per_hour: f64) -> gtk::Box {
     let gutter = gtk::Box::new(gtk::Orientation::Vertical, 0);
     gutter.set_size_request(GUTTER, height);
     gutter.add_css_class("time-gutter");
-    let hour_h = PLAN_PX_PER_HOUR as i32;
+    let hour_h = px_per_hour as i32;
     for h in HOUR_START..HOUR_END {
         let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         slot.set_size_request(GUTTER, hour_h);
@@ -92,13 +86,13 @@ fn gutter(height: i32) -> gtk::Box {
 /// Hour rules for the full day, as stacked rows (reliable allocation).
 /// Spans the same extent as the now-line: the full grid width, gutter
 /// included (the calendar convention), from one width source below.
-fn rules(height: i32) -> gtk::Box {
+fn rules(height: i32, px_per_hour: f64) -> gtk::Box {
     let hours = HOUR_END - HOUR_START;
     let rules = gtk::Box::new(gtk::Orientation::Vertical, 0);
     rules.set_hexpand(true);
     rules.set_size_request(MIN_GRID_W, height);
     rules.add_css_class("time-grid");
-    let hour_h = PLAN_PX_PER_HOUR as i32;
+    let hour_h = px_per_hour as i32;
     for _ in 0..hours {
         let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
         slot.set_hexpand(true);
@@ -114,14 +108,18 @@ fn rules(height: i32) -> gtk::Box {
 /// rides. Only when `now` falls on `day`. The dot is a sized circle, not a
 /// glyph: a Label's box is not its ink. Sized Fixed children: a 2px box
 /// measures to zero here.
-fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk::Box, f64)> {
+fn now_line(
+    now: chrono::DateTime<Tz>,
+    day: NaiveDate,
+    px_per_hour: f64,
+) -> Option<(gtk::Box, gtk::Box, f64)> {
     if now.date_naive() != day {
         return None;
     }
     let mins = f64::from(now.time().hour()) * 60.0
         + f64::from(now.time().minute())
         + f64::from(now.time().second()) / 60.0;
-    let y = y_at(mins);
+    let y = y_at(mins, px_per_hour);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     line.add_css_class("time-now");
     line.set_size_request(MIN_GRID_W, LINE_H as i32);
@@ -163,13 +161,15 @@ fn grid_width(fixed: &gtk::Fixed) -> f64 {
 pub fn day_grid(
     day: NaiveDate,
     now: chrono::DateTime<Tz>,
+    px_per_hour: f64,
     content: impl FnOnce(&gtk::Overlay),
 ) -> gtk::Widget {
-    let height = (HOUR_END - HOUR_START) as i32 * PLAN_PX_PER_HOUR as i32;
+    let px_per_hour = model::clamp_px_per_hour(px_per_hour);
+    let height = ((HOUR_END - HOUR_START) as f64 * px_per_hour).round() as i32;
 
     // Rules under everything, including the gutter, so the hour ticks and
     // the now-line share one extent.
-    let rules = rules(height);
+    let rules = rules(height, px_per_hour);
 
     // Content area (view chips and blocks) over the rules, beside the gutter.
     let overlay = gtk::Overlay::new();
@@ -183,14 +183,14 @@ pub fn day_grid(
     let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     column.add_css_class("time-planner");
     column.set_size_request(MIN_GRID_W, height);
-    column.append(&gutter(height));
+    column.append(&gutter(height, px_per_hour));
     column.append(&overlay);
 
     let fixed = gtk::Fixed::new();
     fixed.set_size_request(MIN_GRID_W, height);
     fixed.put(&rules, 0.0, 0.0);
     fixed.put(&column, 0.0, 0.0);
-    if let Some((line, dot, y)) = now_line(now, day) {
+    if let Some((line, dot, y)) = now_line(now, day, px_per_hour) {
         // Both centers on `y`: the rule's and the dot's midpoints meet.
         center_at(&fixed, line.upcast_ref(), y, LINE_H);
         center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
@@ -339,19 +339,74 @@ fn scroll_set(step: DayStep, y: f64, day: Option<NaiveDate>) {
     });
 }
 
+/// The scroll offset kept for `step`, if the scroller has one yet.
+pub fn scroll_kept(step: DayStep) -> Option<f64> {
+    let (y, _) = scroll_slot(step);
+    y.is_finite().then_some(y)
+}
+
+/// Top-visible minute for `step` at `px_per_hour`, to pin across a zoom.
+pub fn scroll_top_minute(step: DayStep, px_per_hour: f64) -> Option<(f64, f64)> {
+    let y = scroll_kept(step)?;
+    Some((y / px_per_hour * 60.0, 0.0))
+}
+
+/// Ctrl+scroll over the day grid zooms, keeping the minute under the
+/// pointer at the same viewport y. Plain scroll is left to the scroller.
+pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
+    let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    {
+        let (scroll, tx) = (scroll.clone(), tx.clone());
+        ctrl.connect_scroll(move |ctl, _dx, dy| {
+            if !ctl
+                .current_event_state()
+                .contains(relm4::gtk::gdk::ModifierType::CONTROL_MASK)
+            {
+                return glib::Propagation::Proceed;
+            }
+            let y_in_view = ctl
+                .current_event()
+                .and_then(|ev| ev.position().map(|(_, y)| y))
+                .unwrap_or_else(|| scroll.vadjustment().page_size() / 3.0);
+            let hold = minute_under(&scroll, y_in_view, px_per_hour);
+            let factor = if dy > 0.0 { 1.0 / 1.2 } else { 1.2 };
+            tx.emit(Msg::ZoomBy(factor, hold));
+            glib::Propagation::Stop
+        });
+    }
+    scroll.add_controller(ctrl);
+}
+
+/// Where a day scroller rests on attach.
+pub struct ScrollRest {
+    pub step: DayStep,
+    pub day: NaiveDate,
+    pub today: NaiveDate,
+    pub now_min: Option<f64>,
+    pub first_min: Option<f64>,
+    pub fresh_view: bool,
+    /// A minute pinned at `hold.1` from the top of the viewport (a zoom).
+    pub hold: Option<(f64, f64)>,
+    pub px_per_hour: f64,
+}
+
 /// Attach scroll-to-now (today) or scroll-to-first-content (other days) to
 /// `scroll`. `first_min` is the earliest minute the view drew, if any; on a
 /// non-today day the scroller rests there, or at 07:00 when the day is
-/// empty. Rebuilds of the same day keep the reader's place.
-pub fn attach_scroll(
-    scroll: &gtk::ScrolledWindow,
-    step: DayStep,
-    day: NaiveDate,
-    today: NaiveDate,
-    now_min: Option<f64>,
-    first_min: Option<f64>,
-    fresh_view: bool,
-) {
+/// empty. Rebuilds of the same day keep the reader's place. `hold` is a
+/// minute to pin at `hold_y` from the top of the viewport (a zoom), and
+/// wins over both.
+pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
+    let ScrollRest {
+        step,
+        day,
+        today,
+        now_min,
+        first_min,
+        fresh_view,
+        hold,
+        px_per_hour: px,
+    } = rest;
     let recenter = fresh_view || scroll_slot(step).1 != Some(day);
     let placed = std::rc::Rc::new(std::cell::Cell::new(false));
     let place = {
@@ -367,14 +422,16 @@ pub fn attach_scroll(
             if view_h <= 0.0 {
                 return;
             }
-            let target = if day == today {
-                now_min
-            } else {
-                first_min.or(Some(7.0 * 60.0))
-            };
-            let y = if recenter {
+            let y = if let Some((mins, keep_y)) = hold {
+                model::scroll_keep_min(mins as u32, HOUR_START, HOUR_END, view_h, keep_y, px)
+            } else if recenter {
+                let target = if day == today {
+                    now_min
+                } else {
+                    first_min.or(Some(7.0 * 60.0))
+                };
                 target.map_or(0.0, |m| {
-                    scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h)
+                    scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
                 })
             } else {
                 let kept = scroll_slot(step).0;
@@ -397,4 +454,21 @@ pub fn attach_scroll(
     scroll.vadjustment().connect_value_changed(move |a| {
         scroll_set(step, a.value(), Some(day));
     });
+}
+
+/// The minute at `y` from the top of `scroll`'s viewport, and the y to
+/// keep it at while zooming. Returns none when the viewport is not sized.
+pub fn minute_under(
+    scroll: &gtk::ScrolledWindow,
+    y_in_view: f64,
+    px_per_hour: f64,
+) -> Option<(f64, f64)> {
+    let vadj = scroll.vadjustment();
+    let view_h = vadj.page_size();
+    if view_h <= 0.0 {
+        return None;
+    }
+    let y = vadj.value() + y_in_view;
+    let mins = y / px_per_hour * 60.0;
+    Some((mins, y_in_view))
 }

@@ -50,7 +50,7 @@ Libadwaita dressed up, because the first plain libadwaita list felt bare:
 - **Lists are ordered and archived in the window:** `window.toml`, not the server's `calendar-order`, which shared and read-only lists couldn't take anyway. An archived list still syncs and its reminders still ring; it is only out of sight (sidebar, views, counts, the tray). The ring beside a list is its color, not progress: these lists are long-term projects, so a completed share would only grow toward 100% and mean nothing.
 - **Notes stay plain text,** since the iPhone shows them as they are: Enter carries on `- `, `* `, `- [ ] ` and numbered lists, and links are drawn as links and open with Ctrl+click. No bold, headings or hidden markers, which would turn to clutter on the phone.
 - **Small conveniences:** Quick Find reads notes and words for views; the add card has notes, reminders and `#` suggestions; Ctrl+V adds the clipboard; other rows step back while a task is open; a repeating task's new date lights up; a drag near the edge scrolls. Quick add remembers its last list in the state directory, apart from `window.toml`, which the window writes whole.
-- **Window-only preferences** (sort, filters, sidebar views, completion delay, size) live in `window.toml` next to `config.toml`. The daemon's settings go through `Settings`/`SetSettings`.
+- **Window-only preferences** (sort, filters, sidebar views, completion delay, size, day-grid zoom) live in `window.toml` next to `config.toml`. The daemon's settings go through `Settings`/`SetSettings`.
 - **Development builds** (`ASST_DEVEL=1`) use the ID `dev.jaeho.Asst.Devel` and export `drive`/`snapshot` app actions. `scripts/dev` uses them to check the window without focusing it.
 
 ## Sync

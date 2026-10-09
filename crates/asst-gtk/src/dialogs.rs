@@ -240,6 +240,10 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                 ("Place the task on the plan at now", "n"),
                 ("Move the block start", "Left Right"),
                 ("Complete the block", "x space"),
+                (
+                    "Zoom the day grid",
+                    "<Control>plus <Control>minus <Control>scroll",
+                ),
             ],
         ),
         (

@@ -49,6 +49,9 @@ pub struct Prefs {
     /// the start (minutes from midnight) and the duration in minutes.
     /// Cleared when the task goes.
     pub plan: Vec<PlanSlot>,
+    /// Day-grid zoom in pixels per hour. Clamped to a usable range on load
+    /// and on change. Window-only, like the rest of this file.
+    pub day_zoom: f64,
     pub views: BTreeMap<String, ViewOpts>,
 }
 
@@ -72,6 +75,7 @@ impl Default for Prefs {
             sidebar: None,
             filters: Vec::new(),
             plan: Vec::new(),
+            day_zoom: crate::model::PLAN_PX_PER_HOUR,
             views: BTreeMap::new(),
         }
     }
@@ -102,6 +106,7 @@ impl Prefs {
 
     fn parse(text: &str) -> Prefs {
         let mut p: Prefs = toml::from_str(text).unwrap_or_default();
+        p.day_zoom = crate::model::clamp_px_per_hour(p.day_zoom);
         if p.sidebar.is_none() && !p.filters.is_empty() {
             let mut keys: Vec<String> = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
             keys.extend(std::mem::take(&mut p.filters));

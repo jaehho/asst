@@ -14,8 +14,7 @@ use relm4::gtk::{self, gdk, glib, prelude::*};
 
 use crate::daygrid::{self, DayStep};
 use crate::model::{
-    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_PX_PER_HOUR, PLAN_SNAP,
-    PlanBlock, place, unplace,
+    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_SNAP, PlanBlock, place, unplace,
 };
 use crate::row::DRAG_PREFIX;
 use crate::window::{Msg, Tx};
@@ -47,12 +46,12 @@ fn tint_for(priority: u8) -> &'static str {
     }
 }
 
-fn block_top(b: &PlanBlock) -> i32 {
-    daygrid::y_at(f64::from(b.start)) as i32
+fn block_top(b: &PlanBlock, px_per_hour: f64) -> i32 {
+    daygrid::y_at(f64::from(b.start), px_per_hour) as i32
 }
 
-fn block_height(b: &PlanBlock) -> i32 {
-    let natural = f64::from(b.duration) / 60.0 * PLAN_PX_PER_HOUR;
+fn block_height(b: &PlanBlock, px_per_hour: f64) -> i32 {
+    let natural = f64::from(b.duration) / 60.0 * px_per_hour;
     let floor = if b.duration < 30 {
         MIN_BLOCK_H_SHORT
     } else {
@@ -62,14 +61,14 @@ fn block_height(b: &PlanBlock) -> i32 {
 }
 
 /// The chip body both a placed block and the drag ghost wear.
-fn block_chip(b: &PlanBlock, now_min: Option<u32>) -> gtk::Box {
+fn block_chip(b: &PlanBlock, now_min: Option<u32>, px_per_hour: f64) -> gtk::Box {
     let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
     chip.add_css_class("plan-block");
     chip.add_css_class(tint_for(b.task.task.priority));
     if now_min.is_some_and(|n| b.start <= n && n < b.start + b.duration) {
         chip.add_css_class("running");
     }
-    chip.set_height_request(block_height(b));
+    chip.set_height_request(block_height(b, px_per_hour));
     chip.set_hexpand(true);
     chip.set_tooltip_text(Some(&format!(
         "{} – {} · {} · {}",
@@ -91,7 +90,7 @@ fn block_chip(b: &PlanBlock, now_min: Option<u32>) -> gtk::Box {
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
         chip.append(&meta);
-    } else if block_height(b) >= 36 {
+    } else if block_height(b, px_per_hour) >= 36 {
         let meta = gtk::Label::new(Some(&format!(
             "{} – {}",
             clock(b.start),
@@ -125,8 +124,14 @@ fn block_row(chip: &gtk::Box, col: usize, cols: usize) -> gtk::Box {
 /// One placed task: click opens the editor, drag moves, the edge resizes,
 /// right-click sets start and duration by hand. The wrap is focusable so
 /// vim j/k can land on it like a list row.
-fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> gtk::Widget {
-    let chip = block_chip(b, now_min);
+fn block_widget(
+    b: &PlanBlock,
+    now_min: Option<u32>,
+    ghost: &Ghost,
+    tx: &Tx,
+    px_per_hour: f64,
+) -> gtk::Widget {
+    let chip = block_chip(b, now_min, px_per_hour);
 
     // Bottom edge: drag to change the duration, with a ghost of the new end.
     // Thinner on a short chip so the floor can keep it short.
@@ -146,14 +151,14 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> 
         {
             let (ghost, task) = (ghost.clone(), task.clone());
             drag.connect_drag_update(move |_, _, dy| {
-                let end = model::edge_end(start, dur0, dy);
+                let end = model::edge_end(start, dur0, dy, px_per_hour);
                 let duration = end.saturating_sub(start).max(PLAN_MIN_DURATION);
                 ghost.show(&task, start, duration);
             });
         }
         drag.connect_drag_end(move |_, _, dy| {
             ghost.hide();
-            let end = model::edge_end(start, dur0, dy);
+            let end = model::edge_end(start, dur0, dy, px_per_hour);
             let duration = end.saturating_sub(start).max(PLAN_MIN_DURATION);
             tx.emit(Msg::PlanSet(href.clone(), start, duration));
         });
@@ -177,7 +182,7 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> 
                     return;
                 }
                 moved.set(true);
-                ghost.show(&task, model::move_start(start, dy), dur);
+                ghost.show(&task, model::move_start(start, dy, px_per_hour), dur);
             });
         }
         let moved = moved.clone();
@@ -188,7 +193,7 @@ fn block_widget(b: &PlanBlock, now_min: Option<u32>, ghost: &Ghost, tx: &Tx) -> 
                 return;
             }
             moved.set(true);
-            let to = model::move_start(start, dy);
+            let to = model::move_start(start, dy, px_per_hour);
             tx.emit(Msg::PlanSet(href.clone(), to, dur));
         });
         chip.add_controller(drag);
@@ -360,6 +365,7 @@ struct Ghost {
     blocks: Vec<PlanBlock>,
     /// Tray and placed tasks by href, for what a tray drag carries.
     tasks: HashMap<String, TaskView>,
+    px_per_hour: f64,
 }
 
 thread_local! {
@@ -370,7 +376,7 @@ thread_local! {
 impl Ghost {
     /// Build the preview host. `attach` puts it on the grid last, so it
     /// draws over the blocks it previews against.
-    fn new(p: &DayPlan) -> Self {
+    fn new(p: &DayPlan, px_per_hour: f64) -> Self {
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
@@ -388,6 +394,7 @@ impl Ghost {
             wrap,
             blocks: p.blocks.clone(),
             tasks,
+            px_per_hour,
         };
         GHOST.with(|s| *s.borrow_mut() = Some(g.clone()));
         g
@@ -402,11 +409,11 @@ impl Ghost {
         while let Some(c) = self.wrap.first_child() {
             self.wrap.remove(&c);
         }
-        let chip = block_chip(&b, None);
+        let chip = block_chip(&b, None, self.px_per_hour);
         chip.add_css_class("ghost");
         let row = block_row(&chip, b.col, b.cols);
         self.wrap.append(&row);
-        self.wrap.set_margin_top(block_top(&b));
+        self.wrap.set_margin_top(block_top(&b, self.px_per_hour));
         self.wrap.set_visible(true);
     }
 
@@ -446,16 +453,17 @@ fn plan_grid(
     now: chrono::DateTime<chrono_tz::Tz>,
     tx: &Tx,
     rows: &mut Vec<(String, gtk::Widget)>,
+    px_per_hour: f64,
 ) -> gtk::Widget {
-    daygrid::day_grid(p.day, now, |overlay| {
-        let ghost = Ghost::new(p);
+    daygrid::day_grid(p.day, now, px_per_hour, |overlay| {
+        let ghost = Ghost::new(p, px_per_hour);
         for b in &p.blocks {
             let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
             wrap.set_halign(gtk::Align::Fill);
             wrap.set_valign(gtk::Align::Start);
             wrap.set_hexpand(true);
-            wrap.set_margin_top(block_top(b));
-            let row = block_widget(b, p.now_min, &ghost, tx);
+            wrap.set_margin_top(block_top(b, px_per_hour));
+            let row = block_widget(b, p.now_min, &ghost, tx, px_per_hour);
             rows.push((b.task.href.clone(), row.clone()));
             wrap.append(&row);
             overlay.add_overlay(&wrap);
@@ -476,7 +484,7 @@ fn plan_grid(
                     Some(task) => {
                         ghost.show(
                             &task,
-                            model::minutes_at(y, daygrid::HOUR_START),
+                            model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
                             PLAN_DEFAULT_DURATION,
                         );
                     }
@@ -502,7 +510,7 @@ fn plan_grid(
                 };
                 tx.emit(Msg::PlanSet(
                     href.to_string(),
-                    model::minutes_at(y, daygrid::HOUR_START),
+                    model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
                     PLAN_DEFAULT_DURATION,
                 ));
                 true
@@ -648,7 +656,7 @@ pub fn build_column(
     scroll.set_min_content_height(400);
     scroll.add_css_class("time-scroll");
     scroll.add_css_class("plan-scroll");
-    scroll.set_child(Some(&plan_grid(p, o.now, tx, &mut rows)));
+    scroll.set_child(Some(&plan_grid(p, o.now, tx, &mut rows, o.px_per_hour)));
     cols.append(&scroll);
     cols.append(&tray(p, o, tx, &mut rows));
     root.append(&cols);
@@ -663,13 +671,18 @@ pub fn build_column(
         });
     daygrid::attach_scroll(
         &scroll,
-        DayStep::Plan,
-        p.day,
-        today,
-        now_min,
-        first_min,
-        o.fresh.view,
+        daygrid::ScrollRest {
+            step: DayStep::Plan,
+            day: p.day,
+            today,
+            now_min,
+            first_min,
+            fresh_view: o.fresh.view,
+            hold: o.hold,
+            px_per_hour: o.px_per_hour,
+        },
     );
+    daygrid::attach_zoom(&scroll, tx, o.px_per_hour);
 
     content::Built { root, rows }
 }

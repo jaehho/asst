@@ -119,6 +119,11 @@ pub enum Msg {
     TimeStep(i32),
     /// Step the Plan view's day the same way.
     PlanStep(i32),
+    /// Change the day-grid zoom (pixels per hour). `hold` pins a minute at
+    /// a y from the top of the viewport so the view does not jump.
+    Zoom(f64, Option<(f64, f64)>),
+    /// Zoom by a factor (Ctrl+scroll, Ctrl+= / Ctrl+-).
+    ZoomBy(f64, Option<(f64, f64)>),
     ToggleSidebar,
     Refresh,
     Tick,
@@ -240,6 +245,9 @@ pub enum Key {
     PlanPlace,
     /// Nudge the focused block's start by ±15 minutes.
     PlanNudge(i32),
+    /// Zoom the day grid in or out (Ctrl+= / Ctrl+-).
+    ZoomIn,
+    ZoomOut,
     Priority(u8),
     Today,
     Tomorrow,
@@ -349,6 +357,8 @@ pub struct Window {
     /// Which local day the Plan view shows. Slots are keyed by date, so
     /// this is just the cursor the grid is looking at.
     plan_day: chrono::NaiveDate,
+    /// Minute pinned at a viewport y across the next zoom rebuild.
+    zoom_hold: Option<(f64, f64)>,
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
@@ -846,6 +856,7 @@ impl Component for Window {
             blocks: Vec::new(),
             time_day: chrono::Local::now().date_naive(),
             plan_day: chrono::Local::now().date_naive(),
+            zoom_hold: None,
             status: None,
             settings: None,
             error: None,
@@ -921,6 +932,19 @@ impl Component for Window {
             }
             Msg::PlanStep(delta) => {
                 self.plan_day += chrono::Duration::days(i64::from(delta));
+                self.shown = 0;
+            }
+            Msg::Zoom(px, hold) => {
+                self.prefs.day_zoom = model::clamp_px_per_hour(px);
+                self.prefs.save();
+                self.zoom_hold = hold;
+                self.shown = 0;
+            }
+            Msg::ZoomBy(factor, hold) => {
+                let px = self.prefs.day_zoom * factor;
+                self.prefs.day_zoom = model::clamp_px_per_hour(px);
+                self.prefs.save();
+                self.zoom_hold = hold;
                 self.shown = 0;
             }
             Msg::Navigate(nav) => {
@@ -1927,6 +1951,16 @@ impl Window {
         Utc::now().with_timezone(&self.zone)
     }
 
+    /// The top-visible minute of the day scroller, to pin across a zoom.
+    fn top_visible_hold(&self) -> Option<(f64, f64)> {
+        let step = match self.nav {
+            Nav::Time => crate::daygrid::DayStep::Time,
+            Nav::Plan => crate::daygrid::DayStep::Plan,
+            _ => return None,
+        };
+        crate::daygrid::scroll_top_minute(step, self.prefs.day_zoom)
+    }
+
     /// What the views are made of: the lists, the sidebar's in its order
     /// first and archived ones after, and tasks not deleted a moment ago
     /// nor in an archived list, unless it is the list on view.
@@ -2589,6 +2623,16 @@ impl Window {
                 let start = model::place_start(plan.now_min, plan.hour_start);
                 sender.input(Msg::PlanSet(t.href, start, model::PLAN_DEFAULT_DURATION));
             }
+            Key::ZoomIn | Key::ZoomOut => {
+                // Keyboard zoom keeps the top-visible minute put.
+                let factor = if matches!(key, Key::ZoomIn) {
+                    1.2
+                } else {
+                    1.0 / 1.2
+                };
+                let hold = self.top_visible_hold();
+                sender.input(Msg::ZoomBy(factor, hold));
+            }
             Key::PlanNudge(delta) => {
                 let Some(t) = self.cursor_task() else { return };
                 if self.nav != Nav::Plan {
@@ -2713,7 +2757,7 @@ impl Window {
                 _ => now.date_naive().hash(&mut h),
             }
             format!(
-                "{:?}{:?}{:?}{:?}{:?}{:?}{}{}",
+                "{:?}{:?}{:?}{:?}{:?}{:?}{}{}{}",
                 self.adding,
                 self.select_mode,
                 opts,
@@ -2722,6 +2766,7 @@ impl Window {
                 self.prefs.list_order,
                 self.prefs.lists_by_name,
                 self.prefs.sunday_first,
+                self.prefs.day_zoom.to_bits(),
             )
             .hash(&mut h);
             let mut sel: Vec<&String> = self.selected.iter().collect();
@@ -2831,6 +2876,8 @@ impl Window {
                     blocks: &self.blocks,
                     time_day: self.time_day,
                     plan: &day,
+                    px_per_hour: self.prefs.day_zoom,
+                    hold: self.zoom_hold,
                     archived: self.nav_archived(),
                     now,
                     completing: &self.completing.keys().cloned().collect(),
@@ -2846,6 +2893,8 @@ impl Window {
                 &w.add_card.root,
                 &tx,
             );
+            // The pin is for this rebuild only.
+            self.zoom_hold = None;
             w.clamp.set_child(Some(&built.root));
             // On screen now, so what opens can slide.
             motion::open_new();
@@ -3090,6 +3139,28 @@ impl Window {
                         sender.input(Msg::PlanStep(delta));
                     }
                 }
+            }
+            // `zoom <px>` sets the scale; `zoomby <factor>` multiplies it.
+            // Both keep the top-visible minute put.
+            "zoom" => {
+                if let Ok(px) = arg.trim().parse::<f64>() {
+                    let hold = self.top_visible_hold();
+                    sender.input(Msg::Zoom(px, hold));
+                }
+            }
+            "zoomby" => {
+                if let Ok(factor) = arg.trim().parse::<f64>() {
+                    let hold = self.top_visible_hold();
+                    sender.input(Msg::ZoomBy(factor, hold));
+                }
+            }
+            "zoomin" => {
+                let hold = self.top_visible_hold();
+                sender.input(Msg::ZoomBy(1.2, hold));
+            }
+            "zoomout" => {
+                let hold = self.top_visible_hold();
+                sender.input(Msg::ZoomBy(1.0 / 1.2, hold));
             }
             "daytoday" => {
                 let today = self.now().date_naive();
@@ -3715,6 +3786,8 @@ fn key_action(
             gdk::Key::q => Some(Key::Quit),
             gdk::Key::Page_Up => Some(Key::PrevView),
             gdk::Key::Page_Down => Some(Key::NextView),
+            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(Key::ZoomIn),
+            gdk::Key::minus | gdk::Key::KP_Subtract => Some(Key::ZoomOut),
             k => k
                 .to_unicode()
                 .and_then(|c| c.to_digit(10))

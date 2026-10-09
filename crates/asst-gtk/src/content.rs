@@ -26,6 +26,10 @@ pub struct Opts<'a> {
     pub time_day: chrono::NaiveDate,
     /// Placed slots, the tray and the now-line, for the Plan view.
     pub plan: &'a DayPlan,
+    /// Day-grid zoom in pixels per hour.
+    pub px_per_hour: f64,
+    /// Minute to pin across a zoom, with its y from the top of the viewport.
+    pub hold: Option<(f64, f64)>,
     /// The view is a list that was archived.
     pub archived: bool,
     pub now: DateTime<Tz>,

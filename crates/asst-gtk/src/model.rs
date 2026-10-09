@@ -867,11 +867,24 @@ pub const PLAN_HOUR_END: u32 = 24;
 pub const PLAN_DEFAULT_DURATION: u32 = 30;
 /// Shortest slot the plan keeps. The grid may still draw one shorter higher.
 pub const PLAN_MIN_DURATION: u32 = 15;
-/// Pixels per hour on the shared day grid (Time and Plan). Lives with the
-/// placement math so a pointer y has a tested meaning without a window.
+/// Default pixels per hour on the shared day grid (Time and Plan). The
+/// zoomable range is `PX_PER_HOUR_MIN..=PX_PER_HOUR_MAX`; this is what the
+/// views open at and what `window.toml` falls back to.
 pub const PLAN_PX_PER_HOUR: f64 = 52.0;
+/// Smallest usable zoom: a full day still fits a few scrolls.
+pub const PX_PER_HOUR_MIN: f64 = 12.0;
+/// Largest usable zoom: a single hour fills a short column.
+pub const PX_PER_HOUR_MAX: f64 = 120.0;
 /// Minutes a drop or a drag snaps to.
 pub const PLAN_SNAP: u32 = 15;
+
+/// Clamp a zoom into the usable range, and keep it finite.
+pub fn clamp_px_per_hour(px: f64) -> f64 {
+    if !px.is_finite() {
+        return PLAN_PX_PER_HOUR;
+    }
+    px.clamp(PX_PER_HOUR_MIN, PX_PER_HOUR_MAX)
+}
 
 /// A window-local planned slot. The iPhone has no such thing, so this never
 /// reaches the VTODO: `window.toml` holds it, keyed by task UID + date, with
@@ -916,33 +929,34 @@ pub fn snap(min: i32) -> u32 {
     ((min + s / 2) / s * s).clamp(0, 24 * 60 - 1) as u32
 }
 
-/// Minutes `dy` pixels stand for on the plan grid. May be negative.
-fn dy_minutes(dy: f64) -> i32 {
-    (dy / PLAN_PX_PER_HOUR * 60.0) as i32
+/// Minutes `dy` pixels stand for on the plan grid at `px_per_hour`.
+/// May be negative.
+fn dy_minutes(dy: f64, px_per_hour: f64) -> i32 {
+    (dy / px_per_hour * 60.0) as i32
 }
 
-/// Minutes from midnight for a y position on the grid.
-pub fn minutes_at(y: f64, hour_start: u32) -> u32 {
-    let mins = f64::from(hour_start) * 60.0 + y / PLAN_PX_PER_HOUR * 60.0;
+/// Minutes from midnight for a y position on the grid at `px_per_hour`.
+pub fn minutes_at(y: f64, hour_start: u32, px_per_hour: f64) -> u32 {
+    let mins = f64::from(hour_start) * 60.0 + y / px_per_hour * 60.0;
     snap(mins as i32)
 }
 
-/// y on the grid for `mins` minutes from midnight. The inverse of
-/// `minutes_at` before snapping; widgets draw from this so the grid and
-/// the placement math cannot drift apart. `hour_start` is the grid's first
-/// hour (0 on the shared full-day grid).
-pub fn y_at(mins: f64, hour_start: u32) -> f64 {
-    mins / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR
+/// y on the grid for `mins` minutes from midnight at `px_per_hour`. The
+/// inverse of `minutes_at` before snapping; widgets draw from this so the
+/// grid and the placement math cannot drift apart. `hour_start` is the
+/// grid's first hour (0 on the shared full-day grid).
+pub fn y_at(mins: f64, hour_start: u32, px_per_hour: f64) -> f64 {
+    mins / 60.0 * px_per_hour - f64::from(hour_start) * px_per_hour
 }
 
 /// Start a block at `start` would move to, `dy` pixels down the grid.
-pub fn move_start(start: u32, dy: f64) -> u32 {
-    snap(start as i32 + dy_minutes(dy))
+pub fn move_start(start: u32, dy: f64, px_per_hour: f64) -> u32 {
+    snap(start as i32 + dy_minutes(dy, px_per_hour))
 }
 
 /// End minute a duration drag from `start`+`dur0` reaches, `dy` down.
-pub fn edge_end(start: u32, dur0: u32, dy: f64) -> u32 {
-    snap(start as i32 + dur0 as i32 + dy_minutes(dy))
+pub fn edge_end(start: u32, dur0: u32, dy: f64, px_per_hour: f64) -> u32 {
+    snap(start as i32 + dur0 as i32 + dy_minutes(dy, px_per_hour))
 }
 
 /// Duration a slot at `start` keeps: floored and kept inside the day.
@@ -973,18 +987,40 @@ pub fn now_on_grid(now: DateTime<Tz>, hour_start: u32, hour_end: u32) -> Option<
     (mins >= hour_start * 60 && mins < hour_end * 60).then_some(mins)
 }
 
-/// Grid height in pixels for hours `hour_start..hour_end`.
-pub fn grid_height(hour_start: u32, hour_end: u32) -> f64 {
-    f64::from(hour_end.saturating_sub(hour_start).max(1)) * PLAN_PX_PER_HOUR
+/// Grid height in pixels for hours `hour_start..hour_end` at `px_per_hour`.
+pub fn grid_height(hour_start: u32, hour_end: u32, px_per_hour: f64) -> f64 {
+    f64::from(hour_end.saturating_sub(hour_start).max(1)) * px_per_hour
 }
 
 /// Scroll offset that keeps `mins` in a viewport of `view_h` pixels,
 /// slightly above center so the hours after it stay visible. Clamped to
 /// the grid. `hour_start` is the grid's first hour, as in `minutes_at`.
-pub fn scroll_to_min(mins: u32, hour_start: u32, hour_end: u32, view_h: f64) -> f64 {
-    let y = f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR;
-    let max = (grid_height(hour_start, hour_end) - view_h.max(0.0)).max(0.0);
+pub fn scroll_to_min(
+    mins: u32,
+    hour_start: u32,
+    hour_end: u32,
+    view_h: f64,
+    px_per_hour: f64,
+) -> f64 {
+    let y = f64::from(mins) / 60.0 * px_per_hour - f64::from(hour_start) * px_per_hour;
+    let max = (grid_height(hour_start, hour_end, px_per_hour) - view_h.max(0.0)).max(0.0);
     (y - view_h / 3.0).clamp(0.0, max)
+}
+
+/// Scroll offset that holds `mins` at `keep_y` from the top of a viewport
+/// of `view_h` pixels. A zoom re-scrolls with this so the minute under the
+/// pointer (or the top-visible one) does not jump. Clamped to the grid.
+pub fn scroll_keep_min(
+    mins: u32,
+    hour_start: u32,
+    hour_end: u32,
+    view_h: f64,
+    keep_y: f64,
+    px_per_hour: f64,
+) -> f64 {
+    let y = y_at(f64::from(mins), hour_start, px_per_hour);
+    let max = (grid_height(hour_start, hour_end, px_per_hour) - view_h.max(0.0)).max(0.0);
+    (y - keep_y).clamp(0.0, max)
 }
 
 /// The block a drop of `task` at `start` for `duration` would create.
@@ -2240,27 +2276,68 @@ mod tests {
 
     #[test]
     fn scroll_keeps_now_in_view_without_leaving_the_grid() {
+        let z = PLAN_PX_PER_HOUR;
         // 00:00–24:00 is 24 hours on the shared scale.
-        assert_eq!(grid_height(0, 24), 24.0 * PLAN_PX_PER_HOUR);
-        assert_eq!(grid_height(7, 23), 16.0 * PLAN_PX_PER_HOUR);
-        let day = grid_height(0, 24);
+        assert_eq!(grid_height(0, 24, z), 24.0 * z);
+        assert_eq!(grid_height(7, 23, z), 16.0 * z);
+        let day = grid_height(0, 24, z);
         // Morning: already in view from the top, never a negative offset.
-        assert_eq!(scroll_to_min(0, 0, 24, 400.0), 0.0);
+        assert_eq!(scroll_to_min(0, 0, 24, 400.0, z), 0.0);
         // The line sits a third down the viewport so the hours after it show.
-        let y = scroll_to_min(10 * 60, 0, 24, 400.0);
-        let want = 10.0 * PLAN_PX_PER_HOUR - 400.0 / 3.0;
+        let y = scroll_to_min(10 * 60, 0, 24, 400.0, z);
+        let want = 10.0 * z - 400.0 / 3.0;
         assert_eq!(y, want);
         // Late enough that the bottom of the day is the limit.
-        assert_eq!(scroll_to_min(24 * 60 - 1, 0, 24, 400.0), day - 400.0);
+        assert_eq!(scroll_to_min(24 * 60 - 1, 0, 24, 400.0, z), day - 400.0);
         // A viewport taller than the day has nowhere to scroll.
-        assert_eq!(scroll_to_min(12 * 60, 0, 24, day + 10.0), 0.0);
+        assert_eq!(scroll_to_min(12 * 60, 0, 24, day + 10.0, z), 0.0);
         // An hour_start offset moves y, as minutes_at does. 10:00 on a
         // 07:00 grid is 3 h in, less than the third-viewport lift, so the
         // top rule is where the scroller rests.
-        let y7 = scroll_to_min(10 * 60, 7, 23, 400.0);
-        assert_eq!(y7, (3.0 * PLAN_PX_PER_HOUR - 400.0 / 3.0).max(0.0));
-        let y7 = scroll_to_min(14 * 60, 7, 23, 400.0);
-        assert_eq!(y7, 7.0 * PLAN_PX_PER_HOUR - 400.0 / 3.0);
+        let y7 = scroll_to_min(10 * 60, 7, 23, 400.0, z);
+        assert_eq!(y7, (3.0 * z - 400.0 / 3.0).max(0.0));
+        let y7 = scroll_to_min(14 * 60, 7, 23, 400.0, z);
+        assert_eq!(y7, 7.0 * z - 400.0 / 3.0);
+    }
+
+    #[test]
+    fn zoom_scales_the_whole_day_mapping() {
+        // Two zooms agree on minutes and disagree on pixels by the ratio.
+        let (z0, z1) = (PLAN_PX_PER_HOUR, 2.0 * PLAN_PX_PER_HOUR);
+        assert_eq!(minutes_at(y_at(9.0 * 60.0, 0, z1), 0, z1), 9 * 60);
+        assert_eq!(y_at(10.0 * 60.0, 0, z1), 2.0 * y_at(10.0 * 60.0, 0, z0));
+        assert_eq!(minutes_at(10.0 * z1, 0, z1), 10 * 60);
+        assert_eq!(grid_height(0, 24, z1), 2.0 * grid_height(0, 24, z0));
+        // A pointer dy covers half the minutes when the grid is twice as tall.
+        assert_eq!(move_start(9 * 60, z1, z1), 10 * 60);
+        assert_eq!(move_start(9 * 60, z1, z0), 9 * 60 + 120);
+        // Clamps: below, above, and non-finite fall back to the default.
+        assert_eq!(clamp_px_per_hour(1.0), PX_PER_HOUR_MIN);
+        assert_eq!(clamp_px_per_hour(1000.0), PX_PER_HOUR_MAX);
+        assert_eq!(clamp_px_per_hour(f64::NAN), PLAN_PX_PER_HOUR);
+        assert_eq!(clamp_px_per_hour(PLAN_PX_PER_HOUR), PLAN_PX_PER_HOUR);
+    }
+
+    #[test]
+    fn zoom_keeps_a_minute_under_the_pointer() {
+        // After a zoom, the scroll that holds `mins` at `keep_y` from the
+        // top of the viewport is y_at(mins) − keep_y, clamped to the day.
+        let (z0, z1) = (PLAN_PX_PER_HOUR, 2.0 * PLAN_PX_PER_HOUR);
+        let mins = 10 * 60;
+        let keep_y = 80.0;
+        let scroll = scroll_keep_min(mins, 0, 24, 400.0, keep_y, z1);
+        assert_eq!(scroll, y_at(mins as f64, 0, z1) - keep_y);
+        // The minute still reads at keep_y from the new scroll.
+        assert_eq!(minutes_at(scroll + keep_y, 0, z1), mins);
+        // Clamped at the top and bottom of the day.
+        assert_eq!(scroll_keep_min(0, 0, 24, 400.0, keep_y, z1), 0.0);
+        let end = scroll_keep_min(24 * 60 - 1, 0, 24, 400.0, 10.0, z1);
+        assert_eq!(end, grid_height(0, 24, z1) - 400.0);
+        // At the default zoom the same formula holds.
+        assert_eq!(
+            scroll_keep_min(mins, 0, 24, 400.0, keep_y, z0),
+            y_at(mins as f64, 0, z0) - keep_y
+        );
     }
 
     #[test]
@@ -2277,24 +2354,25 @@ mod tests {
 
     #[test]
     fn pointer_y_snaps_to_the_grid() {
+        let z = PLAN_PX_PER_HOUR;
         // 07:00 at the top of a grid that starts at 7.
-        assert_eq!(minutes_at(0.0, 7), 7 * 60);
-        assert_eq!(minutes_at(PLAN_PX_PER_HOUR, 7), 8 * 60);
+        assert_eq!(minutes_at(0.0, 7, z), 7 * 60);
+        assert_eq!(minutes_at(z, 7, z), 8 * 60);
         // Half an hour, a quarter, and a point that snaps up.
-        assert_eq!(minutes_at(PLAN_PX_PER_HOUR / 2.0, 7), 7 * 60 + 30);
-        assert_eq!(minutes_at(PLAN_PX_PER_HOUR / 4.0, 7), 7 * 60 + 15);
-        assert_eq!(minutes_at(9.0, 7), 7 * 60 + 15);
+        assert_eq!(minutes_at(z / 2.0, 7, z), 7 * 60 + 30);
+        assert_eq!(minutes_at(z / 4.0, 7, z), 7 * 60 + 15);
+        assert_eq!(minutes_at(9.0, 7, z), 7 * 60 + 15);
         // The move and edge drags share the same pixel scale.
-        assert_eq!(move_start(9 * 60, PLAN_PX_PER_HOUR), 10 * 60);
-        assert_eq!(move_start(9 * 60, -PLAN_PX_PER_HOUR / 2.0), 8 * 60 + 30);
-        assert_eq!(edge_end(9 * 60, 30, PLAN_PX_PER_HOUR / 2.0), 10 * 60);
+        assert_eq!(move_start(9 * 60, z, z), 10 * 60);
+        assert_eq!(move_start(9 * 60, -z / 2.0, z), 8 * 60 + 30);
+        assert_eq!(edge_end(9 * 60, 30, z / 2.0, z), 10 * 60);
         // y_at is the same mapping the widgets use: midnight at y 0 on a
-        // full-day grid, and each hour one PLAN_PX_PER_HOUR further down.
-        assert_eq!(y_at(0.0, 0), 0.0);
-        assert_eq!(y_at(10.0 * 60.0, 0), 10.0 * PLAN_PX_PER_HOUR);
-        assert_eq!(y_at(10.0 * 60.0, 7), 3.0 * PLAN_PX_PER_HOUR);
+        // full-day grid, and each hour one `z` further down.
+        assert_eq!(y_at(0.0, 0, z), 0.0);
+        assert_eq!(y_at(10.0 * 60.0, 0, z), 10.0 * z);
+        assert_eq!(y_at(10.0 * 60.0, 7, z), 3.0 * z);
         // A snapped minute round-trips through the shared scale.
-        assert_eq!(minutes_at(y_at(9.0 * 60.0, 0), 0), 9 * 60);
+        assert_eq!(minutes_at(y_at(9.0 * 60.0, 0, z), 0, z), 9 * 60);
     }
 
     #[test]
@@ -2305,8 +2383,9 @@ mod tests {
             assert_eq!((g.start, g.duration, g.col, g.cols), (hour * 60, 30, 0, 1));
         }
         // The pointer path and the ghost agree at an hour.
-        let y = y_at(10.0 * 60.0, PLAN_HOUR_START);
-        let start = minutes_at(y, PLAN_HOUR_START);
+        let z = PLAN_PX_PER_HOUR;
+        let y = y_at(10.0 * 60.0, PLAN_HOUR_START, z);
+        let start = minutes_at(y, PLAN_HOUR_START, z);
         let g = ghost_block(&[], &t, start, PLAN_DEFAULT_DURATION);
         assert_eq!(g.start, 10 * 60);
     }
