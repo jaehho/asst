@@ -12,6 +12,7 @@
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
+#   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev down               stop the window, the tray, asstd and the bus (Radicale stays up)
 #
 # ASST_DEV (default ~/.cache/asst-dev/<name>, name from ASST_DEV_NAME or
@@ -173,6 +174,16 @@ CONF
     ;;
   snap) action snapshot "$(realpath -m "$2")" ;;
   snap-popover) action snapshot-popover "$(realpath -m "$2")" ;;
+  dump)
+    on_bus
+    out="$(realpath -m "${2:-$DEV/dump.json}")"
+    rm -f "$out"
+    action dump "$out"
+    # The action only queues the write on the GTK loop.
+    for _ in $(seq 40); do [ -f "$out" ] && break; sleep 0.05; done
+    [ -f "$out" ] || { echo "dump did not write $out; see $DEV/window.log" >&2; exit 1; }
+    [ -n "${2:-}" ] || cat "$out"
+    ;;
   down)
     pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
     pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
@@ -187,5 +198,5 @@ CONF
       rm -f "$DEV/bus"
     fi
     ;;
-  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

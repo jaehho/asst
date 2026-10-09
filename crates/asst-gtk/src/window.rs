@@ -226,6 +226,9 @@ pub enum Msg {
     TrayClick,
     /// A scripted click or key, in development builds.
     Drive(String),
+    /// Write the machine-readable state dump (devel `dump`), to `path`.
+    /// Empty path prints it on the log.
+    Dump(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1647,6 +1650,7 @@ impl Component for Window {
             }
             Msg::Key(key) => self.key(w, key, &sender),
             Msg::Drive(command) => self.drive(w, &sender, &command),
+            Msg::Dump(path) => self.dump(w, &path),
             Msg::CloseWindow => {
                 if self.prefs.background && w.tray.as_ref().is_some_and(|t| t.online()) {
                     self.hide(w, &sender);
@@ -2940,6 +2944,42 @@ impl Window {
             1 => "1 selected".to_string(),
             n => format!("{n} selected"),
         });
+    }
+
+    /// Development builds: the machine-readable state dump for agents.
+    /// Serialization is `devel::build_dump` / `devel::dump_json`; this only
+    /// gathers and writes.
+    fn dump(&self, w: &Widgets, path: &str) {
+        let (lists, open, completed) = self.view_data();
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: completed.as_deref(),
+            sunday_first: self.prefs.sunday_first,
+        };
+        let now = self.now();
+        let sections = model::plan(&self.nav, &data, &self.prefs.view_opts(&self.nav), now);
+        let day = model::day_plan(&open, &self.prefs.plan, now, self.day_day);
+        let top =
+            crate::daygrid::scroll_top_minute(crate::daygrid::DayStep::Day, self.prefs.day_zoom)
+                .map(|(min, _)| min.clamp(0.0, 24.0 * 60.0) as u32);
+        let state = crate::devel::build_dump(
+            &self.nav,
+            self.day_day,
+            self.prefs.day_zoom,
+            top,
+            &sections,
+            &day,
+            self.editing.as_deref(),
+            crate::devel::visible_toast(w.toasts.upcast_ref()).as_deref(),
+            self.cursor.as_deref(),
+        );
+        let json = crate::devel::dump_json(&state);
+        if path.is_empty() {
+            eprintln!("{json}");
+        } else if let Err(e) = std::fs::write(path, format!("{json}\n")) {
+            eprintln!("dump {path}: {e}");
+        }
     }
 
     /// Development builds: `nav today`, `key j`, `open <words>`, `reveal <words>`, `close`,
