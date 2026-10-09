@@ -4,10 +4,10 @@
 # Radicale as the server. The real config, cache, keyring and Nextcloud are
 # never touched.
 #
-#   scripts/dev up [--signed-out]  Radicale, the bus and asstd (idempotent)
+#   scripts/dev up [--signed-out]  build, then Radicale, the bus and asstd (idempotent)
 #   scripts/dev run CMD...         a command on the private bus
 #   scripts/dev asst ARGS...       the dev CLI on it
-#   scripts/dev window [ARGS...]   the window, on a hidden Hyprland workspace, unfocused
+#   scripts/dev window [ARGS...]   build, then the window on a hidden Hyprland workspace, unfocused
 #   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
@@ -30,6 +30,12 @@ BIN="$REPO/target/debug"
 has_name() {
   gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
     --method org.freedesktop.DBus.NameHasOwner "$1" 2>/dev/null | grep -q true
+}
+
+# The debug binaries this harness runs. Always rebuilt on `up`/`window` so
+# an edit cannot be invisible; a warm incremental is about a second.
+build() {
+  cargo build --manifest-path "$REPO/Cargo.toml" -p asstd -p asst -p asst-gtk
 }
 
 on_bus() {
@@ -89,8 +95,10 @@ inside() {
 
 case "${1:-}" in
   up)
+    # Build first even when already up: the bus may be live with last
+    # build's binaries. Bring-up itself stays idempotent below.
+    build
     if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then exit 0; fi
-    cargo build --manifest-path "$REPO/Cargo.toml" -p asstd -p asst -p asst-gtk
     radicale_up
     mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data" "$DEV/notes"
     # Never the default, which is the real ~/Nextcloud/Notes.
@@ -148,6 +156,7 @@ CONF
   asst) shift; on_bus; exec "$BIN/asst" "$@" ;;
   window)
     shift
+    build
     on_bus
     pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
     hide_window
