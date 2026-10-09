@@ -13,6 +13,8 @@ window {
   --due-today: #16af54;
   --due-overdue: #fa1955;
   --done: #ff7800;
+  /* You are here: the now-line and the running ring. Blue's job. */
+  --now: #3584e4;
   --p1: #ff7066;
   --p2: #ff9a14;
   --p3: #5297ff;
@@ -26,6 +28,7 @@ window.dark {
   --due-today: #57e389;
   --due-overdue: #ff6a8c;
   --done: #ffa348;
+  --now: #99c1f1;
 }
 
 @keyframes spin {
@@ -876,17 +879,16 @@ menubutton.filtered > button {
   border-top: 1px solid alpha(@borders, 0.55);
 }
 
-/* The now-line is a steady-state violation of the red rule ("never spend
-   red on a steady state") — kept because the user asked for Time's red
-   line on both views. One style everywhere; the peach overlay is gone. */
+/* The now-line is "you are here", so it takes the blue role
+   (`--now`, the same hue as the view tiles). Red stays for act-now. */
 .time-now-row {
   min-height: 12px;
 }
 
 .time-now {
-  color: @destructive_color;
+  color: var(--now);
   min-height: 3px;
-  background: @destructive_color;
+  background: var(--now);
 }
 
 /* A drawn circle, not a glyph: size is the allocation the layout uses. */
@@ -894,7 +896,7 @@ menubutton.filtered > button {
   min-width: 10px;
   min-height: 10px;
   border-radius: 999px;
-  background: @destructive_color;
+  background: var(--now);
 }
 
 .time-date {
@@ -1024,7 +1026,7 @@ button.pill {
 }
 
 .plan-block.running {
-  box-shadow: 0 0 0 2px alpha(@destructive_color, 0.7);
+  box-shadow: 0 0 0 2px alpha(var(--now), 0.7);
 }
 
 /* Provisional: the block a drag would drop, not one already placed.
