@@ -13,6 +13,8 @@
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
+#   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
+#   scripts/dev reset              wipe this instance's state, then up and seed
 #   scripts/dev down               stop the window, the tray, asstd and the bus (Radicale stays up)
 #
 # ASST_DEV (default ~/.cache/asst-dev/<name>, name from ASST_DEV_NAME or
@@ -36,6 +38,92 @@ has_name() {
 # an edit cannot be invisible; a warm incremental is about a second.
 build() {
   cargo build --manifest-path "$REPO/Cargo.toml" -p asstd -p asst -p asst-gtk
+}
+
+# Fixture tasks for `seed`: key, title, due, priority, repeat, optional
+# plan placement as "HH:MM minutes" on today. Empty fields are skipped.
+# `--source dev:<key>` keeps a re-run from duplicating; the same keys own
+# their plan slots.
+seed_list() {
+  local past next_mon
+  past="$(date -d '2 days ago' +%F)"
+  next_mon="$(date -d 'next monday' +%F)"
+  cat <<SEED
+overdue|Pay the rent|$past|1||
+today-bank|Call the bank|today|1||11:00 30
+today-standup|Daily standup|today||every day|09:00 30
+today-anki|Review flashcards|today|3||
+soon-report|Write the report|tomorrow|2||14:00 60
+someday-gym|Gym||||
+week-meeting|Team meeting|$next_mon||every monday|
+SEED
+}
+
+# Merge day-plan slots into window.toml. Slots listed on stdin as JSON
+# objects {uid,date,start,duration} replace any slot with the same uid.
+place_slots() {
+  local toml="$DEV/config/asst/window.toml"
+  mkdir -p "$(dirname "$toml")"
+  uv run --no-project --with tomli-w python -c '
+import json, sys, tomllib, tomli_w
+from pathlib import Path
+path = Path(sys.argv[1])
+slots = json.load(sys.stdin)
+drop = {s["uid"] for s in slots}
+data = tomllib.loads(path.read_text()) if path.exists() else {}
+data["plan"] = [s for s in data.get("plan", []) if s.get("uid") not in drop] + slots
+path.write_text(tomli_w.dumps(data))
+' "$toml"
+}
+
+# Lists the fixtures go to, created on first seed.
+seed_lists() {
+  local have
+  have="$("$BIN/asst" --json lists | python3 -c 'import json,sys; print("\n".join(l["name"].lower() for l in json.load(sys.stdin)))')"
+  for name in Inbox Work Errands; do
+    grep -qx "$(echo "$name" | tr '[:upper:]' '[:lower:]')" <<<"$have" || "$BIN/asst" list new "$name"
+  done
+}
+
+seed_tasks() {
+  local slots="[]" key title due prio repeat plan uid json
+  local -a args
+  while IFS='|' read -r key title due prio repeat plan; do
+    [ -n "$key" ] || continue
+    args=(--json add --source "dev:$key" --literal)
+    if [ -n "$due" ]; then args+=(--due "$due"); fi
+    if [ -n "$prio" ]; then args+=(--priority "$prio"); fi
+    if [ -n "$repeat" ]; then args+=(--repeat "$repeat"); fi
+    json="$("$BIN/asst" "${args[@]}" "$title")"
+    uid="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["uid"])' <<<"$json")"
+    if [ -n "$plan" ]; then
+      slots="$(python3 -c '
+import json, sys
+uid, day, rest = sys.argv[1], sys.argv[2], sys.argv[3]
+start_s, dur_s = rest.split()
+h, m = start_s.split(":")
+slots = json.loads(sys.stdin.read() or "[]")
+slots.append({"uid": uid, "date": day, "start": int(h)*60+int(m), "duration": int(dur_s)})
+print(json.dumps(slots))
+' "$uid" "$(date +%F)" "$plan" <<<"$slots")"
+    fi
+  done < <(seed_list)
+  place_slots <<<"$slots"
+}
+
+# Files older harness versions left in the instance dir. The live set is
+# the bus file, the logs and session.conf, plus config/ state/ data/ notes/.
+clear_stale() {
+  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|config|state|data|notes)$'
+  local f base
+  for f in "$DEV"/* "$DEV"/.*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    [ "$base" = . ] || [ "$base" = .. ] && continue
+    if ! [[ $base =~ $keep ]]; then
+      rm -rf "$f"
+    fi
+  done
 }
 
 on_bus() {
@@ -193,6 +281,22 @@ CONF
     [ -f "$out" ] || { echo "dump did not write $out; see $DEV/window.log" >&2; exit 1; }
     [ -n "${2:-}" ] || cat "$out"
     ;;
+  seed)
+    on_bus
+    seed_lists
+    seed_tasks
+    ;;
+  reset)
+    "$0" down
+    rm -f "$DEV/config/asst/window.toml" "$DEV"/state/asst/asst.db*
+    rm -rf "$DEV/notes"
+    mkdir -p "$DEV/notes"
+    # This instance's CalDAV collection only; other instances share Radicale.
+    rm -rf "$RADICALE/data/collection-root/$(basename "$DEV")"
+    clear_stale
+    "$0" up
+    "$0" seed
+    ;;
   down)
     pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
     pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
@@ -207,5 +311,5 @@ CONF
       rm -f "$DEV/bus"
     fi
     ;;
-  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
