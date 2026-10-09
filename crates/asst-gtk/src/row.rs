@@ -165,6 +165,22 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         i.set_tooltip_text(Some("Not on the server yet"));
         body.append(&i);
     }
+    {
+        // Creation site, not the last editor. Grey caption, same weight as
+        // the list name — provenance is context, not a state colour.
+        let tip = match t.origin.as_str() {
+            "steno" => "Filed from a Steno meeting",
+            "github" => "GitHub issue",
+            "asst" => "Created in asst",
+            "mail" => "From mail-digest",
+            _ => "Another CalDAV client",
+        };
+        let o = gtk::Label::builder().label(&t.origin).build();
+        o.add_css_class("caption");
+        o.add_css_class("dim-label");
+        o.set_tooltip_text(Some(tip));
+        body.append(&o);
+    }
     if o.show_list {
         let l = gtk::Label::builder()
             .label(&t.list_name)

@@ -405,7 +405,7 @@ impl Daemon {
                     })
                 });
                 let mut view = TaskView::new(r, id, list_name);
-                view.issue = issue;
+                view.set_issue(issue);
                 view
             })
             .collect())
@@ -531,9 +531,16 @@ impl Daemon {
 
     pub fn add(&self, spec: &AddSpec) -> Result<Added> {
         let now = Utc::now();
-        if let Some(source) = &spec.source {
+        // Stamp a unique asst: source so a task created here can be told
+        // apart from one that arrived over CalDAV (phone, Reminders). Tools
+        // that pass --source keep their own kind.
+        let source = spec
+            .source
+            .clone()
+            .unwrap_or_else(asst_core::api::local_source);
+        {
             let store = self.store();
-            if let Some(row) = store.by_source(source)? {
+            if let Some(row) = store.by_source(&source)? {
                 return Ok(Added {
                     task: self.view(&store, row)?,
                     existed: true,
@@ -594,9 +601,7 @@ impl Daemon {
         if !alarms.is_empty() {
             edits.push(Edit::Alarms(alarms));
         }
-        if let Some(s) = &spec.source {
-            edits.push(Edit::Source(Some(s.clone())));
-        }
+        edits.push(Edit::Source(Some(source.clone())));
         let mut store = self.store();
         let list = match spec
             .list

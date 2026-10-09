@@ -483,6 +483,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(s) = &t.task.source {
                 row("source", s.clone());
             }
+            row("origin", t.origin.to_string());
             if t.pending {
                 row("sync", "waiting to be sent".into());
             }

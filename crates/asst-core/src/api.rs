@@ -170,12 +170,17 @@ pub struct TaskView {
     /// The paired GitHub issue, when the list is linked to a repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<IssueLink>,
+    /// Where the task came from: `steno`, `github`, `asst`, `mail`, or
+    /// `phone` (another CalDAV client, no stamp). Derived from `source`
+    /// and the issue pair; not stored twice.
+    pub origin: String,
     #[serde(flatten)]
     pub task: Task,
 }
 
 impl TaskView {
     pub fn new(row: Row, id: String, list_name: String) -> TaskView {
+        let origin = origin_of(row.task.source.as_deref(), false).to_string();
         TaskView {
             id,
             href: row.href,
@@ -183,9 +188,41 @@ impl TaskView {
             list_name,
             pending: row.pending,
             issue: None,
+            origin,
             task: row.task,
         }
     }
+
+    /// Refresh `origin` after the issue pair is filled in.
+    pub fn set_issue(&mut self, issue: Option<IssueLink>) {
+        self.origin = origin_of(self.task.source.as_deref(), issue.is_some()).to_string();
+        self.issue = issue;
+    }
+}
+
+/// `steno` / `github` / `asst` / `mail` / `phone` — creation site, not the
+/// last editor. `source` wins when present; a GitHub pair is the fallback
+/// for issues that arrived without a stamp.
+pub fn origin_of(source: Option<&str>, has_issue: bool) -> &'static str {
+    if let Some(kind) = source.and_then(|s| s.split(':').next()) {
+        return match kind {
+            "steno" => "steno",
+            "asst" => "asst",
+            "mail" => "mail",
+            "gh" | "github" => "github",
+            _ => "other",
+        };
+    }
+    if has_issue {
+        return "github";
+    }
+    "phone"
+}
+
+/// Stamp for a task created in asst itself. Unique, so two native adds are
+/// two tasks, while `--source` from a tool stays idempotent.
+pub fn local_source() -> String {
+    format!("asst:{}", uuid::Uuid::new_v4().simple())
 }
 
 /// A new task. With `parse`, `text` is quick-add syntax; fields given
@@ -422,5 +459,24 @@ mod tests {
         assert_eq!(ids["0f27bb00-1111"], "0f27b");
         assert_eq!(ids["abcdef"], "abcd");
         assert_eq!(ids["ab"], "ab");
+    }
+
+    #[test]
+    fn origin_prefers_the_source_kind() {
+        assert_eq!(origin_of(Some("steno:2026/send"), false), "steno");
+        assert_eq!(origin_of(Some("asst:abc123"), true), "asst");
+        assert_eq!(origin_of(Some("mail:1"), false), "mail");
+    }
+
+    #[test]
+    fn origin_falls_back_to_issue_then_phone() {
+        assert_eq!(origin_of(None, true), "github");
+        assert_eq!(origin_of(None, false), "phone");
+    }
+
+    #[test]
+    fn local_sources_are_unique_stamps() {
+        assert_ne!(local_source(), local_source());
+        assert!(local_source().starts_with("asst:"));
     }
 }

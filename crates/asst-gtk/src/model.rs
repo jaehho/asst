@@ -1565,6 +1565,7 @@ mod tests {
             list_name: list.trim_matches('/').into(),
             pending: false,
             issue: None,
+            origin: "phone".into(),
             task: Task {
                 uid: uid.into(),
                 summary: uid.into(),
