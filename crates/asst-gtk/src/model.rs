@@ -867,9 +867,9 @@ pub const PLAN_HOUR_END: u32 = 24;
 pub const PLAN_DEFAULT_DURATION: u32 = 30;
 /// Shortest slot the plan keeps. The grid may still draw one shorter higher.
 pub const PLAN_MIN_DURATION: u32 = 15;
-/// Pixels per hour on the Plan grid. Lives with the placement math so a
-/// pointer y has a tested meaning without a window.
-pub const PLAN_PX_PER_HOUR: f64 = 36.0;
+/// Pixels per hour on the shared day grid (Time and Plan). Lives with the
+/// placement math so a pointer y has a tested meaning without a window.
+pub const PLAN_PX_PER_HOUR: f64 = 52.0;
 /// Minutes a drop or a drag snaps to.
 pub const PLAN_SNAP: u32 = 15;
 
@@ -899,12 +899,14 @@ pub struct PlanBlock {
 /// What the Plan view draws: placed blocks, the tray, and the now-line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayPlan {
+    /// The local day this plan is for (the day the view is showing).
+    pub day: NaiveDate,
     pub hour_start: u32,
     pub hour_end: u32,
     pub blocks: Vec<PlanBlock>,
-    /// Today's open and overdue tasks that are not placed.
+    /// Open and overdue backlog not placed on `day`.
     pub tray: Vec<TaskView>,
-    /// Minutes from midnight, when the grid shows today.
+    /// Minutes from midnight, only when `day` is the wall-clock today.
     pub now_min: Option<u32>,
 }
 
@@ -927,9 +929,10 @@ pub fn minutes_at(y: f64, hour_start: u32) -> u32 {
 
 /// y on the grid for `mins` minutes from midnight. The inverse of
 /// `minutes_at` before snapping; widgets draw from this so the grid and
-/// the placement math cannot drift apart.
-pub fn y_at(mins: u32, hour_start: u32) -> f64 {
-    f64::from(mins) / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR
+/// the placement math cannot drift apart. `hour_start` is the grid's first
+/// hour (0 on the shared full-day grid).
+pub fn y_at(mins: f64, hour_start: u32) -> f64 {
+    mins / 60.0 * PLAN_PX_PER_HOUR - f64::from(hour_start) * PLAN_PX_PER_HOUR
 }
 
 /// Start a block at `start` would move to, `dy` pixels down the grid.
@@ -1040,20 +1043,29 @@ pub fn prune_slots(slots: &mut Vec<PlanSlot>, live: &HashSet<&str>) -> bool {
     slots.len() != before
 }
 
-/// Today's day plan. Blocks are the open tasks with a slot on `today`; the
-/// tray is the rest of Today (overdue, then due today), unscheduled.
+/// The day plan for `viewed`. Blocks are the open tasks with a slot on that
+/// day; the tray is the open/overdue backlog (due on or before the
+/// wall-clock today) minus the tasks placed on `viewed`. The same task may
+/// sit on several days' plans at once, so a slot on another day does not
+/// empty it from the tray here. Today's tray is that rule with `viewed ==
+/// today`, which is the original behavior.
 ///
 /// Overlaps sit side by side: each block takes the leftmost column that no
 /// overlapping block already holds, and a group of blocks linked by overlap
 /// shares one width (`cols` columns). A drop or a move only changes the
 /// slot; the layout is recomputed here every time.
-pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> DayPlan {
+pub fn day_plan(
+    open: &[TaskView],
+    slots: &[PlanSlot],
+    now: DateTime<Tz>,
+    viewed: NaiveDate,
+) -> DayPlan {
     let zone = now.timezone();
     let today = now.date_naive();
-    let today_slots: Vec<&PlanSlot> = slots.iter().filter(|s| s.date == today).collect();
-    let placed: HashSet<&str> = today_slots.iter().map(|s| s.uid.as_str()).collect();
+    let day_slots: Vec<&PlanSlot> = slots.iter().filter(|s| s.date == viewed).collect();
+    let placed: HashSet<&str> = day_slots.iter().map(|s| s.uid.as_str()).collect();
     let mut blocks: Vec<PlanBlock> = Vec::new();
-    for s in &today_slots {
+    for s in &day_slots {
         if let Some(t) = open.iter().find(|t| t.task.uid == s.uid) {
             blocks.push(PlanBlock {
                 task: t.clone(),
@@ -1067,14 +1079,14 @@ pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> Day
     blocks.sort_by_key(|b| (b.start, b.duration, b.task.task.uid.clone()));
     layout(&mut blocks);
 
-    let day = |t: &TaskView| t.task.due.as_ref().map(|d| d.local_date(zone));
+    let due = |t: &TaskView| t.task.due.as_ref().map(|d| d.local_date(zone));
     let mut tray: Vec<TaskView> = open
         .iter()
-        .filter(|t| !placed.contains(t.task.uid.as_str()) && day(t).is_some_and(|d| d <= today))
+        .filter(|t| !placed.contains(t.task.uid.as_str()) && due(t).is_some_and(|d| d <= today))
         .cloned()
         .collect();
     tray.sort_by_key(|t| {
-        let d = day(t);
+        let d = due(t);
         (
             d.is_none(),
             d,
@@ -1084,11 +1096,14 @@ pub fn day_plan(open: &[TaskView], slots: &[PlanSlot], now: DateTime<Tz>) -> Day
     });
 
     DayPlan {
+        day: viewed,
         hour_start: PLAN_HOUR_START,
         hour_end: PLAN_HOUR_END,
         blocks,
         tray,
-        now_min: now_on_grid(now, PLAN_HOUR_START, PLAN_HOUR_END),
+        now_min: (viewed == today)
+            .then(|| now_on_grid(now, PLAN_HOUR_START, PLAN_HOUR_END))
+            .flatten(),
     }
 }
 
@@ -1189,7 +1204,7 @@ impl Counts {
                 }
             }
         }
-        c.plan = day_plan(data.open, slots, now).blocks.len();
+        c.plan = day_plan(data.open, slots, now, today).blocks.len();
         c
     }
 
@@ -2028,7 +2043,7 @@ mod tests {
             task("other", "/a/", on(date(9, 14))),
         ];
         let slots = vec![slot("now", 9 * 60, 60), slot("gone", 10 * 60, 30)];
-        let p = day_plan(&open, &slots, now());
+        let p = day_plan(&open, &slots, now(), date(9, 14));
         assert_eq!((p.hour_start, p.hour_end), (PLAN_HOUR_START, PLAN_HOUR_END));
         // `now` sits on the grid; `gone` is not open and is dropped.
         assert_eq!(placed(&p, "now"), Some((9 * 60, 60, 0, 1)));
@@ -2068,7 +2083,7 @@ mod tests {
             slot("c", 10 * 60, 90),
             slot("d", 12 * 60, 30),
         ];
-        let p = day_plan(&open, &slots, now());
+        let p = day_plan(&open, &slots, now(), date(9, 14));
         assert_eq!(placed(&p, "a"), Some((9 * 60, 120, 0, 3)));
         assert_eq!(placed(&p, "b"), Some((9 * 60 + 30, 90, 1, 3)));
         assert_eq!(placed(&p, "c"), Some((10 * 60, 90, 2, 3)));
@@ -2093,7 +2108,7 @@ mod tests {
             slot("c", 11 * 60, 60),
             slot("d", 11 * 60 + 30, 60),
         ];
-        let p = day_plan(&open, &slots, now());
+        let p = day_plan(&open, &slots, now(), date(9, 14));
         assert_eq!(placed(&p, "a"), Some((9 * 60, 60, 0, 2)));
         assert_eq!(placed(&p, "b"), Some((9 * 60 + 30, 60, 1, 2)));
         assert_eq!(placed(&p, "c"), Some((11 * 60, 60, 0, 2)));
@@ -2164,15 +2179,67 @@ mod tests {
         assert_eq!(now_on_grid(on(23, 59, 0), 0, 24), Some(23 * 60 + 59));
         assert_eq!(now_on_grid(on(23, 59, 40), 0, 24), Some(24 * 60 - 1));
         // day_plan carries the rule through.
-        let p = day_plan(&[], &[], on(0, 59, 0));
+        let p = day_plan(&[], &[], on(0, 59, 0), date(9, 14));
         assert_eq!(p.now_min, Some(59));
-        let p = day_plan(&[], &[], on(10, 0, 0));
+        let p = day_plan(&[], &[], on(10, 0, 0), date(9, 14));
         assert_eq!(p.now_min, Some(10 * 60));
+        // Only the wall-clock today wears a now-line.
+        let p = day_plan(&[], &[], on(10, 0, 0), date(9, 15));
+        assert_eq!(p.now_min, None);
+    }
+
+    #[test]
+    fn day_plan_follows_the_viewed_date() {
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("now", "/a/", on(date(9, 14))),
+            task("soon", "/b/", on(date(9, 15))),
+        ];
+        let slots = vec![
+            PlanSlot {
+                uid: "now".into(),
+                date: date(9, 14),
+                start: 9 * 60,
+                duration: 60,
+            },
+            PlanSlot {
+                uid: "soon".into(),
+                date: date(9, 15),
+                start: 11 * 60,
+                duration: 30,
+            },
+            PlanSlot {
+                uid: "now".into(),
+                date: date(9, 15),
+                start: 14 * 60,
+                duration: 30,
+            },
+        ];
+        // Today: `now` is on the grid; `soon` is due tomorrow so it is not
+        // in the backlog tray either.
+        let p = day_plan(&open, &slots, now(), date(9, 14));
+        assert_eq!(p.day, date(9, 14));
+        assert_eq!(placed(&p, "now"), Some((9 * 60, 60, 0, 1)));
+        assert_eq!(placed(&p, "soon"), None);
+        let tray: Vec<&str> = p.tray.iter().map(|t| t.task.uid.as_str()).collect();
+        assert_eq!(tray, ["late"]);
+        assert_eq!(p.now_min, Some(10 * 60));
+        // Tomorrow: that day's slots only. The tray is the same backlog
+        // minus what sits on the viewed day, so `now` (placed tomorrow too)
+        // leaves it and `late` stays. A slot on today does not empty the
+        // tray for another day.
+        let p = day_plan(&open, &slots, now(), date(9, 15));
+        assert_eq!(p.day, date(9, 15));
+        assert_eq!(placed(&p, "now"), Some((14 * 60, 30, 0, 1)));
+        assert_eq!(placed(&p, "soon"), Some((11 * 60, 30, 0, 1)));
+        let tray: Vec<&str> = p.tray.iter().map(|t| t.task.uid.as_str()).collect();
+        assert_eq!(tray, ["late"]);
+        assert_eq!(p.now_min, None);
     }
 
     #[test]
     fn scroll_keeps_now_in_view_without_leaving_the_grid() {
-        // 00:00–24:00 is 864 px tall at the shared scale.
+        // 00:00–24:00 is 24 hours on the shared scale.
         assert_eq!(grid_height(0, 24), 24.0 * PLAN_PX_PER_HOUR);
         assert_eq!(grid_height(7, 23), 16.0 * PLAN_PX_PER_HOUR);
         let day = grid_height(0, 24);
@@ -2222,11 +2289,11 @@ mod tests {
         assert_eq!(edge_end(9 * 60, 30, PLAN_PX_PER_HOUR / 2.0), 10 * 60);
         // y_at is the same mapping the widgets use: midnight at y 0 on a
         // full-day grid, and each hour one PLAN_PX_PER_HOUR further down.
-        assert_eq!(y_at(0, 0), 0.0);
-        assert_eq!(y_at(10 * 60, 0), 10.0 * PLAN_PX_PER_HOUR);
-        assert_eq!(y_at(10 * 60, 7), 3.0 * PLAN_PX_PER_HOUR);
+        assert_eq!(y_at(0.0, 0), 0.0);
+        assert_eq!(y_at(10.0 * 60.0, 0), 10.0 * PLAN_PX_PER_HOUR);
+        assert_eq!(y_at(10.0 * 60.0, 7), 3.0 * PLAN_PX_PER_HOUR);
         // A snapped minute round-trips through the shared scale.
-        assert_eq!(minutes_at(y_at(9 * 60, 0), 0), 9 * 60);
+        assert_eq!(minutes_at(y_at(9.0 * 60.0, 0), 0), 9 * 60);
     }
 
     #[test]
@@ -2237,7 +2304,7 @@ mod tests {
             assert_eq!((g.start, g.duration, g.col, g.cols), (hour * 60, 30, 0, 1));
         }
         // The pointer path and the ghost agree at an hour.
-        let y = y_at(10 * 60, PLAN_HOUR_START);
+        let y = y_at(10.0 * 60.0, PLAN_HOUR_START);
         let start = minutes_at(y, PLAN_HOUR_START);
         let g = ghost_block(&[], &t, start, PLAN_DEFAULT_DURATION);
         assert_eq!(g.start, 10 * 60);
@@ -2250,7 +2317,7 @@ mod tests {
             task("g", "/a/", on(date(9, 14))),
         ];
         let slots = vec![slot("a", 9 * 60, 60)];
-        let p = day_plan(&open, &slots, now());
+        let p = day_plan(&open, &slots, now(), date(9, 14));
         let t = task("g", "/a/", on(date(9, 14)));
         // Overlapping `a` joins its group in the free column.
         let g = ghost_block(&p.blocks, &t, 9 * 60 + 30, 30);
