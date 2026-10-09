@@ -15,7 +15,10 @@
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
 #   scripts/dev reset              wipe this instance's state, then up and seed
-#   scripts/dev down               stop the window, the tray, asstd and the bus (Radicale stays up)
+#   scripts/dev down [--all]       stop the window, the tray, asstd and the bus;
+#                                  --all also Radicale and stray target/debug bins.
+#                                  The devel hyprctl window rule cannot be
+#                                  dropped and stays until a config reload.
 #
 # ASST_DEV (default ~/.cache/asst-dev/<name>, name from ASST_DEV_NAME or
 # "gui") holds the bus address, config, cache and notes folder; the name is also the
@@ -114,7 +117,7 @@ print(json.dumps(slots))
 # Files older harness versions left in the instance dir. The live set is
 # the bus file, the logs and session.conf, plus config/ state/ data/ notes/.
 clear_stale() {
-  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|config|state|data|notes)$'
+  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|up\.lock|config|state|data|notes)$'
   local f base
   for f in "$DEV"/* "$DEV"/.*; do
     [ -e "$f" ] || continue
@@ -154,13 +157,19 @@ filesystem_folder = $RADICALE/data
 [logging]
 level = warning
 CONF
-  (setsid nohup uvx --from radicale radicale --config "$RADICALE/config" > "$RADICALE/log" 2>&1 &)
+  # 9>&-: do not inherit the up lock into the long-lived server.
+  (setsid nohup uvx --from radicale radicale --config "$RADICALE/config" > "$RADICALE/log" 2>&1 9>&- &)
   for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:5232/ && return; sleep 0.2; done
   echo "Radicale did not start; see $RADICALE/log" >&2
   exit 1
 }
 
 hide_window() {
+  # Named rule, so a later `up` replaces it in place. There is no remove
+  # or reset on hl.window_rule (the userdata has no methods, and the name
+  # map only holds one rule per name), so this stays until Hyprland
+  # reloads its config. `down --all` leaves it too; it matches only the
+  # devel app id, so a normal asst window is unaffected.
   if command -v hyprctl > /dev/null; then
     hyprctl eval 'hl.window_rule({ name = "asst-devel", match = { class = "^(dev.jaeho.Asst.Devel)$" }, workspace = "name:asstdev silent", no_initial_focus = true, render_unfocused = true, float = true, size = "1280 820" })' > /dev/null
   fi
@@ -183,6 +192,11 @@ inside() {
 
 case "${1:-}" in
   up)
+    # One bring-up at a time: a second `up` waits here instead of
+    # stacking a second bus and asstd on the same instance dir.
+    mkdir -p "$DEV"
+    exec 9>"$DEV/up.lock"
+    flock 9
     # Build first even when already up: the bus may be live with last
     # build's binaries. Bring-up itself stays idempotent below.
     build
@@ -230,8 +244,9 @@ SERVICE
   <servicedir>$DEV/data/dbus-1/services</servicedir>
 </busconfig>
 CONF
+    # 9>&-: the bus and asstd outlive `up`; they must not hold its lock.
     (setsid nohup dbus-run-session --config-file="$DEV/session.conf" \
-      -- "$0" inside > "$DEV/session.log" 2>&1 &)
+      -- "$0" inside > "$DEV/session.log" 2>&1 9>&- &)
     for _ in $(seq 50); do
       if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then echo "up: $DEV"; exit 0; fi
       sleep 0.2
@@ -287,7 +302,7 @@ CONF
     seed_tasks
     ;;
   reset)
-    "$0" down
+    "$0" down --all
     rm -f "$DEV/config/asst/window.toml" "$DEV"/state/asst/asst.db*
     rm -rf "$DEV/notes"
     mkdir -p "$DEV/notes"
@@ -300,6 +315,16 @@ CONF
   down)
     pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
     pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
+    if [ "${2:-}" = "--all" ]; then
+      # Stray debug binaries and this instance's Radicale. The window rule
+      # from hide_window cannot be dropped (see its comment); it only
+      # matches the devel app id and dies with a Hyprland config reload.
+      pkill -f "$BIN/asst-gtk" 2>/dev/null || true
+      pkill -f "$BIN/asstd" 2>/dev/null || true
+      pkill -f "target/debug/asst-gtk" 2>/dev/null || true
+      pkill -f "target/debug/asstd" 2>/dev/null || true
+      pkill -f "$RADICALE/config" 2>/dev/null || true
+    fi
     if [ -f "$DEV/bus" ]; then
       # The reply reads `(uint32 12345,)`.
       pid="$( (on_bus && gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
@@ -311,5 +336,5 @@ CONF
       rm -f "$DEV/bus"
     fi
     ;;
-  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
