@@ -1017,7 +1017,7 @@ pub fn list_popover_with(
         line.set_margin_bottom(6);
         line.set_margin_start(6);
         line.set_margin_end(6);
-        line.append(&ui::ring(l.color.as_deref(), 14));
+        line.append(&ui::list_mark(l, 14));
         let name = ui::label(&l.name, &[]);
         name.set_hexpand(true);
         line.append(&name);
@@ -1042,7 +1042,7 @@ pub fn list_popover_with(
         line.set_margin_bottom(6);
         line.set_margin_start(6);
         line.set_margin_end(6);
-        line.append(&gtk::Image::from_icon_name("list-add-symbolic"));
+        line.append(&gtk::Image::from_icon_name("plus-large-symbolic"));
         line.append(&create_label);
         create_row.set_child(Some(&line));
         create_row.set_visible(false);
@@ -1233,7 +1233,7 @@ pub fn reminder_popover(
             for a in &task.location_alarms {
                 let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 line.set_margin_start(6);
-                line.append(&gtk::Image::from_icon_name("location-symbolic"));
+                line.append(&gtk::Image::from_icon_name("lucide-map-pin-symbolic"));
                 let text = ui::label(&format!("On arrival at {}", a.title), &[]);
                 text.set_hexpand(true);
                 line.append(&text);
@@ -1436,7 +1436,7 @@ pub fn reminder_popover(
             .hexpand(true)
             .build();
         bar.append(&entry);
-        let go = gtk::Button::from_icon_name("magnifier-symbolic");
+        let go = gtk::Button::from_icon_name("edit-find-symbolic");
         go.add_css_class("flat");
         go.set_tooltip_text(Some("Search"));
         bar.append(&go);

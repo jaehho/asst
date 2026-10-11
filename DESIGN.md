@@ -35,6 +35,7 @@ Libadwaita dressed up, because the first plain libadwaita list felt bare:
 - **Tasks open in place:** the row grows into a card with the title, notes and a bar of buttons. A pane on the right came first; the card was preferred.
 - **Pickers:** a date picker (suggestions, three weeks, time, repeat), plus priority, list and reminder pickers.
 - **Also:** the task menu, the add card, Quick Find, selection, and colors and icons (GNOME Icon Development Kit, bundled as a GResource).
+- **List icons:** a list wears a Lucide icon in its color instead of the ring, chosen in the list dialog and kept in `window.toml` by href, since CalDAV has nowhere to put one. Lucide draws with strokes, which GTK's symbolic recoloring fills into blobs, so `scripts/lucide-icons.py` fetches a pinned release and writes each icon as a filled outline; the picker offers that curated set.
 
 - **One model, no widget state.** `model.rs` works out views, sections and counts from the daemon's data, so it is unit-tested. The window rebuilds a view's rows when what it shows changes, but not while a popover is open over them.
 - **The editor and the add card outlive rebuilds.** Each is one widget moved into the new rows, keeping its text, cursor and the keyboard. The open task's own edits don't rebuild the view, and nothing does while its title or notes have the keyboard: taking the field away would end an input method's composition mid-word.

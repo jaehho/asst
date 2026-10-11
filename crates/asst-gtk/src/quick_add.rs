@@ -104,6 +104,7 @@ impl Component for QuickAdd {
         card.open(Target::Anywhere);
         card.show_keep();
         let prefs = Prefs::load();
+        crate::ui::set_list_icons(&prefs.list_icons);
         card.set_defaults(prefs.default_priority, prefs.read_dates);
 
         let status = gtk::Label::builder()

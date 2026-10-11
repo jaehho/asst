@@ -112,7 +112,7 @@ impl Nav {
         match self {
             Nav::Inbox => "mailbox-symbolic",
             Nav::Today => "star-outline-thick-symbolic",
-            Nav::Day => "calendar-hollow-symbolic",
+            Nav::Day => "work-week-symbolic",
             Nav::Matrix => "flag-outline-thick-symbolic",
             Nav::Scheduled => "month-symbolic",
             Nav::Completed => "check-round-outline-symbolic",

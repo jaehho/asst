@@ -29,6 +29,9 @@ pub struct Prefs {
     /// The order lists were dragged into, as hrefs. Lists not in it follow,
     /// in the server's order.
     pub list_order: Vec<String>,
+    /// A list's icon (a Lucide name, see `ui::list_icon_names`), by href.
+    /// Window-only: the server has nowhere to keep one.
+    pub list_icons: BTreeMap<String, String>,
     /// Lists put away (hrefs): out of the sidebar, the views and the counts.
     /// They still sync, and their reminders still ring.
     pub archived: Vec<String>,
@@ -74,6 +77,7 @@ impl Default for Prefs {
             background: true,
             lists_by_name: false,
             list_order: Vec::new(),
+            list_icons: BTreeMap::new(),
             archived: Vec::new(),
             remember_list: false,
             default_priority: 4,

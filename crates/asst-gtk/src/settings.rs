@@ -478,7 +478,7 @@ fn archived_group(
     group.add(&none);
     for l in archived {
         let row = adw::ActionRow::builder().title(&l.name).build();
-        row.add_prefix(&crate::ui::ring(l.color.as_deref(), 16));
+        row.add_prefix(&crate::ui::list_mark(l, 16));
         let restore = gtk::Button::with_label("Unarchive");
         restore.set_valign(gtk::Align::Center);
         let (prefs, save, href) = (prefs.clone(), save.clone(), l.href.clone());

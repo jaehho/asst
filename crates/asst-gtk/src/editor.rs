@@ -870,8 +870,7 @@ impl Editor {
 
         let list = lists.iter().find(|l| l.href == t.list);
         ui::clear(&self.list_ring);
-        self.list_ring
-            .append(&ui::ring(list.and_then(|l| l.color.as_deref()), 14));
+        self.list_ring.append(&ui::list_mark_of(list, 14));
         self.list_label.set_text(&t.list_name);
 
         self.reminder_dot

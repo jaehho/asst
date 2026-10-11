@@ -741,7 +741,7 @@ impl AddCard {
             line.set_margin_bottom(4);
             line.set_margin_start(6);
             line.set_margin_end(6);
-            line.append(&ui::ring(l.color.as_deref(), 14));
+            line.append(&ui::list_mark(l, 14));
             line.append(&ui::label(&l.name, &[]));
             self.suggest_rows.append(&line);
         }
@@ -751,7 +751,7 @@ impl AddCard {
             line.set_margin_bottom(4);
             line.set_margin_start(6);
             line.set_margin_end(6);
-            line.append(&gtk::Image::from_icon_name("list-add-symbolic"));
+            line.append(&gtk::Image::from_icon_name("plus-large-symbolic"));
             line.append(&ui::label(&format!("Create list “{word}”"), &[]));
             self.suggest_rows.append(&line);
         }
@@ -857,8 +857,7 @@ impl AddCard {
                 .unwrap_or("Inbox"),
         );
         ui::clear(&self.list_ring);
-        self.list_ring
-            .append(&ui::ring(list.and_then(|l| l.color.as_deref()), 14));
+        self.list_ring.append(&ui::list_mark_of(list, 14));
     }
 
     pub fn submit(&self) {

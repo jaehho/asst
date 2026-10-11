@@ -347,12 +347,13 @@ impl Sidebar {
 
         let signed_in = st.status.is_some_and(|s| s.state != SyncState::NoAccount);
         let lists_key = format!(
-            "{:?}{}",
+            "{:?}{}{:?}",
             st.lists
                 .iter()
                 .map(|l| (&l.href, &l.name, &l.color, l.writable))
                 .collect::<Vec<_>>(),
-            st.prefs.lists_by_name
+            st.prefs.lists_by_name,
+            st.prefs.list_icons
         );
         if *self.lists_key.borrow() != lists_key {
             *self.lists_key.borrow_mut() = lists_key;
@@ -539,7 +540,7 @@ impl Sidebar {
         for l in lists {
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             line.add_css_class("list-line");
-            line.append(&ui::ring(l.color.as_deref(), 18));
+            line.append(&ui::list_mark(l, 18));
             let name = ui::label(&l.name, &[]);
             name.set_hexpand(true);
             line.append(&name);

@@ -188,7 +188,8 @@ pub enum Msg {
     /// to do with it once it exists.
     MakeList(String, Then),
     EditList(String),
-    SaveList(Option<String>, String, String),
+    /// href (none for a new list), name, color, icon
+    SaveList(Option<String>, String, String, Option<String>),
     AskDeleteList(String),
     DeleteList(String),
     /// A list's completed tasks, or every list's: ask first.
@@ -325,7 +326,8 @@ pub enum Cmd {
     Completed(String, client::Result<TaskView>),
     Added(client::Result<Added>),
     Opened(client::Result<TaskView>),
-    ListSaved(client::Result<ListView>),
+    /// The icon a list just made is to have, and the list.
+    ListSaved(Option<String>, client::Result<ListView>),
     ListMade(client::Result<ListView>, Then),
     /// A task's iCalendar object, to save.
     Ics(String, client::Result<String>),
@@ -1401,8 +1403,8 @@ impl Component for Window {
             }
             Msg::NewList => {
                 let tx = tx.clone();
-                dialogs::list_dialog(&w.window, None, move |name, color| {
-                    tx.emit(Msg::SaveList(None, name, color))
+                dialogs::list_dialog(&w.window, None, None, move |name, color, icon| {
+                    tx.emit(Msg::SaveList(None, name, color, icon))
                 });
             }
             Msg::OpenUrl(url) => {
@@ -1473,32 +1475,46 @@ impl Component for Window {
             Msg::EditList(href) => {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
                     let tx = tx.clone();
-                    dialogs::list_dialog(&w.window, Some(l), move |name, color| {
-                        tx.emit(Msg::SaveList(Some(href.clone()), name, color))
-                    });
+                    let icon = self.prefs.list_icons.get(&href).cloned();
+                    dialogs::list_dialog(
+                        &w.window,
+                        Some(l),
+                        icon.as_deref(),
+                        move |name, color, icon| {
+                            tx.emit(Msg::SaveList(Some(href.clone()), name, color, icon))
+                        },
+                    );
                 }
             }
-            Msg::SaveList(href, name, color) => {
+            Msg::SaveList(href, name, color, icon) => {
+                if let Some(h) = &href {
+                    self.set_list_icon(h, icon.as_deref());
+                }
+                // A new list has no href until the server has made it.
+                let new_icon = if href.is_none() { icon } else { None };
                 sender.oneshot_command(async move {
-                    Cmd::ListSaved(match href {
-                        None => {
-                            client::create_list(&ListSpec {
-                                name,
-                                color: Some(color),
-                            })
-                            .await
-                        }
-                        Some(h) => {
-                            client::update_list(
-                                &h,
-                                &ListChange {
-                                    name: Some(name),
+                    Cmd::ListSaved(
+                        new_icon,
+                        match href {
+                            None => {
+                                client::create_list(&ListSpec {
+                                    name,
                                     color: Some(color),
-                                },
-                            )
-                            .await
-                        }
-                    })
+                                })
+                                .await
+                            }
+                            Some(h) => {
+                                client::update_list(
+                                    &h,
+                                    &ListChange {
+                                        name: Some(name),
+                                        color: Some(color),
+                                    },
+                                )
+                                .await
+                            }
+                        },
+                    )
                 });
             }
             Msg::AskDeleteList(href) => {
@@ -1984,8 +2000,11 @@ impl Component for Window {
                 }
                 Err(e) => toast(w, &e),
             },
-            Cmd::ListSaved(result) => match result {
+            Cmd::ListSaved(icon, result) => match result {
                 Ok(l) => {
+                    if icon.is_some() {
+                        self.set_list_icon(&l.href, icon.as_deref());
+                    }
                     if !self.lists.iter().any(|x| x.href == l.href) {
                         self.lists.push(l.clone());
                         self.nav = Nav::List(l.href.clone());
@@ -2259,6 +2278,23 @@ impl Window {
         self.shown = 0;
         self.render(w, sender, false);
         w.add_card.focus();
+    }
+
+    /// A list's icon, or none; kept with the window's prefs.
+    fn set_list_icon(&mut self, href: &str, icon: Option<&str>) {
+        let was = self.prefs.list_icons.get(href).map(String::as_str);
+        if was == icon {
+            return;
+        }
+        match icon {
+            Some(i) => self
+                .prefs
+                .list_icons
+                .insert(href.to_string(), i.to_string()),
+            None => self.prefs.list_icons.remove(href),
+        };
+        self.prefs.save();
+        self.shown = 0;
     }
 
     fn default_target(&self) -> Target {
@@ -2780,6 +2816,7 @@ impl Window {
                 self.prefs.save();
             }
         }
+        ui::set_list_icons(&self.prefs.list_icons);
         let (lists, open, completed) = self.view_data();
         let data = Data {
             lists: &lists,
@@ -3770,7 +3807,7 @@ fn view_menu(tx: Tx) -> gtk::Popover {
                 }
                 next.hide_lists.push(l.href.clone());
             }
-            let ring = ui::ring(l.color.as_deref(), 12);
+            let ring = ui::list_mark(l, 12);
             let item = Item::new(None, &l.name).checked(!hidden).build(set(next));
             if let Some(content) = item.child().and_downcast::<gtk::Box>() {
                 content.prepend(&ring);
