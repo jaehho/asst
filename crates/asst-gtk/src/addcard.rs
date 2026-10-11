@@ -25,6 +25,9 @@ use crate::pickers::{self, DateOpts, Schedule};
 use crate::window::{Msg, Tx};
 use crate::{notes, ui};
 
+/// Starts making a list of the name given.
+pub type MakeList = Rc<dyn Fn(String)>;
+
 /// Where a task added from the card goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -64,7 +67,7 @@ pub struct AddCard {
     /// The `#word` the last suggestion row would make a list of.
     suggest_new: RefCell<Option<String>>,
     /// Makes a list nothing is named for. Without it, no row offers one.
-    on_create: RefCell<Option<Rc<dyn Fn(String)>>>,
+    on_create: RefCell<Option<MakeList>>,
     /// The list being made, and an add waiting on it.
     making: RefCell<Option<String>>,
     add_when_made: Cell<bool>,
@@ -455,7 +458,7 @@ impl AddCard {
                         if let Some(c) = weak.upgrade() {
                             c.make_list(name);
                         }
-                    }) as Rc<dyn Fn(String)>
+                    }) as MakeList
                 });
                 mb.set_popover(Some(&pickers::list_popover_with(
                     &lists,

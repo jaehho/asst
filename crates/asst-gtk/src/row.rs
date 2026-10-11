@@ -508,7 +508,7 @@ pub fn task_menu(
                     let make = {
                         let (tx, h) = (tx.clone(), h.clone());
                         Rc::new(move |name| tx.emit(Msg::MakeList(name, Then::Move(h.clone()))))
-                            as Rc<dyn Fn(String)>
+                            as crate::addcard::MakeList
                     };
                     let (tx, h) = (tx.clone(), h.clone());
                     let picker = pickers::list_popover_with(

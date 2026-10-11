@@ -417,7 +417,7 @@ impl Editor {
                 let make = {
                     let (tx, href) = (tx.clone(), t.href.clone());
                     Rc::new(move |name| tx.emit(Msg::MakeList(name, Then::Move(href.clone()))))
-                        as Rc<dyn Fn(String)>
+                        as crate::addcard::MakeList
                 };
                 mb.set_popover(Some(&pickers::list_popover_with(
                     &lists,
