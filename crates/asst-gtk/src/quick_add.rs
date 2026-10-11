@@ -33,6 +33,8 @@ fn last_list_path() -> PathBuf {
 
 pub struct QuickAdd {
     busy: bool,
+    /// The colors the lists wear, for the next one's.
+    colors: Vec<String>,
     keep_open: Rc<Cell<bool>>,
 }
 
@@ -44,12 +46,14 @@ pub struct Widgets {
 #[derive(Debug)]
 pub enum Msg {
     Add(Box<AddSpec>),
+    MakeList(String),
     Close,
 }
 
 #[derive(Debug)]
 pub enum Cmd {
     Lists(client::Result<Vec<ListView>>),
+    ListMade(client::Result<ListView>),
     Added(client::Result<Box<Added>>),
 }
 
@@ -92,6 +96,10 @@ impl Component for QuickAdd {
                 move || close.input(Msg::Close),
             )
         };
+        {
+            let sender = sender.clone();
+            card.on_create_list(move |name| sender.input(Msg::MakeList(name)));
+        }
         card.root.add_css_class("quick-add-card");
         card.open(Target::Anywhere);
         card.show_keep();
@@ -164,6 +172,7 @@ impl Component for QuickAdd {
         ComponentParts {
             model: QuickAdd {
                 busy: false,
+                colors: Vec::new(),
                 keep_open,
             },
             widgets: Widgets { card, status },
@@ -187,6 +196,18 @@ impl Component for QuickAdd {
                     Cmd::Added(client::add(&spec).await.map(Box::new))
                 });
             }
+            Msg::MakeList(name) => {
+                let color = crate::ui::unused_color(self.colors.iter().map(|c| Some(c.as_str())));
+                sender.oneshot_command(async move {
+                    Cmd::ListMade(
+                        client::create_list(&asst_core::api::ListSpec {
+                            name,
+                            color: Some(color.to_string()),
+                        })
+                        .await,
+                    )
+                });
+            }
             Msg::Close => relm4::main_application().quit(),
         }
     }
@@ -208,7 +229,16 @@ impl Component for QuickAdd {
             }
         };
         match cmd {
+            Cmd::ListMade(Ok(list)) => {
+                self.colors.extend(list.color.clone());
+                widgets.card.list_made(&list);
+            }
+            Cmd::ListMade(Err(e)) => {
+                widgets.card.list_failed();
+                say(&e, true);
+            }
             Cmd::Lists(Ok(lists)) => {
+                self.colors = lists.iter().filter_map(|l| l.color.clone()).collect();
                 let prefs = Prefs::load();
                 widgets.card.set_lists(&lists, prefs.sunday_first);
                 let last = std::fs::read_to_string(last_list_path()).unwrap_or_default();

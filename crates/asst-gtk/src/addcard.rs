@@ -61,6 +61,13 @@ pub struct AddCard {
     suggest_rows: gtk::ListBox,
     /// The names in `suggest_rows`, in order.
     suggested: RefCell<Vec<String>>,
+    /// The `#word` the last suggestion row would make a list of.
+    suggest_new: RefCell<Option<String>>,
+    /// Makes a list nothing is named for. Without it, no row offers one.
+    on_create: RefCell<Option<Rc<dyn Fn(String)>>>,
+    /// The list being made, and an add waiting on it.
+    making: RefCell<Option<String>>,
+    add_when_made: Cell<bool>,
     chosen: RefCell<Chosen>,
     target: RefCell<Target>,
     lists: RefCell<Vec<ListView>>,
@@ -225,6 +232,10 @@ impl AddCard {
             suggest,
             suggest_rows,
             suggested: RefCell::default(),
+            suggest_new: RefCell::default(),
+            on_create: RefCell::default(),
+            making: RefCell::default(),
+            add_when_made: Cell::new(false),
             chosen: RefCell::default(),
             target: RefCell::new(Target::Anywhere),
             lists: RefCell::default(),
@@ -299,9 +310,15 @@ impl AddCard {
                 if !c.suggesting() {
                     return glib::Propagation::Proceed;
                 }
+                let chosen = c.suggest_rows.selected_row().is_some();
                 match key {
                     gdk::Key::Down | gdk::Key::Up => {
                         c.move_suggestion(if key == gdk::Key::Down { 1 } else { -1 });
+                    }
+                    // Nothing is chosen while the only offer is a new list:
+                    // `#123` is text, and Enter adds the task.
+                    gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::Tab if !chosen => {
+                        return glib::Propagation::Proceed;
                     }
                     gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::Tab => c.take_suggestion(),
                     gdk::Key::Escape => c.suggest.popdown(),
@@ -432,7 +449,15 @@ impl AddCard {
                 let current = c.list_href();
                 let lists = c.lists.borrow().clone();
                 let weak = Rc::downgrade(&c);
-                mb.set_popover(Some(&pickers::list_popover(
+                let create = c.on_create.borrow().is_some().then(|| {
+                    let weak = Rc::downgrade(&c);
+                    Rc::new(move |name: String| {
+                        if let Some(c) = weak.upgrade() {
+                            c.make_list(name);
+                        }
+                    }) as Rc<dyn Fn(String)>
+                });
+                mb.set_popover(Some(&pickers::list_popover_with(
                     &lists,
                     current.as_deref(),
                     move |href| {
@@ -441,6 +466,7 @@ impl AddCard {
                             c.refresh();
                         }
                     },
+                    create,
                 )));
             });
         }
@@ -502,6 +528,44 @@ impl AddCard {
 
     pub fn focus(&self) {
         self.entry.grab_focus();
+    }
+
+    /// Lets pickers offer to make a list nothing is named for; `make`
+    /// starts it, and `list_made` or `list_failed` answers.
+    pub fn on_create_list(&self, make: impl Fn(String) + 'static) {
+        *self.on_create.borrow_mut() = Some(Rc::new(make));
+    }
+
+    fn make_list(&self, name: String) {
+        let Some(make) = self.on_create.borrow().clone() else {
+            return;
+        };
+        *self.making.borrow_mut() = Some(name.clone());
+        self.refresh();
+        make(name);
+    }
+
+    /// The list asked for exists now: the task goes there.
+    pub fn list_made(&self, list: &ListView) {
+        self.making.borrow_mut().take();
+        {
+            let mut lists = self.lists.borrow_mut();
+            if !lists.iter().any(|l| l.href == list.href) {
+                lists.push(list.clone());
+            }
+        }
+        self.chosen.borrow_mut().list = Some(list.href.clone());
+        self.refresh();
+        self.parse();
+        if self.add_when_made.take() {
+            self.submit();
+        }
+    }
+
+    pub fn list_failed(&self) {
+        self.making.borrow_mut().take();
+        self.add_when_made.set(false);
+        self.refresh();
     }
 
     /// Esc: the card closes, and what was typed is added first (in the
@@ -631,7 +695,7 @@ impl AddCard {
             .map_or(0, |i| i + 1);
         let word: String = chars[start..end].iter().collect();
         let rest = word.strip_prefix('#')?;
-        Some((start as i32, end as i32, rest.to_lowercase()))
+        Some((start as i32, end as i32, rest.to_string()))
     }
 
     fn suggest_lists(&self) {
@@ -641,19 +705,29 @@ impl AddCard {
                 .collect::<String>()
                 .to_lowercase()
         };
-        let matches: Vec<ListView> = match self.hash_word() {
-            Some((_, _, word)) => self
-                .lists
-                .borrow()
+        let word = self.hash_word().map(|(_, _, w)| w);
+        let lower = word.as_deref().map(str::to_lowercase);
+        let lists = self.lists.borrow();
+        let matches: Vec<ListView> = match &lower {
+            Some(word) => lists
                 .iter()
-                .filter(|l| l.writable && squash(&l.name).contains(&word))
-                .filter(|l| squash(&l.name) != word)
+                .filter(|l| l.writable && squash(&l.name).contains(word))
+                .filter(|l| squash(&l.name) != *word)
                 .take(8)
                 .cloned()
                 .collect(),
             None => Vec::new(),
         };
-        if matches.is_empty() {
+        // A word nobody is named for can become a list. Not a number:
+        // `#123` is an issue, and `#` alone is nothing yet.
+        let new = word.filter(|w| {
+            self.on_create.borrow().is_some()
+                && !w.is_empty()
+                && !w.chars().all(|c| c.is_ascii_digit())
+                && !lists.iter().any(|l| squash(&l.name) == w.to_lowercase())
+        });
+        drop(lists);
+        if matches.is_empty() && new.is_none() {
             self.suggest.popdown();
             return;
         }
@@ -668,18 +742,40 @@ impl AddCard {
             line.append(&ui::label(&l.name, &[]));
             self.suggest_rows.append(&line);
         }
+        if let Some(word) = &new {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.set_margin_top(4);
+            line.set_margin_bottom(4);
+            line.set_margin_start(6);
+            line.set_margin_end(6);
+            line.append(&gtk::Image::from_icon_name("list-add-symbolic"));
+            line.append(&ui::label(&format!("Create list “{word}”"), &[]));
+            self.suggest_rows.append(&line);
+        }
+        let first = !matches.is_empty();
         *self.suggested.borrow_mut() = matches.into_iter().map(|l| l.name).collect();
-        self.suggest_rows
-            .select_row(self.suggest_rows.row_at_index(0).as_ref());
+        *self.suggest_new.borrow_mut() = new;
+        // Existing lists first, the first chosen; "create" waits to be
+        // reached for.
+        self.suggest_rows.select_row(
+            first
+                .then(|| self.suggest_rows.row_at_index(0))
+                .flatten()
+                .as_ref(),
+        );
         if !self.suggest.is_visible() && self.entry.is_mapped() {
             self.suggest.popup();
         }
     }
 
     fn move_suggestion(&self, step: i32) {
-        let count = self.suggested.borrow().len() as i32;
-        let at = self.suggest_rows.selected_row().map_or(0, |r| r.index());
-        let next = (at + step).rem_euclid(count.max(1));
+        let count =
+            (self.suggested.borrow().len() + self.suggest_new.borrow().iter().count()) as i32;
+        let next = match self.suggest_rows.selected_row() {
+            Some(r) => (r.index() + step).rem_euclid(count.max(1)),
+            None if step > 0 => 0,
+            None => count - 1,
+        };
         self.suggest_rows
             .select_row(self.suggest_rows.row_at_index(next).as_ref());
     }
@@ -687,9 +783,21 @@ impl AddCard {
     /// Put the chosen list's name in place of the `#word`.
     fn take_suggestion(&self) {
         let index = self.suggest_rows.selected_row().map_or(0, |r| r.index());
-        let name = self.suggested.borrow().get(index as usize).cloned();
+        let existing = self.suggested.borrow().get(index as usize).cloned();
+        let new = match existing {
+            Some(_) => None,
+            None => self.suggest_new.borrow().clone(),
+        };
         self.suggest.popdown();
-        let (Some(name), Some((start, end, _))) = (name, self.hash_word()) else {
+        let name = match (existing, new) {
+            (Some(name), _) => name,
+            (None, Some(word)) => {
+                self.make_list(word.clone());
+                word
+            }
+            (None, None) => return,
+        };
+        let Some((start, end, _)) = self.hash_word() else {
             return;
         };
         let word: String = name.chars().filter(|c| !c.is_whitespace()).collect();
@@ -738,8 +846,13 @@ impl AddCard {
         let list = href
             .as_deref()
             .and_then(|h| lists.iter().find(|l| l.href == h));
-        self.list_label
-            .set_text(list.map_or("Inbox", |l| l.name.as_str()));
+        let making = self.making.borrow();
+        self.list_label.set_text(
+            making
+                .as_deref()
+                .or(list.map(|l| l.name.as_str()))
+                .unwrap_or("Inbox"),
+        );
         ui::clear(&self.list_ring);
         self.list_ring
             .append(&ui::ring(list.and_then(|l| l.color.as_deref()), 14));
@@ -748,6 +861,11 @@ impl AddCard {
     pub fn submit(&self) {
         let text = self.entry.text().trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if self.making.borrow().is_some() {
+            // The list this task is going to doesn't exist yet.
+            self.add_when_made.set(true);
             return;
         }
         self.suggest.popdown();

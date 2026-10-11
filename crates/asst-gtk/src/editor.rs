@@ -23,7 +23,7 @@ use crate::motion;
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::row::schedule_change;
 use crate::ui::{self, Item};
-use crate::window::{Msg, Tx};
+use crate::window::{Msg, Then, Tx};
 
 pub struct Editor {
     pub root: gtk::Box,
@@ -414,10 +414,16 @@ impl Editor {
                 };
                 let tx = e.tx.clone();
                 let lists = e.lists.borrow().clone();
-                mb.set_popover(Some(&pickers::list_popover(
+                let make = {
+                    let (tx, href) = (tx.clone(), t.href.clone());
+                    Rc::new(move |name| tx.emit(Msg::MakeList(name, Then::Move(href.clone()))))
+                        as Rc<dyn Fn(String)>
+                };
+                mb.set_popover(Some(&pickers::list_popover_with(
                     &lists,
                     Some(&t.list),
                     move |to| tx.emit(Msg::Move(t.href.clone(), to)),
+                    Some(make),
                 )));
             });
         }

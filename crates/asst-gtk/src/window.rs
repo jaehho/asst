@@ -112,6 +112,15 @@ pub enum Batch {
     Copy,
 }
 
+/// What a list made on the spot is for.
+#[derive(Debug, Clone)]
+pub enum Then {
+    /// The add card's list.
+    AddCard,
+    /// Where this task goes.
+    Move(String),
+}
+
 #[derive(Debug)]
 pub enum Msg {
     Navigate(Nav),
@@ -171,6 +180,9 @@ pub enum Msg {
     Batch(Batch),
     SetViewOpts(ViewOpts),
     NewList,
+    /// A list made from a picker that found none by that name, and what
+    /// to do with it once it exists.
+    MakeList(String, Then),
     EditList(String),
     SaveList(Option<String>, String, String),
     AskDeleteList(String),
@@ -309,6 +321,7 @@ pub enum Cmd {
     Added(client::Result<Added>),
     Opened(client::Result<TaskView>),
     ListSaved(client::Result<ListView>),
+    ListMade(client::Result<ListView>, Then),
     /// A task's iCalendar object, to save.
     Ics(String, client::Result<String>),
     /// Places found for a location reminder's search.
@@ -728,6 +741,10 @@ impl Component for Window {
         window.add_breakpoint(narrow);
 
         let add_card = AddCard::for_window(tx.clone());
+        {
+            let tx = tx.clone();
+            add_card.on_create_list(move |name| tx.emit(Msg::MakeList(name, Then::AddCard)));
+        }
         add_card.set_defaults(prefs.default_priority, prefs.read_dates);
 
         // View options: sort, show completed, priorities.
@@ -1380,6 +1397,17 @@ impl Component for Window {
                     tx.emit(Msg::SaveList(None, name, color))
                 });
             }
+            Msg::MakeList(name, then) => {
+                let color = ui::unused_color(self.lists.iter().map(|l| l.color.as_deref()));
+                sender.oneshot_command(async move {
+                    let made = client::create_list(&ListSpec {
+                        name,
+                        color: Some(color.to_string()),
+                    })
+                    .await;
+                    Cmd::ListMade(made, then)
+                });
+            }
             Msg::EditList(href) => {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
                     let tx = tx.clone();
@@ -1902,6 +1930,22 @@ impl Component for Window {
                     self.reload(&sender);
                 }
                 Err(e) => toast(w, &e),
+            },
+            Cmd::ListMade(result, then) => match result {
+                Ok(l) => {
+                    if !self.lists.iter().any(|x| x.href == l.href) {
+                        self.lists.push(l.clone());
+                    }
+                    match then {
+                        Then::AddCard => w.add_card.list_made(&l),
+                        Then::Move(href) => sender.input(Msg::Move(href, l.href.clone())),
+                    }
+                    self.reload(&sender);
+                }
+                Err(e) => {
+                    w.add_card.list_failed();
+                    toast(w, &e);
+                }
             },
             Cmd::Places(result) => match result {
                 Ok(places) => w.editor.show_places(places),
@@ -3282,6 +3326,26 @@ impl Window {
             }
             "add" => sender.input(Msg::ShowAdd(None)),
             // Choose a row or a button in the open popover by its words.
+            // `search <text>`: into the open popover's search field.
+            "search" => {
+                let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
+                    eprintln!("drive: no popover open");
+                    return;
+                };
+                let mut stack: Vec<gtk::Widget> = p.child().into_iter().collect();
+                while let Some(widget) = stack.pop() {
+                    if let Some(entry) = widget.downcast_ref::<gtk::SearchEntry>() {
+                        entry.set_text(arg);
+                        return;
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(c) = child {
+                        child = c.next_sibling();
+                        stack.push(c);
+                    }
+                }
+                eprintln!("drive: no search field in the popover");
+            }
             "pick" => {
                 let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
                     eprintln!("drive: no popover open");

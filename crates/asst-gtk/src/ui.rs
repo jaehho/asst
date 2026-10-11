@@ -31,6 +31,18 @@ pub const COLORS: [(&str, &str); 20] = [
     ("Taupe", "#b99780"),
 ];
 
+/// A color for a list made without the color dialog: the first of
+/// `COLORS` no list wears yet, or Blue (the dialog's own default) when
+/// every one is taken.
+pub fn unused_color<'a>(used: impl IntoIterator<Item = Option<&'a str>>) -> &'static str {
+    let used: Vec<String> = used.into_iter().flatten().map(str::to_lowercase).collect();
+    COLORS
+        .iter()
+        .map(|(_, hex)| *hex)
+        .find(|hex| !used.iter().any(|u| u == hex))
+        .unwrap_or(COLORS[11].1)
+}
+
 pub fn icon(name: &str, px: i32) -> gtk::Image {
     let image = gtk::Image::from_icon_name(name);
     image.set_pixel_size(px);
@@ -339,4 +351,22 @@ pub fn tip(w: &impl IsA<gtk::Widget>, text: &str, keys: &str) {
         glib::markup_escape_text(text),
         glib::markup_escape_text(keys)
     )));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_list_takes_the_first_color_nobody_wears() {
+        assert_eq!(unused_color([]), COLORS[0].1);
+        let used = [Some("#C42D78"), None, Some("#e23d3d")];
+        assert_eq!(unused_color(used), COLORS[2].1);
+    }
+
+    #[test]
+    fn with_every_color_taken_it_is_blue() {
+        let all: Vec<Option<&str>> = COLORS.iter().map(|(_, h)| Some(*h)).collect();
+        assert_eq!(unused_color(all), "#3c6dff");
+    }
 }

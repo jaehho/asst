@@ -5,6 +5,7 @@
 //! Right-click for the task menu; drag it onto a list or a view.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use asst_core::api::{Change, ListView, TaskView};
 use asst_core::fmt;
@@ -16,7 +17,7 @@ use relm4::gtk::{self, gdk, glib, pango};
 
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::ui::{self, Item};
-use crate::window::{Msg, Tx};
+use crate::window::{Msg, Then, Tx};
 use crate::{model, motion};
 
 /// What a drag of a task carries.
@@ -504,10 +505,18 @@ pub fn task_menu(
         items.push(
             Item::new(Some("arrow3-right-symbolic"), "Move to…")
                 .build(move || {
+                    let make = {
+                        let (tx, h) = (tx.clone(), h.clone());
+                        Rc::new(move |name| tx.emit(Msg::MakeList(name, Then::Move(h.clone()))))
+                            as Rc<dyn Fn(String)>
+                    };
                     let (tx, h) = (tx.clone(), h.clone());
-                    let picker = pickers::list_popover(&lists, Some(&list), move |to| {
-                        tx.emit(Msg::Move(h.clone(), to))
-                    });
+                    let picker = pickers::list_popover_with(
+                        &lists,
+                        Some(&list),
+                        move |to| tx.emit(Msg::Move(h.clone(), to)),
+                        Some(make),
+                    );
                     let anchor = anchor.clone();
                     glib::idle_add_local_once(move || show_at(&picker, &anchor, at));
                 })
