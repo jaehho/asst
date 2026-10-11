@@ -255,6 +255,21 @@ pub fn day_grid(
         let place = place.clone();
         move || place()
     });
+    // Map and the 50 ms timer can both come before the window has handed
+    // the Fixed a width (a view shown at startup): the lanes would stay at
+    // the minimum. Place again whenever the allocated width changes.
+    let applied = std::rc::Rc::new(std::cell::Cell::new(0));
+    {
+        let (place, applied) = (place.clone(), applied.clone());
+        fixed.add_tick_callback(move |f, _| {
+            let w = f.width();
+            if w > 0 && w != applied.get() {
+                applied.set(w);
+                place();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     // Map runs after the first real allocation, so a rebuild of an
     // already-sized Fixed still re-centers.
     fixed.connect_map(move |_| place());

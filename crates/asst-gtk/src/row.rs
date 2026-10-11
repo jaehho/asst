@@ -37,6 +37,9 @@ pub fn dragging() -> Option<String> {
 pub struct RowOpts<'a> {
     pub now: DateTime<Tz>,
     pub show_list: bool,
+    /// A narrow column: the title keeps the room, and the origin and list
+    /// captions are left off (the list is in the tooltip).
+    pub compact: bool,
     pub completing: bool,
     /// Checked since the row was last drawn: the box pops.
     pub just_checked: bool,
@@ -129,7 +132,11 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         .ellipsize(pango::EllipsizeMode::End)
         .build();
     title.add_css_class("task-title");
-    title.set_tooltip_text(Some(&t.task.summary));
+    title.set_tooltip_text(Some(&if o.compact {
+        format!("{}\n{}", t.task.summary, t.list_name)
+    } else {
+        t.task.summary.clone()
+    }));
     body.append(&title);
 
     if let Some(notes) = t
@@ -166,7 +173,7 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         i.set_tooltip_text(Some("Not on the server yet"));
         body.append(&i);
     }
-    {
+    if !o.compact {
         // Creation site, not the last editor. Grey caption, same weight as
         // the list name — provenance is context, not a state colour.
         let tip = match t.origin.as_str() {

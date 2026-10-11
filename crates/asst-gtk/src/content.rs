@@ -356,6 +356,7 @@ fn section(
         let r = row::task_row(
             t,
             &RowOpts {
+                compact: false,
                 now: o.now,
                 show_list,
                 completing: o.completing.contains(&t.href),
