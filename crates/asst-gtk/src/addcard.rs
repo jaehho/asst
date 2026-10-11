@@ -2,7 +2,10 @@
 //! what was understood, or set the date, priority, reminders and list with
 //! buttons; notes go under the title, and notes to link under those (quick
 //! add started from a note). Typing `#` suggests lists. Enter adds and keeps
-//! the card open for the next one.
+//! the card open for the next one; in the notes, Enter adds too and
+//! Shift+Enter starts a new line. In the window, what is typed is added when
+//! the card is left (Esc, another view, the window closing); the cancel
+//! button is what throws it away.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -67,19 +70,31 @@ pub struct AddCard {
     read_dates: Cell<bool>,
     on_add: Box<dyn Fn(AddSpec)>,
     on_cancel: Rc<dyn Fn()>,
+    /// Leaving the card with a title typed adds the task (the window's
+    /// card; quick add's popup throws it away).
+    save_on_leave: bool,
 }
 
 impl AddCard {
     /// The window's card sends its tasks as messages.
     pub fn for_window(tx: Tx) -> Rc<AddCard> {
         let cancel = tx.clone();
-        AddCard::new(
+        AddCard::build(
             move |spec| tx.emit(Msg::Add(Box::new(spec))),
             move || cancel.emit(Msg::HideAdd),
+            true,
         )
     }
 
     pub fn new(on_add: impl Fn(AddSpec) + 'static, on_cancel: impl Fn() + 'static) -> Rc<AddCard> {
+        AddCard::build(on_add, on_cancel, false)
+    }
+
+    fn build(
+        on_add: impl Fn(AddSpec) + 'static,
+        on_cancel: impl Fn() + 'static,
+        save_on_leave: bool,
+    ) -> Rc<AddCard> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.add_css_class("card");
         root.add_css_class("add-card");
@@ -100,7 +115,6 @@ impl AddCard {
         root.append(&chips);
         let notes = ui::text_view("Notes");
         notes.add_css_class("add-notes");
-        notes::enhance(&notes);
         root.append(&notes);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
@@ -166,7 +180,11 @@ impl AddCard {
         // An icon, so the buttons still fit a phone-wide window.
         let cancel = gtk::Button::from_icon_name("window-close-symbolic");
         cancel.add_css_class("flat");
-        ui::tip(&cancel, "Cancel", "Esc");
+        if save_on_leave {
+            ui::tip(&cancel, "Discard", "Esc keeps what you typed");
+        } else {
+            ui::tip(&cancel, "Cancel", "Esc");
+        }
         actions.append(&cancel);
         let add = gtk::Button::with_label("Add Task");
         add.add_css_class("suggested-action");
@@ -215,8 +233,23 @@ impl AddCard {
             read_dates: Cell::new(true),
             on_add: Box::new(on_add),
             on_cancel: Rc::new(on_cancel),
+            save_on_leave,
         });
-
+        {
+            // Before `enhance`, whose handler carries a list on from a
+            // newline: a stopped newline must not reach it.
+            let weak = Rc::downgrade(&card);
+            notes_enter(&card.notes, move || {
+                if let Some(c) = weak.upgrade() {
+                    if c.entry.text().trim().is_empty() {
+                        c.entry.grab_focus();
+                    } else {
+                        c.submit();
+                    }
+                }
+            });
+            notes::enhance(&card.notes);
+        }
         {
             let weak = Rc::downgrade(&card);
             let add = add.clone();
@@ -280,10 +313,12 @@ impl AddCard {
         }
         {
             let keys = gtk::EventControllerKey::new();
-            let on_cancel = card.on_cancel.clone();
+            let weak = Rc::downgrade(&card);
             keys.connect_key_pressed(move |_, key, _, _| {
-                if key == gdk::Key::Escape {
-                    on_cancel();
+                if key == gdk::Key::Escape
+                    && let Some(c) = weak.upgrade()
+                {
+                    c.leave();
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
@@ -467,6 +502,23 @@ impl AddCard {
 
     pub fn focus(&self) {
         self.entry.grab_focus();
+    }
+
+    /// Esc: the card closes, and what was typed is added first (in the
+    /// window).
+    pub fn leave(&self) {
+        self.save_draft();
+        (self.on_cancel)();
+    }
+
+    /// Add the task being typed, if there is one and this card keeps what
+    /// is left in it. For leaving the card by any way but its cancel button.
+    pub fn save_draft(&self) -> bool {
+        let save = self.save_on_leave && !self.entry.text().trim().is_empty();
+        if save {
+            self.submit();
+        }
+        save
     }
 
     /// The list suggestions are up, and take Enter and Esc.
@@ -797,4 +849,40 @@ pub fn chips(p: &quickadd::Parsed) -> Vec<(String, &'static str)> {
         }
     }
     out
+}
+
+/// Enter in the notes calls `add` instead of starting a line; Shift+Enter
+/// still does. The newline is stopped where it is inserted, after the input
+/// method has had the key, so Enter that only confirms a composition adds
+/// nothing.
+fn notes_enter(view: &gtk::TextView, add: impl Fn() + 'static) {
+    let plain = Rc::new(Cell::new(false));
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let plain = plain.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let held = state.intersects(
+                gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK,
+            );
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) && !held {
+                plain.set(true);
+                // The insert, if the key makes one, is within this event.
+                let plain = plain.clone();
+                glib::idle_add_local_once(move || plain.set(false));
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    view.add_controller(keys);
+    let add = Rc::new(add);
+    view.buffer().connect_insert_text(move |b, _, text| {
+        if text == "\n" && plain.replace(false) {
+            b.stop_signal_emission_by_name("insert-text");
+            let add = add.clone();
+            glib::idle_add_local_once(move || add());
+        }
+    });
 }

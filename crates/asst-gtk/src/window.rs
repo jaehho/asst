@@ -949,7 +949,9 @@ impl Component for Window {
                     self.nav = nav;
                     self.prefs.view = self.nav.key();
                     self.prefs.save();
-                    self.adding = None;
+                    if self.adding.take().is_some() {
+                        let _ = w.add_card.save_draft();
+                    }
                     self.cursor = None;
                     if self.select_mode {
                         self.select_mode = false;
@@ -1566,7 +1568,9 @@ impl Component for Window {
                     self.close_editor(w, &sender);
                     self.nav = Nav::List(t.list.clone());
                     self.prefs.view = self.nav.key();
-                    self.adding = None;
+                    if self.adding.take().is_some() {
+                        let _ = w.add_card.save_draft();
+                    }
                     if !t.task.is_open() {
                         let mut opts = self.prefs.view_opts(&self.nav);
                         opts.show_completed = true;
@@ -1660,7 +1664,7 @@ impl Component for Window {
             }
             Msg::Quit => {
                 self.remember_size(w);
-                let waiting = w.editor.has_pending();
+                let waiting = w.add_card.save_draft() || w.editor.has_pending();
                 self.close_editor(w, &sender);
                 let deletes: Vec<String> = self.hidden.iter().cloned().collect();
                 sender.oneshot_command(async move {
@@ -2122,6 +2126,7 @@ impl Window {
     /// now, since their toasts go with the window.
     fn hide(&mut self, w: &Widgets, sender: &ComponentSender<Self>) {
         self.remember_size(w);
+        let _ = w.add_card.save_draft();
         self.close_editor(w, sender);
         w.toasts.dismiss_all();
         w.window.set_visible(false);
@@ -2137,6 +2142,7 @@ impl Window {
         self.close_editor(w, sender);
         let target = target.unwrap_or_else(|| self.default_target());
         if self.adding.as_ref() != Some(&target) {
+            let _ = w.add_card.save_draft();
             w.add_card.open(target.clone());
         }
         self.adding = Some(target);
@@ -2518,7 +2524,7 @@ impl Window {
                 } else if self.editing.is_some() {
                     sender.input(Msg::CloseEditor);
                 } else if self.adding.is_some() {
-                    sender.input(Msg::HideAdd);
+                    w.add_card.leave();
                 }
             }
             Key::PrevView | Key::NextView => {

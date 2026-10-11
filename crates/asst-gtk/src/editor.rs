@@ -284,15 +284,23 @@ impl Editor {
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             let weak = Rc::downgrade(self);
-            keys.connect_key_pressed(move |_, key, _, _| {
-                // Shift+Tab reads as ISO_Left_Tab.
-                if key == gdk::Key::ISO_Left_Tab
-                    && let Some(e) = weak.upgrade()
-                {
-                    e.focus();
-                    return glib::Propagation::Stop;
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let Some(e) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                match key {
+                    // Shift+Tab reads as ISO_Left_Tab.
+                    gdk::Key::ISO_Left_Tab => e.focus(),
+                    // Enter is a new line here; Ctrl+Enter is done.
+                    gdk::Key::Return | gdk::Key::KP_Enter
+                        if state.contains(gdk::ModifierType::CONTROL_MASK) =>
+                    {
+                        // Closing sends what is typed.
+                        e.tx.emit(Msg::CloseEditor);
+                    }
+                    _ => return glib::Propagation::Proceed,
                 }
-                glib::Propagation::Proceed
+                glib::Propagation::Stop
             });
             self.notes.add_controller(keys);
         }
