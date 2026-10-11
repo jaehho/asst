@@ -461,8 +461,17 @@ fn day_at(toks: &[Tok], i: usize, today: NaiveDate) -> Option<(usize, NaiveDate)
             return Some((2, next_weekday(today, wd, false)));
         }
         "this" | "on" => {
-            let wd = weekday(next?)?;
-            return Some((2, next_weekday(today, wd, t == "this")));
+            if let Some(wd) = next.and_then(weekday) {
+                return Some((2, next_weekday(today, wd, t == "this")));
+            }
+            // this weekend, on oct 25, on 9/20
+            let (n, date) = day_at(toks, i + 1, today)?;
+            return Some((n + 1, date));
+        }
+        // File taxes by friday, report due oct 25
+        "by" | "due" => {
+            let (n, date) = day_at(toks, i + 1, today)?;
+            return Some((n + 1, date));
         }
         "in" => {
             let n: i64 = match next? {
@@ -482,7 +491,8 @@ fn day_at(toks: &[Tok], i: usize, today: NaiveDate) -> Option<(usize, NaiveDate)
         _ => {}
     }
     if let Some(wd) = weekday(t) {
-        if !ambiguous_weekday(t) {
+        // "sat" alone may be a verb; "sat 7pm" is a day.
+        if !ambiguous_weekday(t) || time_at(toks, i + 1, true).is_some() {
             return Some((1, next_weekday(today, wd, false)));
         }
         return None;
@@ -807,6 +817,32 @@ mod tests {
             &"Call the bank #errands p1 tomorrow 5pm !30m"[r.spans[2].0.clone()],
             "tomorrow 5pm"
         );
+    }
+
+    #[test]
+    fn a_preposition_before_a_date_goes_with_it() {
+        // "now" is Monday 9/14.
+        let r = p("Dentist on oct 25");
+        assert_eq!(r.summary, "Dentist");
+        assert_eq!(r.due, Some(date(10, 25)));
+        let r = p("File taxes by friday");
+        assert_eq!(r.summary, "File taxes");
+        assert_eq!(r.due, Some(date(9, 18)));
+        let r = p("Report due 9/30");
+        assert_eq!(r.summary, "Report");
+        assert_eq!(r.due, Some(date(9, 30)));
+        let r = p("Call mom this weekend");
+        assert_eq!(r.summary, "Call mom");
+        assert_eq!(r.due, Some(date(9, 19)));
+        assert_eq!(p("Hand it in by hand").summary, "Hand it in by hand");
+    }
+
+    #[test]
+    fn a_day_abbreviation_that_is_also_a_word_needs_a_time() {
+        let r = p("Dinner sat 7pm");
+        assert_eq!(r.summary, "Dinner");
+        assert_eq!(r.due, Some(at(9, 19, 19, 0)));
+        assert_eq!(p("We sat down").summary, "We sat down");
     }
 
     #[test]
