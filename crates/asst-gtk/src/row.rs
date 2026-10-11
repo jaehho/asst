@@ -523,6 +523,27 @@ pub fn task_menu(
                 .upcast(),
         );
     }
+    if let Some(issue) = &t.issue {
+        let (start, h) = (send.clone(), href.clone());
+        items.push(
+            Item::new(
+                Some("go-next-symbolic"),
+                &format!("Start work on #{}…", issue.number),
+            )
+            .build(move || start(Msg::StartWork(h.clone())))
+            .upcast(),
+        );
+        let (open, url) = (send.clone(), issue.url.clone());
+        items.push(
+            Item::new(
+                Some("external-link-symbolic"),
+                &format!("Open #{} on GitHub", issue.number),
+            )
+            .build(move || open(Msg::OpenUrl(url.clone())))
+            .upcast(),
+        );
+        items.push(ui::separator());
+    }
     {
         let (send, h) = (send.clone(), href.clone());
         items.push(

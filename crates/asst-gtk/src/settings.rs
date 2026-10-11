@@ -298,8 +298,45 @@ fn general_page(
         Box::new(|p, on| p.sunday_first = on),
     ));
     page.add(&window_group);
+    page.add(&github_group(&p, prefs, save));
     page.add(&background_group(dialog, p.background, prefs, save));
     page
+}
+
+/// Where checkouts are, and what Start work runs for a task's issue.
+fn github_group(
+    p: &Prefs,
+    prefs: &Rc<RefCell<Prefs>>,
+    save: &Rc<dyn Fn()>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("GitHub")
+        .description("For tasks in lists linked to a repo (asst link)")
+        .build();
+    let entry = |title: &str, text: &str, set: fn(&mut Prefs, String)| {
+        let row = adw::EntryRow::builder()
+            .title(title)
+            .text(text)
+            .show_apply_button(true)
+            .build();
+        let (prefs, save) = (prefs.clone(), save.clone());
+        row.connect_apply(move |e| {
+            set(&mut prefs.borrow_mut(), e.text().trim().to_string());
+            save();
+        });
+        row
+    };
+    group.add(&entry(
+        "Projects folder (a checkout per repo, named for it)",
+        &p.projects_dir,
+        |p, v| p.projects_dir = v,
+    ));
+    group.add(&entry(
+        "Start work runs ({dir} {number} {repo} {url})",
+        &p.work_command,
+        |p, v| p.work_command = v,
+    ));
+    group
 }
 
 /// When a task with a time rings by default, as minutes before it.

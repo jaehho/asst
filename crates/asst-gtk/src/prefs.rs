@@ -38,6 +38,12 @@ pub struct Prefs {
     pub default_priority: u8,
     /// A date or repeat typed in a new task's title becomes its own.
     pub read_dates: bool,
+    /// Where checkouts of linked repos live: a folder holding one folder
+    /// per repo, named for it. `~` is the home folder.
+    pub projects_dir: String,
+    /// What "Start work" on a GitHub issue runs, through `sh`: `{dir}` is
+    /// the repo's checkout, `{number}` the issue, `{repo}` and `{url}`.
+    pub work_command: String,
     /// The views in the sidebar, in order, as `Nav::key`s. Unset: the default.
     pub sidebar: Option<Vec<String>>,
     /// Before `sidebar`: views shown besides Inbox, Today, Scheduled and
@@ -72,6 +78,8 @@ impl Default for Prefs {
             remember_list: false,
             default_priority: 4,
             read_dates: true,
+            projects_dir: "~/projects".into(),
+            work_command: "kitty --directory {dir} gh-co {number}".into(),
             sidebar: None,
             filters: Vec::new(),
             plan: Vec::new(),

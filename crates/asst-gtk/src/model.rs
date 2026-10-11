@@ -1328,6 +1328,40 @@ pub fn sync_state(s: &StatusView, now: DateTime<Tz>) -> String {
     state
 }
 
+/// `owner/repo` of an issue's URL.
+pub fn issue_repo(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
+/// Where a repo is checked out: its name under the projects folder
+/// (`~` in it is the home folder).
+pub fn checkout_dir(projects: &str, repo: &str, home: &str) -> std::path::PathBuf {
+    let projects = match projects.trim() {
+        "" => "~/projects",
+        p => p,
+    };
+    let projects = match projects.strip_prefix('~') {
+        Some(rest) => format!("{home}{rest}"),
+        None => projects.to_string(),
+    };
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    std::path::Path::new(&projects).join(name)
+}
+
+/// The command to run for "start work": `template` with `{dir}`, `{repo}`,
+/// `{number}` and `{url}` replaced, each quoted for `sh`.
+pub fn work_command(template: &str, dir: &str, repo: &str, number: u32, url: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    template
+        .replace("{dir}", &quote(dir))
+        .replace("{repo}", &quote(repo))
+        .replace("{number}", &number.to_string())
+        .replace("{url}", &quote(url))
+}
+
 /// A list's GitHub link, as its sidebar mark's tooltip says it.
 pub fn link_state(l: &LinkView, now: DateTime<Tz>) -> String {
     match (&l.error, l.synced) {
@@ -1923,6 +1957,33 @@ mod tests {
         assert_eq!(ago(at(7300), now()), "2 hours ago");
         assert_eq!(ago(at(3 * 86400), now()), "on Sep 11");
         assert_eq!(ago(at(400 * 86400), now()), "on Aug 10, 2025");
+    }
+
+    #[test]
+    fn work_starts_in_the_checkout_of_the_issues_repo() {
+        assert_eq!(
+            issue_repo("https://github.com/jaehho/asst/issues/12").as_deref(),
+            Some("jaehho/asst")
+        );
+        assert_eq!(issue_repo("https://example.com/a/b/issues/1"), None);
+        assert_eq!(
+            checkout_dir("~/projects", "jaehho/asst", "/home/jaeho"),
+            std::path::PathBuf::from("/home/jaeho/projects/asst")
+        );
+        assert_eq!(
+            checkout_dir("/srv/src", "jaehho/asst", "/home/jaeho"),
+            std::path::PathBuf::from("/srv/src/asst")
+        );
+        assert_eq!(
+            work_command(
+                "kitty --directory {dir} gh-co {number}",
+                "/home/jaeho/my projects/it's",
+                "jaehho/asst",
+                12,
+                "https://github.com/jaehho/asst/issues/12"
+            ),
+            "kitty --directory '/home/jaeho/my projects/it'\\''s' gh-co 12"
+        );
     }
 
     #[test]

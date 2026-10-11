@@ -180,6 +180,10 @@ pub enum Msg {
     Batch(Batch),
     SetViewOpts(ViewOpts),
     NewList,
+    /// Run the work command in the checkout of the task's issue's repo.
+    StartWork(String),
+    /// A link, in the browser.
+    OpenUrl(String),
     /// A list made from a picker that found none by that name, and what
     /// to do with it once it exists.
     MakeList(String, Then),
@@ -1400,6 +1404,60 @@ impl Component for Window {
                 dialogs::list_dialog(&w.window, None, move |name, color| {
                     tx.emit(Msg::SaveList(None, name, color))
                 });
+            }
+            Msg::OpenUrl(url) => {
+                gtk::UriLauncher::new(&url).launch(
+                    Some(&w.window),
+                    None::<&gio::Cancellable>,
+                    |_| {},
+                );
+            }
+            Msg::StartWork(href) => {
+                let Some(issue) = self.find(&href).and_then(|t| t.issue.clone()) else {
+                    return;
+                };
+                let Some(repo) = model::issue_repo(&issue.url) else {
+                    return;
+                };
+                if self.prefs.work_command.trim().is_empty() {
+                    toast(w, "Set what Start work runs in Preferences → GitHub");
+                    return;
+                }
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dir = model::checkout_dir(&self.prefs.projects_dir, &repo, &home);
+                if !dir.is_dir() {
+                    toast(
+                        w,
+                        &format!(
+                            "No checkout of {repo} at {} (Preferences → GitHub)",
+                            dir.display()
+                        ),
+                    );
+                    return;
+                }
+                let command = model::work_command(
+                    &self.prefs.work_command,
+                    &dir.to_string_lossy(),
+                    &repo,
+                    issue.number,
+                    &issue.url,
+                );
+                match std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .current_dir(&dir)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    // Reaped when it ends, so it doesn't linger as a zombie.
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => toast(w, &format!("Could not run {command}: {e}")),
+                }
             }
             Msg::MakeList(name, then) => {
                 let color = ui::unused_color(self.lists.iter().map(|l| l.color.as_deref()));
