@@ -49,6 +49,7 @@ Libadwaita dressed up, because the first plain libadwaita list felt bare:
 - **Undo instead of confirmation.**
   - A checked task is struck through for a moment and can be unchecked.
   - A deleted one hides at once and goes when its Undo toast does, or before the window closes.
+  - The add card is left with what was typed added, not lost (Esc, another view, closing the window; its ✕ discards), and a toast offers Undo. Enter in its notes adds; Shift+Enter is the new line. The notes' newline is stopped where it is inserted, after the input method has had the key, so Enter that only confirms a composition adds nothing.
   - Deleting a list asks first, because it takes its tasks on every device. So does deleting completed tasks, which the daemon does in one transaction, however many (the window only ever loads 500).
 - **Lists are ordered and archived in the window:** `window.toml`, not the server's `calendar-order`, which shared and read-only lists couldn't take anyway. An archived list still syncs and its reminders still ring; it is only out of sight (sidebar, views, counts, the tray). The ring beside a list is its color, not progress: these lists are long-term projects, so a completed share would only grow toward 100% and mean nothing.
 - **Notes stay plain text,** since the iPhone shows them as they are: Enter carries on `- `, `* `, `- [ ] ` and numbered lists, and links are drawn as links and open with Ctrl+click. No bold, headings or hidden markers, which would turn to clutter on the phone.
