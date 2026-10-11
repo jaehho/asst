@@ -132,6 +132,13 @@ pub struct LinkView {
     /// The list's href.
     pub list: String,
     pub name: String,
+    /// When asstd last read the repo's issues without trouble. Not kept
+    /// across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced: Option<DateTime<Utc>>,
+    /// Why the last pass failed, until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The GitHub issue a task is paired with.

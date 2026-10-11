@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use asst_core::api::{
-    AddSpec, Added, Change, ListChange, ListSpec, ListView, Settings, SettingsChange, StatusView,
-    SyncState, TaskView, query,
+    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings, SettingsChange,
+    StatusView, SyncState, TaskView, query,
 };
 use asst_core::fmt;
 use asst_core::store::{Query, View};
@@ -292,6 +292,7 @@ pub struct Loaded {
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     status: StatusView,
+    links: Vec<LinkView>,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -376,6 +377,8 @@ pub struct Window {
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
     status: Option<StatusView>,
+    /// The lists tied to GitHub repos, and how the last pass went.
+    links: Vec<LinkView>,
     settings: Option<Settings>,
     error: Option<String>,
     loaded: bool,
@@ -874,6 +877,7 @@ impl Component for Window {
             day_day: chrono::Local::now().date_naive(),
             zoom_hold: None,
             status: None,
+            links: Vec::new(),
             settings: None,
             error: None,
             loaded: false,
@@ -1740,6 +1744,7 @@ impl Component for Window {
                         self.open = l.open;
                         if let Some(Settings { .. }) = &self.settings {}
                         self.status = Some(l.status);
+                        self.links = l.links;
                         self.settle();
                         w.add_card.set_lists(&self.lists, self.prefs.sunday_first);
                         if let Nav::List(href) = &self.nav
@@ -2072,6 +2077,8 @@ impl Window {
                     lists: client::lists().await?,
                     open: client::tasks(&query(View::Open)).await?,
                     status: client::status().await?,
+                    // A daemon that can't say is not a failed load.
+                    links: client::links().await.unwrap_or_default(),
                 })
             }
             .await;
@@ -2736,6 +2743,7 @@ impl Window {
             counts: &counts,
             status: self.status.as_ref(),
             prefs: &self.prefs,
+            links: &self.links,
         });
         w.header_title.set_text(&self.nav.title(&self.lists));
         // The view button is marked while a filter hides tasks.

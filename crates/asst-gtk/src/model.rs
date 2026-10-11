@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use asst_core::api::{Change, ListView, StatusView, SyncState, TaskView};
+use asst_core::api::{Change, LinkView, ListView, StatusView, SyncState, TaskView};
 use asst_core::fmt;
 use asst_core::task::{Task, priority_level};
 use asst_core::time::{Trigger, When, resolve, weekday_code};
@@ -1328,6 +1328,16 @@ pub fn sync_state(s: &StatusView, now: DateTime<Tz>) -> String {
     state
 }
 
+/// A list's GitHub link, as its sidebar mark's tooltip says it.
+pub fn link_state(l: &LinkView, now: DateTime<Tz>) -> String {
+    match (&l.error, l.synced) {
+        (Some(e), Some(t)) => format!("{}: {e} (last read {})", l.repo, ago(t, now)),
+        (Some(e), None) => format!("{}: {e}", l.repo),
+        (None, Some(t)) => format!("Issues of {} read {}", l.repo, ago(t, now)),
+        (None, None) => format!("Issues of {}: not read yet", l.repo),
+    }
+}
+
 /// `just now`, `12 seconds ago`, `5 minutes ago`, `3 hours ago`, then the
 /// day. Seconds, because the daemon checks every minute: "Synced just now"
 /// would be all it ever said.
@@ -1913,6 +1923,29 @@ mod tests {
         assert_eq!(ago(at(7300), now()), "2 hours ago");
         assert_eq!(ago(at(3 * 86400), now()), "on Sep 11");
         assert_eq!(ago(at(400 * 86400), now()), "on Aug 10, 2025");
+    }
+
+    #[test]
+    fn a_link_says_when_it_was_read_or_what_is_wrong() {
+        let link = |synced: Option<i64>, error: Option<&str>| LinkView {
+            repo: "jaehho/asst".into(),
+            list: "/cal/asst/".into(),
+            name: "asst".into(),
+            synced: synced.map(|s| now().with_timezone(&Utc) - Duration::seconds(s)),
+            error: error.map(str::to_string),
+        };
+        assert_eq!(
+            link_state(&link(Some(150), None), now()),
+            "Issues of jaehho/asst read 2 minutes ago"
+        );
+        assert_eq!(
+            link_state(&link(None, None), now()),
+            "Issues of jaehho/asst: not read yet"
+        );
+        assert_eq!(
+            link_state(&link(Some(61), Some("the server answered 403")), now()),
+            "jaehho/asst: the server answered 403 (last read 1 minute ago)"
+        );
     }
 
     #[test]

@@ -40,12 +40,21 @@ pub async fn run(daemon: Arc<Daemon>) {
                 }
             };
         }
+        if client.is_none() {
+            for (repo, _) in &links {
+                daemon.gh_pass_done(
+                    repo,
+                    Err("no GitHub token (GITHUB_TOKEN, or `gh auth login`)".into()),
+                );
+            }
+        }
         if let Some(gh) = &client {
             for (repo, list) in &links {
                 match pass(&daemon, gh, &mut cache, repo, list).await {
-                    Ok(()) => {}
+                    Ok(()) => daemon.gh_pass_done(repo, Ok(())),
                     Err(Error::Remote(RemoteError::Unauthorized)) => {
                         log::warn!("GitHub rejected the token; asking for it again next round");
+                        daemon.gh_pass_done(repo, Err("GitHub rejected the token".into()));
                         client = None;
                         break;
                     }
@@ -53,7 +62,10 @@ pub async fn run(daemon: Arc<Daemon>) {
                         log::info!("GitHub offline: {m}");
                         break;
                     }
-                    Err(e) => log::warn!("syncing {repo}: {e}"),
+                    Err(e) => {
+                        log::warn!("syncing {repo}: {e}");
+                        daemon.gh_pass_done(repo, Err(e.to_string()));
+                    }
                 }
             }
         }
