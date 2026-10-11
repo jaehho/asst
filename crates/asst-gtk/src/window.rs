@@ -170,7 +170,8 @@ pub enum Msg {
     /// Undo a plan change: restore this slot on `date`, or take the task
     /// off when there was none. Carries what the toast is holding.
     PlanUndo(String, chrono::NaiveDate, Option<(u32, u32)>),
-    Add(Box<AddSpec>),
+    /// A new task, and whether the add card was left with it typed.
+    Add(Box<AddSpec>, bool),
     ShowAdd(Option<Target>),
     HideAdd,
     /// The add card has folded away.
@@ -180,6 +181,8 @@ pub enum Msg {
     Batch(Batch),
     SetViewOpts(ViewOpts),
     NewList,
+    /// Take back a task added by leaving the add card.
+    Unadd(String),
     /// Run the work command in the checkout of the task's issue's repo.
     StartWork(String),
     /// A link, in the browser.
@@ -324,7 +327,8 @@ pub enum Cmd {
     Settings(client::Result<Settings>),
     Toast(client::Result<String>),
     Completed(String, client::Result<TaskView>),
-    Added(client::Result<Added>),
+    /// Whether it was added by leaving the add card, which says so.
+    Added(bool, client::Result<Added>),
     Opened(client::Result<TaskView>),
     /// The icon a list just made is to have, and the list.
     ListSaved(Option<String>, client::Result<ListView>),
@@ -1334,8 +1338,9 @@ impl Component for Window {
                     self.shown = 0;
                 }
             }
-            Msg::Add(spec) => {
-                sender.oneshot_command(async move { Cmd::Added(client::add(&spec).await) });
+            Msg::Add(spec, implicit) => {
+                sender
+                    .oneshot_command(async move { Cmd::Added(implicit, client::add(&spec).await) });
             }
             Msg::ShowAdd(target) => {
                 self.show_add(w, &sender, target);
@@ -1405,6 +1410,12 @@ impl Component for Window {
                 let tx = tx.clone();
                 dialogs::list_dialog(&w.window, None, None, move |name, color, icon| {
                     tx.emit(Msg::SaveList(None, name, color, icon))
+                });
+            }
+            Msg::Unadd(href) => {
+                self.hidden.insert(href.clone());
+                sender.oneshot_command(async move {
+                    Cmd::Toast(client::delete(&href).await.map(|()| String::new()))
                 });
             }
             Msg::OpenUrl(url) => {
@@ -1940,11 +1951,27 @@ impl Component for Window {
                     toast(w, &e);
                 }
             },
-            Cmd::Added(result) => match result {
+            Cmd::Added(implicit, result) => match result {
                 Ok(a) if a.existed => toast(
                     w,
                     &format!("Already there: {}", quoted(&a.task.task.summary)),
                 ),
+                // Added by leaving the card: say so, and let it be taken back.
+                Ok(a) if implicit => {
+                    let t = &a.task;
+                    let toast = adw::Toast::builder()
+                        .title(glib::markup_escape_text(&format!(
+                            "Added {} to {}",
+                            quoted(&t.task.summary),
+                            t.list_name
+                        )))
+                        .button_label("Undo")
+                        .timeout(5)
+                        .build();
+                    let (tx, href) = (tx.clone(), t.href.clone());
+                    toast.connect_button_clicked(move |_| tx.emit(Msg::Unadd(href.clone())));
+                    w.toasts.add_toast(toast);
+                }
                 Ok(a) => {
                     // Show where it went when that isn't this view.
                     let t = &a.task;

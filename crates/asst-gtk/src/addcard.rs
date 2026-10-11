@@ -78,7 +78,9 @@ pub struct AddCard {
     /// 1 to 4: what a task gets when neither the text nor a button says.
     default_priority: Cell<u8>,
     read_dates: Cell<bool>,
-    on_add: Box<dyn Fn(AddSpec)>,
+    /// The task, and whether it was added by leaving the card.
+    on_add: Box<dyn Fn(AddSpec, bool)>,
+    leaving: Cell<bool>,
     on_cancel: Rc<dyn Fn()>,
     /// Leaving the card with a title typed adds the task (the window's
     /// card; quick add's popup throws it away).
@@ -90,18 +92,18 @@ impl AddCard {
     pub fn for_window(tx: Tx) -> Rc<AddCard> {
         let cancel = tx.clone();
         AddCard::build(
-            move |spec| tx.emit(Msg::Add(Box::new(spec))),
+            move |spec, implicit| tx.emit(Msg::Add(Box::new(spec), implicit)),
             move || cancel.emit(Msg::HideAdd),
             true,
         )
     }
 
     pub fn new(on_add: impl Fn(AddSpec) + 'static, on_cancel: impl Fn() + 'static) -> Rc<AddCard> {
-        AddCard::build(on_add, on_cancel, false)
+        AddCard::build(move |spec, _| on_add(spec), on_cancel, false)
     }
 
     fn build(
-        on_add: impl Fn(AddSpec) + 'static,
+        on_add: impl Fn(AddSpec, bool) + 'static,
         on_cancel: impl Fn() + 'static,
         save_on_leave: bool,
     ) -> Rc<AddCard> {
@@ -246,6 +248,7 @@ impl AddCard {
             default_priority: Cell::new(4),
             read_dates: Cell::new(true),
             on_add: Box::new(on_add),
+            leaving: Cell::new(false),
             on_cancel: Rc::new(on_cancel),
             save_on_leave,
         });
@@ -583,7 +586,9 @@ impl AddCard {
     pub fn save_draft(&self) -> bool {
         let save = self.save_on_leave && !self.entry.text().trim().is_empty();
         if save {
+            self.leaving.set(true);
             self.submit();
+            self.leaving.set(false);
         }
         save
     }
@@ -909,7 +914,7 @@ impl AddCard {
                 _ => None,
             });
         drop(chosen);
-        (self.on_add)(spec);
+        (self.on_add)(spec, self.leaving.get());
         self.entry.set_text("");
         buffer.set_text("");
         {
