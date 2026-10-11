@@ -72,8 +72,15 @@ pub struct Daemon {
     pub wake_github: Notify,
     /// How each linked repo's last pass went: when it last worked, and
     /// what is wrong now.
-    gh_state: Mutex<HashMap<String, (Option<DateTime<Utc>>, Option<String>)>>,
+    gh_state: Mutex<HashMap<String, GhState>>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
+}
+
+/// How a linked repo's last GitHub pass went.
+#[derive(Clone, Default)]
+struct GhState {
+    synced: Option<DateTime<Utc>>,
+    error: Option<String>,
 }
 
 /// What the D-Bus side should tell clients.
@@ -781,7 +788,7 @@ impl Daemon {
                     .find_list(&href)
                     .map(|l| l.name)
                     .unwrap_or_else(|_| href.clone());
-                let (synced, error) = self
+                let state = self
                     .gh_state
                     .lock()
                     .expect("not poisoned")
@@ -792,8 +799,8 @@ impl Daemon {
                     repo,
                     list: href,
                     name,
-                    synced,
-                    error,
+                    synced: state.synced,
+                    error: state.error,
                 })
             })
             .collect()
@@ -804,8 +811,13 @@ impl Daemon {
         let mut state = self.gh_state.lock().expect("not poisoned");
         let entry = state.entry(repo.to_string()).or_default();
         match outcome {
-            Ok(()) => *entry = (Some(Utc::now()), None),
-            Err(e) => entry.1 = Some(e),
+            Ok(()) => {
+                *entry = GhState {
+                    synced: Some(Utc::now()),
+                    error: None,
+                }
+            }
+            Err(e) => entry.error = Some(e),
         }
     }
 
