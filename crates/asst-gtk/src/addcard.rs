@@ -326,7 +326,7 @@ impl AddCard {
             card.entry.add_controller(keys);
         }
         {
-            // Ctrl+Enter adds from the notes, where Enter is a new line.
+            // Ctrl+Enter adds from the notes too.
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             let weak = Rc::downgrade(&card);

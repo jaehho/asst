@@ -231,6 +231,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                     "Pick a date or reminders for the open task",
                     "<Control>d <Control>r",
                 ),
+                ("Finish editing the open task", "<Control>Return"),
                 ("Close the task or selection", "Escape"),
             ],
         ),
@@ -250,12 +251,13 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             "Adding",
             &[
                 ("Add and keep going", "Return"),
-                ("Add from the notes", "<Control>Return"),
+                ("Add from the notes", "Return <Control>Return"),
+                ("New line in the notes", "<Shift>Return"),
                 ("Add a task from the clipboard", "<Control>v"),
                 ("Pick a date", "<Control>d"),
                 ("Pick reminders", "<Control>r"),
                 ("Keep quick add open", "<Control>k"),
-                ("Stop adding", "Escape"),
+                ("Stop adding, keeping what is typed", "Escape"),
             ],
         ),
         (
