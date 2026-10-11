@@ -84,9 +84,11 @@ enum Cmd {
         #[arg(long)]
         literal: bool,
     },
-    /// Tie a list to a GitHub repo: its issues are synced both ways;
-    /// without arguments, show the ties
+    /// Tie a list to a GitHub repo: its issues are synced both ways.
+    /// `asst link owner/repo` uses the list named for the repo, making it
+    /// if there is none; without arguments, show the ties
     Link {
+        /// The list, or with no repo, `owner/repo`
         list: Option<String>,
         #[arg(requires = "list", value_name = "OWNER/REPO")]
         repo: Option<String>,
@@ -564,7 +566,45 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let l: LinkView = serde_json::from_str(&raw)?;
                 println!("{} {} ⇄ {}", style.dim("Linked:"), l.name, l.repo);
             }
-            _ => {
+            (Some(repo), None) => {
+                let repo = repo.trim();
+                if !asst_core::github::valid_repo(repo) {
+                    bail!(
+                        "{repo:?} is not owner/repo; `asst link <list> <owner/repo>` names the list"
+                    );
+                }
+                let name = repo.split_once('/').map_or(repo, |(_, n)| n);
+                let lists: Vec<ListView> = serde_json::from_str(&proxy.lists().await?)?;
+                let existing = lists
+                    .iter()
+                    .find(|l| l.writable && l.name.eq_ignore_ascii_case(name));
+                let made = match existing {
+                    Some(_) => None,
+                    None => {
+                        let spec = ListSpec {
+                            name: name.to_string(),
+                            color: None,
+                        };
+                        let raw = proxy.create_list(&serde_json::to_string(&spec)?).await?;
+                        Some(serde_json::from_str::<ListView>(&raw)?)
+                    }
+                };
+                let href = made
+                    .as_ref()
+                    .or(existing)
+                    .map(|l| l.href.clone())
+                    .unwrap_or_default();
+                let raw = proxy.link(&href, repo).await?;
+                if json {
+                    return show_json(&raw);
+                }
+                let l: LinkView = serde_json::from_str(&raw)?;
+                if made.is_some() {
+                    println!("{} {}", style.dim("Created:"), l.name);
+                }
+                println!("{} {} ⇄ {}", style.dim("Linked:"), l.name, l.repo);
+            }
+            (None, _) => {
                 let raw = proxy.links().await?;
                 if json {
                     return show_json(&raw);

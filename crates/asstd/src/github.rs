@@ -81,6 +81,24 @@ async fn token() -> Option<String> {
     (out.status.success() && !t.is_empty()).then_some(t)
 }
 
+/// The repo answered with a redirect: it was renamed, or moved to another
+/// owner. Its link and pairs take the new name, and the next pass uses it.
+async fn follow_rename(
+    daemon: &Daemon,
+    gh: &GitHub,
+    cache: &mut HashMap<String, (String, Vec<Issue>)>,
+    repo: &str,
+) -> Result<()> {
+    let Some(new) = gh.renamed(repo).await? else {
+        return Err(RemoteError::Status(301).into());
+    };
+    daemon.store().gh_rename(repo, &new)?;
+    cache.remove(repo);
+    log::info!("{repo} is now {new}");
+    daemon.wake_github.notify_one();
+    Ok(())
+}
+
 /// One repo against its list. An op that fails is logged and left for the
 /// next pass, its pair as it was; a lost connection stops the pass.
 async fn pass(
@@ -91,7 +109,11 @@ async fn pass(
     list: &str,
 ) -> Result<()> {
     let etag = cache.get(repo).map(|(e, _)| e.as_str());
-    let issues = match gh.issues(repo, etag).await? {
+    let fetched = match gh.issues(repo, etag).await {
+        Err(RemoteError::Status(301)) => return follow_rename(daemon, gh, cache, repo).await,
+        other => other?,
+    };
+    let issues = match fetched {
         Some((issues, Some(etag))) => {
             cache.insert(repo.to_string(), (etag, issues.clone()));
             issues

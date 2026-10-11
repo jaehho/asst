@@ -958,6 +958,18 @@ impl Store {
         Ok(())
     }
 
+    /// The repo is called `new` now: its link and pairs follow, nothing
+    /// is paired again. Fails, changing nothing, when `new` is linked.
+    pub fn gh_rename(&self, old: &str, new: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        // The pairs name the link by repo, and move with it.
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        tx.execute("UPDATE gh_links SET repo = ?2 WHERE repo = ?1", [old, new])?;
+        tx.execute("UPDATE gh_pairs SET repo = ?2 WHERE repo = ?1", [old, new])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn gh_unlink(&self, repo: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -1481,6 +1493,16 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             s.gh_links().unwrap(),
             [("jaehho/asst".to_string(), "/cal/inbox/".to_string())]
         );
+        // A renamed repo keeps its link and pairs
+        s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
+        s.gh_rename("jaehho/asst", "jaehho/assistant").unwrap();
+        assert_eq!(
+            s.gh_links().unwrap(),
+            [("jaehho/assistant".to_string(), "/cal/inbox/".to_string())]
+        );
+        assert_eq!(s.gh_pairs("jaehho/assistant").unwrap(), [pair("One", true)]);
+        assert!(s.gh_pairs("jaehho/asst").unwrap().is_empty());
+        s.gh_rename("jaehho/assistant", "jaehho/asst").unwrap();
         // Unlinking forgets them too
         s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
         s.gh_unpair("jaehho/asst", 7).unwrap();
