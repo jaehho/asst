@@ -767,6 +767,38 @@ window.asst-quick-add {
   min-height: 44px;
 }
 
+/* The snooze chooser (snooze.rs): a card on a transparent layer surface,
+   as quick add's is. */
+window.asst-snooze {
+  background: transparent;
+}
+
+.snooze-card {
+  padding: 12px 12px 8px 12px;
+  border-radius: 14px;
+  margin: 16px;
+  background-color: var(--window-bg-color);
+  box-shadow: 0 4px 14px alpha(black, 0.35);
+}
+
+.snooze-card > .heading {
+  margin: 0 6px 4px 6px;
+}
+
+.snooze-card > button {
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+}
+
+.snooze-card > entry {
+  margin-top: 6px;
+}
+
+.snooze-card > .caption {
+  margin: 0 6px;
+}
+
 .quick-add-status {
   margin: 0 28px 16px 28px;
   padding: 6px 12px;

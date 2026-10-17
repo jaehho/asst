@@ -769,8 +769,26 @@ impl Daemon {
     }
 
     pub fn snooze(&self, href: &str, minutes: u64) -> Result<()> {
-        let until = Utc::now() + chrono::Duration::minutes(minutes as i64);
-        self.store().snooze(href, until)?;
+        self.snooze_until(href, Utc::now() + chrono::Duration::minutes(minutes as i64))
+    }
+
+    /// Ring an open task's reminder again at `until`: in the future, and no
+    /// more than a year off (a typo like 2062 should not hide a task).
+    pub fn snooze_until(&self, id: &str, until: DateTime<Utc>) -> Result<()> {
+        let now = Utc::now();
+        if until <= now {
+            return Err(Error::Invalid("that time has passed".into()));
+        }
+        if until > now + chrono::Duration::days(366) {
+            return Err(Error::Invalid("a reminder waits a year at most".into()));
+        }
+        let store = self.store();
+        let row = store.find(id)?;
+        if !row.task.is_open() {
+            return Err(Error::Invalid("a completed task has no reminder".into()));
+        }
+        store.snooze(&row.href, until)?;
+        drop(store);
         self.wake_reminders.notify_one();
         Ok(())
     }
@@ -1223,6 +1241,53 @@ mod tests {
         apply_settings(&mut cfg, &SettingsChange::default(), Some(None)).unwrap();
         assert_eq!(cfg.inbox, None);
         assert_eq!(cfg.interval, 300, "absent fields stay");
+    }
+
+    #[test]
+    fn a_snooze_needs_an_open_task_and_a_time_ahead() {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        store
+            .apply_lists(&[caldav::RemoteList {
+                href: "/cal/work/".into(),
+                name: "Work".into(),
+                color: None,
+                order: None,
+                sync_token: Some("t1".into()),
+                ctag: None,
+                writable: true,
+            }])
+            .unwrap();
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        let spec = |text: &str| AddSpec {
+            text: text.into(),
+            list: Some("work".into()),
+            ..AddSpec::default()
+        };
+        let task = daemon.add(&spec("Call the bank")).unwrap().task;
+        let in_hours = |h: i64| Utc::now() + chrono::Duration::hours(h);
+
+        daemon.snooze_until(&task.href, in_hours(3)).unwrap();
+        let snoozed = daemon.store().snoozed().unwrap();
+        assert_eq!(snoozed.len(), 1);
+        assert_eq!(snoozed[0].0, task.href);
+        // The short id works as it does for every other call
+        daemon.snooze_until(&task.id, in_hours(5)).unwrap();
+        assert_eq!(daemon.store().snoozed().unwrap().len(), 1, "one per task");
+
+        assert!(daemon.snooze_until(&task.href, in_hours(-1)).is_err());
+        assert!(daemon.snooze_until(&task.href, in_hours(24 * 400)).is_err());
+        assert!(
+            daemon
+                .snooze_until("/cal/work/nope.ics", in_hours(1))
+                .is_err()
+        );
+        daemon.complete(&task.href).unwrap();
+        assert!(daemon.snooze_until(&task.href, in_hours(1)).is_err());
+        assert!(
+            daemon.store().snoozed().unwrap().is_empty(),
+            "completing forgets the snooze"
+        );
     }
 
     #[test]

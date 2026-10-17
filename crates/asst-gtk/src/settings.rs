@@ -394,7 +394,7 @@ fn snooze_group(
     let group = adw::PreferencesGroup::builder()
         .title("Snooze")
         .description(format!(
-            "The buttons on a reminder, up to {}",
+            "The buttons on a reminder, up to {}. Snooze… beside them asks for any other time.",
             asst_core::config::MAX_SNOOZE
         ))
         .build();

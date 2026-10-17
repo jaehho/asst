@@ -77,6 +77,15 @@ impl Service {
         json(&self.daemon.reopen(id).map_err(failed)?)
     }
 
+    async fn snooze(&self, id: &str, until: &str) -> fdo::Result<()> {
+        let until = chrono::DateTime::parse_from_rfc3339(until).map_err(|e| {
+            fdo::Error::InvalidArgs(format!("{until:?} is not an RFC 3339 time: {e}"))
+        })?;
+        self.daemon
+            .snooze_until(id, until.with_timezone(&chrono::Utc))
+            .map_err(failed)
+    }
+
     async fn delete(&self, id: &str) -> fdo::Result<()> {
         self.daemon.delete(id).map_err(failed)
     }
