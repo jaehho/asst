@@ -5,6 +5,7 @@
 //! Right-click for the task menu; drag it onto a list or a view.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use asst_core::api::{Change, ListView, TaskView};
 use asst_core::fmt;
@@ -16,7 +17,7 @@ use relm4::gtk::{self, gdk, glib, pango};
 
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::ui::{self, Item};
-use crate::window::{Msg, Tx};
+use crate::window::{Msg, Then, Tx};
 use crate::{model, motion};
 
 /// What a drag of a task carries.
@@ -36,6 +37,9 @@ pub fn dragging() -> Option<String> {
 pub struct RowOpts<'a> {
     pub now: DateTime<Tz>,
     pub show_list: bool,
+    /// A narrow column: the title keeps the room, and the origin and list
+    /// captions are left off (the list is in the tooltip).
+    pub compact: bool,
     pub completing: bool,
     /// Checked since the row was last drawn: the box pops.
     pub just_checked: bool,
@@ -128,7 +132,11 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         .ellipsize(pango::EllipsizeMode::End)
         .build();
     title.add_css_class("task-title");
-    title.set_tooltip_text(Some(&t.task.summary));
+    title.set_tooltip_text(Some(&if o.compact {
+        format!("{}\n{}", t.task.summary, t.list_name)
+    } else {
+        t.task.summary.clone()
+    }));
     body.append(&title);
 
     if let Some(notes) = t
@@ -165,7 +173,7 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         i.set_tooltip_text(Some("Not on the server yet"));
         body.append(&i);
     }
-    {
+    if !o.compact {
         // Creation site, not the last editor. Grey caption, same weight as
         // the list name — provenance is context, not a state colour.
         let tip = match t.origin.as_str() {
@@ -504,15 +512,44 @@ pub fn task_menu(
         items.push(
             Item::new(Some("arrow3-right-symbolic"), "Move to…")
                 .build(move || {
+                    let make = {
+                        let (tx, h) = (tx.clone(), h.clone());
+                        Rc::new(move |name| tx.emit(Msg::MakeList(name, Then::Move(h.clone()))))
+                            as crate::addcard::MakeList
+                    };
                     let (tx, h) = (tx.clone(), h.clone());
-                    let picker = pickers::list_popover(&lists, Some(&list), move |to| {
-                        tx.emit(Msg::Move(h.clone(), to))
-                    });
+                    let picker = pickers::list_popover_with(
+                        &lists,
+                        Some(&list),
+                        move |to| tx.emit(Msg::Move(h.clone(), to)),
+                        Some(make),
+                    );
                     let anchor = anchor.clone();
                     glib::idle_add_local_once(move || show_at(&picker, &anchor, at));
                 })
                 .upcast(),
         );
+    }
+    if let Some(issue) = &t.issue {
+        let (start, h) = (send.clone(), href.clone());
+        items.push(
+            Item::new(
+                Some("go-next-symbolic"),
+                &format!("Start work on #{}…", issue.number),
+            )
+            .build(move || start(Msg::StartWork(h.clone())))
+            .upcast(),
+        );
+        let (open, url) = (send.clone(), issue.url.clone());
+        items.push(
+            Item::new(
+                Some("external-link-symbolic"),
+                &format!("Open #{} on GitHub", issue.number),
+            )
+            .build(move || open(Msg::OpenUrl(url.clone())))
+            .upcast(),
+        );
+        items.push(ui::separator());
     }
     {
         let (send, h) = (send.clone(), href.clone());

@@ -2,7 +2,10 @@
 //! what was understood, or set the date, priority, reminders and list with
 //! buttons; notes go under the title, and notes to link under those (quick
 //! add started from a note). Typing `#` suggests lists. Enter adds and keeps
-//! the card open for the next one.
+//! the card open for the next one; in the notes, Enter adds too and
+//! Shift+Enter starts a new line. In the window, what is typed is added when
+//! the card is left (Esc, another view, the window closing); the cancel
+//! button is what throws it away.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -21,6 +24,9 @@ use crate::model::{self, capitalize};
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::window::{Msg, Tx};
 use crate::{notes, ui};
+
+/// Starts making a list of the name given.
+pub type MakeList = Rc<dyn Fn(String)>;
 
 /// Where a task added from the card goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +64,13 @@ pub struct AddCard {
     suggest_rows: gtk::ListBox,
     /// The names in `suggest_rows`, in order.
     suggested: RefCell<Vec<String>>,
+    /// The `#word` the last suggestion row would make a list of.
+    suggest_new: RefCell<Option<String>>,
+    /// Makes a list nothing is named for. Without it, no row offers one.
+    on_create: RefCell<Option<MakeList>>,
+    /// The list being made, and an add waiting on it.
+    making: RefCell<Option<String>>,
+    add_when_made: Cell<bool>,
     chosen: RefCell<Chosen>,
     target: RefCell<Target>,
     lists: RefCell<Vec<ListView>>,
@@ -65,21 +78,35 @@ pub struct AddCard {
     /// 1 to 4: what a task gets when neither the text nor a button says.
     default_priority: Cell<u8>,
     read_dates: Cell<bool>,
-    on_add: Box<dyn Fn(AddSpec)>,
+    /// The task, and whether it was added by leaving the card.
+    on_add: Box<dyn Fn(AddSpec, bool)>,
+    leaving: Cell<bool>,
     on_cancel: Rc<dyn Fn()>,
+    /// Leaving the card with a title typed adds the task (the window's
+    /// card; quick add's popup throws it away).
+    save_on_leave: bool,
 }
 
 impl AddCard {
     /// The window's card sends its tasks as messages.
     pub fn for_window(tx: Tx) -> Rc<AddCard> {
         let cancel = tx.clone();
-        AddCard::new(
-            move |spec| tx.emit(Msg::Add(Box::new(spec))),
+        AddCard::build(
+            move |spec, implicit| tx.emit(Msg::Add(Box::new(spec), implicit)),
             move || cancel.emit(Msg::HideAdd),
+            true,
         )
     }
 
     pub fn new(on_add: impl Fn(AddSpec) + 'static, on_cancel: impl Fn() + 'static) -> Rc<AddCard> {
+        AddCard::build(move |spec, _| on_add(spec), on_cancel, false)
+    }
+
+    fn build(
+        on_add: impl Fn(AddSpec, bool) + 'static,
+        on_cancel: impl Fn() + 'static,
+        save_on_leave: bool,
+    ) -> Rc<AddCard> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.add_css_class("card");
         root.add_css_class("add-card");
@@ -100,7 +127,6 @@ impl AddCard {
         root.append(&chips);
         let notes = ui::text_view("Notes");
         notes.add_css_class("add-notes");
-        notes::enhance(&notes);
         root.append(&notes);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
@@ -166,7 +192,11 @@ impl AddCard {
         // An icon, so the buttons still fit a phone-wide window.
         let cancel = gtk::Button::from_icon_name("window-close-symbolic");
         cancel.add_css_class("flat");
-        ui::tip(&cancel, "Cancel", "Esc");
+        if save_on_leave {
+            ui::tip(&cancel, "Discard", "Esc keeps what you typed");
+        } else {
+            ui::tip(&cancel, "Cancel", "Esc");
+        }
         actions.append(&cancel);
         let add = gtk::Button::with_label("Add Task");
         add.add_css_class("suggested-action");
@@ -207,6 +237,10 @@ impl AddCard {
             suggest,
             suggest_rows,
             suggested: RefCell::default(),
+            suggest_new: RefCell::default(),
+            on_create: RefCell::default(),
+            making: RefCell::default(),
+            add_when_made: Cell::new(false),
             chosen: RefCell::default(),
             target: RefCell::new(Target::Anywhere),
             lists: RefCell::default(),
@@ -214,9 +248,25 @@ impl AddCard {
             default_priority: Cell::new(4),
             read_dates: Cell::new(true),
             on_add: Box::new(on_add),
+            leaving: Cell::new(false),
             on_cancel: Rc::new(on_cancel),
+            save_on_leave,
         });
-
+        {
+            // Before `enhance`, whose handler carries a list on from a
+            // newline: a stopped newline must not reach it.
+            let weak = Rc::downgrade(&card);
+            notes_enter(&card.notes, move || {
+                if let Some(c) = weak.upgrade() {
+                    if c.entry.text().trim().is_empty() {
+                        c.entry.grab_focus();
+                    } else {
+                        c.submit();
+                    }
+                }
+            });
+            notes::enhance(&card.notes);
+        }
         {
             let weak = Rc::downgrade(&card);
             let add = add.clone();
@@ -266,9 +316,15 @@ impl AddCard {
                 if !c.suggesting() {
                     return glib::Propagation::Proceed;
                 }
+                let chosen = c.suggest_rows.selected_row().is_some();
                 match key {
                     gdk::Key::Down | gdk::Key::Up => {
                         c.move_suggestion(if key == gdk::Key::Down { 1 } else { -1 });
+                    }
+                    // Nothing is chosen while the only offer is a new list:
+                    // `#123` is text, and Enter adds the task.
+                    gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::Tab if !chosen => {
+                        return glib::Propagation::Proceed;
                     }
                     gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::Tab => c.take_suggestion(),
                     gdk::Key::Escape => c.suggest.popdown(),
@@ -280,10 +336,12 @@ impl AddCard {
         }
         {
             let keys = gtk::EventControllerKey::new();
-            let on_cancel = card.on_cancel.clone();
+            let weak = Rc::downgrade(&card);
             keys.connect_key_pressed(move |_, key, _, _| {
-                if key == gdk::Key::Escape {
-                    on_cancel();
+                if key == gdk::Key::Escape
+                    && let Some(c) = weak.upgrade()
+                {
+                    c.leave();
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
@@ -291,7 +349,7 @@ impl AddCard {
             card.entry.add_controller(keys);
         }
         {
-            // Ctrl+Enter adds from the notes, where Enter is a new line.
+            // Ctrl+Enter adds from the notes too.
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             let weak = Rc::downgrade(&card);
@@ -397,7 +455,15 @@ impl AddCard {
                 let current = c.list_href();
                 let lists = c.lists.borrow().clone();
                 let weak = Rc::downgrade(&c);
-                mb.set_popover(Some(&pickers::list_popover(
+                let create = c.on_create.borrow().is_some().then(|| {
+                    let weak = Rc::downgrade(&c);
+                    Rc::new(move |name: String| {
+                        if let Some(c) = weak.upgrade() {
+                            c.make_list(name);
+                        }
+                    }) as MakeList
+                });
+                mb.set_popover(Some(&pickers::list_popover_with(
                     &lists,
                     current.as_deref(),
                     move |href| {
@@ -406,6 +472,7 @@ impl AddCard {
                             c.refresh();
                         }
                     },
+                    create,
                 )));
             });
         }
@@ -467,6 +534,63 @@ impl AddCard {
 
     pub fn focus(&self) {
         self.entry.grab_focus();
+    }
+
+    /// Lets pickers offer to make a list nothing is named for; `make`
+    /// starts it, and `list_made` or `list_failed` answers.
+    pub fn on_create_list(&self, make: impl Fn(String) + 'static) {
+        *self.on_create.borrow_mut() = Some(Rc::new(make));
+    }
+
+    fn make_list(&self, name: String) {
+        let Some(make) = self.on_create.borrow().clone() else {
+            return;
+        };
+        *self.making.borrow_mut() = Some(name.clone());
+        self.refresh();
+        make(name);
+    }
+
+    /// The list asked for exists now: the task goes there.
+    pub fn list_made(&self, list: &ListView) {
+        self.making.borrow_mut().take();
+        {
+            let mut lists = self.lists.borrow_mut();
+            if !lists.iter().any(|l| l.href == list.href) {
+                lists.push(list.clone());
+            }
+        }
+        self.chosen.borrow_mut().list = Some(list.href.clone());
+        self.refresh();
+        self.parse();
+        if self.add_when_made.take() {
+            self.submit();
+        }
+    }
+
+    pub fn list_failed(&self) {
+        self.making.borrow_mut().take();
+        self.add_when_made.set(false);
+        self.refresh();
+    }
+
+    /// Esc: the card closes, and what was typed is added first (in the
+    /// window).
+    pub fn leave(&self) {
+        self.save_draft();
+        (self.on_cancel)();
+    }
+
+    /// Add the task being typed, if there is one and this card keeps what
+    /// is left in it. For leaving the card by any way but its cancel button.
+    pub fn save_draft(&self) -> bool {
+        let save = self.save_on_leave && !self.entry.text().trim().is_empty();
+        if save {
+            self.leaving.set(true);
+            self.submit();
+            self.leaving.set(false);
+        }
+        save
     }
 
     /// The list suggestions are up, and take Enter and Esc.
@@ -579,7 +703,7 @@ impl AddCard {
             .map_or(0, |i| i + 1);
         let word: String = chars[start..end].iter().collect();
         let rest = word.strip_prefix('#')?;
-        Some((start as i32, end as i32, rest.to_lowercase()))
+        Some((start as i32, end as i32, rest.to_string()))
     }
 
     fn suggest_lists(&self) {
@@ -589,19 +713,29 @@ impl AddCard {
                 .collect::<String>()
                 .to_lowercase()
         };
-        let matches: Vec<ListView> = match self.hash_word() {
-            Some((_, _, word)) => self
-                .lists
-                .borrow()
+        let word = self.hash_word().map(|(_, _, w)| w);
+        let lower = word.as_deref().map(str::to_lowercase);
+        let lists = self.lists.borrow();
+        let matches: Vec<ListView> = match &lower {
+            Some(word) => lists
                 .iter()
-                .filter(|l| l.writable && squash(&l.name).contains(&word))
-                .filter(|l| squash(&l.name) != word)
+                .filter(|l| l.writable && squash(&l.name).contains(word))
+                .filter(|l| squash(&l.name) != *word)
                 .take(8)
                 .cloned()
                 .collect(),
             None => Vec::new(),
         };
-        if matches.is_empty() {
+        // A word nobody is named for can become a list. Not a number:
+        // `#123` is an issue, and `#` alone is nothing yet.
+        let new = word.filter(|w| {
+            self.on_create.borrow().is_some()
+                && !w.is_empty()
+                && !w.chars().all(|c| c.is_ascii_digit())
+                && !lists.iter().any(|l| squash(&l.name) == w.to_lowercase())
+        });
+        drop(lists);
+        if matches.is_empty() && new.is_none() {
             self.suggest.popdown();
             return;
         }
@@ -612,22 +746,44 @@ impl AddCard {
             line.set_margin_bottom(4);
             line.set_margin_start(6);
             line.set_margin_end(6);
-            line.append(&ui::ring(l.color.as_deref(), 14));
+            line.append(&ui::list_mark(l, 14));
             line.append(&ui::label(&l.name, &[]));
             self.suggest_rows.append(&line);
         }
+        if let Some(word) = &new {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.set_margin_top(4);
+            line.set_margin_bottom(4);
+            line.set_margin_start(6);
+            line.set_margin_end(6);
+            line.append(&gtk::Image::from_icon_name("plus-large-symbolic"));
+            line.append(&ui::label(&format!("Create list “{word}”"), &[]));
+            self.suggest_rows.append(&line);
+        }
+        let first = !matches.is_empty();
         *self.suggested.borrow_mut() = matches.into_iter().map(|l| l.name).collect();
-        self.suggest_rows
-            .select_row(self.suggest_rows.row_at_index(0).as_ref());
+        *self.suggest_new.borrow_mut() = new;
+        // Existing lists first, the first chosen; "create" waits to be
+        // reached for.
+        self.suggest_rows.select_row(
+            first
+                .then(|| self.suggest_rows.row_at_index(0))
+                .flatten()
+                .as_ref(),
+        );
         if !self.suggest.is_visible() && self.entry.is_mapped() {
             self.suggest.popup();
         }
     }
 
     fn move_suggestion(&self, step: i32) {
-        let count = self.suggested.borrow().len() as i32;
-        let at = self.suggest_rows.selected_row().map_or(0, |r| r.index());
-        let next = (at + step).rem_euclid(count.max(1));
+        let count =
+            (self.suggested.borrow().len() + self.suggest_new.borrow().iter().count()) as i32;
+        let next = match self.suggest_rows.selected_row() {
+            Some(r) => (r.index() + step).rem_euclid(count.max(1)),
+            None if step > 0 => 0,
+            None => count - 1,
+        };
         self.suggest_rows
             .select_row(self.suggest_rows.row_at_index(next).as_ref());
     }
@@ -635,9 +791,21 @@ impl AddCard {
     /// Put the chosen list's name in place of the `#word`.
     fn take_suggestion(&self) {
         let index = self.suggest_rows.selected_row().map_or(0, |r| r.index());
-        let name = self.suggested.borrow().get(index as usize).cloned();
+        let existing = self.suggested.borrow().get(index as usize).cloned();
+        let new = match existing {
+            Some(_) => None,
+            None => self.suggest_new.borrow().clone(),
+        };
         self.suggest.popdown();
-        let (Some(name), Some((start, end, _))) = (name, self.hash_word()) else {
+        let name = match (existing, new) {
+            (Some(name), _) => name,
+            (None, Some(word)) => {
+                self.make_list(word.clone());
+                word
+            }
+            (None, None) => return,
+        };
+        let Some((start, end, _)) = self.hash_word() else {
             return;
         };
         let word: String = name.chars().filter(|c| !c.is_whitespace()).collect();
@@ -686,16 +854,25 @@ impl AddCard {
         let list = href
             .as_deref()
             .and_then(|h| lists.iter().find(|l| l.href == h));
-        self.list_label
-            .set_text(list.map_or("Inbox", |l| l.name.as_str()));
+        let making = self.making.borrow();
+        self.list_label.set_text(
+            making
+                .as_deref()
+                .or(list.map(|l| l.name.as_str()))
+                .unwrap_or("Inbox"),
+        );
         ui::clear(&self.list_ring);
-        self.list_ring
-            .append(&ui::ring(list.and_then(|l| l.color.as_deref()), 14));
+        self.list_ring.append(&ui::list_mark_of(list, 14));
     }
 
     pub fn submit(&self) {
         let text = self.entry.text().trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if self.making.borrow().is_some() {
+            // The list this task is going to doesn't exist yet.
+            self.add_when_made.set(true);
             return;
         }
         self.suggest.popdown();
@@ -737,7 +914,7 @@ impl AddCard {
                 _ => None,
             });
         drop(chosen);
-        (self.on_add)(spec);
+        (self.on_add)(spec, self.leaving.get());
         self.entry.set_text("");
         buffer.set_text("");
         {
@@ -797,4 +974,40 @@ pub fn chips(p: &quickadd::Parsed) -> Vec<(String, &'static str)> {
         }
     }
     out
+}
+
+/// Enter in the notes calls `add` instead of starting a line; Shift+Enter
+/// still does. The newline is stopped where it is inserted, after the input
+/// method has had the key, so Enter that only confirms a composition adds
+/// nothing.
+fn notes_enter(view: &gtk::TextView, add: impl Fn() + 'static) {
+    let plain = Rc::new(Cell::new(false));
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let plain = plain.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let held = state.intersects(
+                gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK,
+            );
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) && !held {
+                plain.set(true);
+                // The insert, if the key makes one, is within this event.
+                let plain = plain.clone();
+                glib::idle_add_local_once(move || plain.set(false));
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    view.add_controller(keys);
+    let add = Rc::new(add);
+    view.buffer().connect_insert_text(move |b, _, text| {
+        if text == "\n" && plain.replace(false) {
+            b.stop_signal_emission_by_name("insert-text");
+            let add = add.clone();
+            glib::idle_add_local_once(move || add());
+        }
+    });
 }

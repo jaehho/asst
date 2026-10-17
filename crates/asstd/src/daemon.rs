@@ -70,7 +70,17 @@ pub struct Daemon {
     pub wake_reminders: Notify,
     /// Tasks changed, here or on the server, or links did: a GitHub pass.
     pub wake_github: Notify,
+    /// How each linked repo's last pass went: when it last worked, and
+    /// what is wrong now.
+    gh_state: Mutex<HashMap<String, GhState>>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
+}
+
+/// How a linked repo's last GitHub pass went.
+#[derive(Clone, Default)]
+struct GhState {
+    synced: Option<DateTime<Utc>>,
+    error: Option<String>,
 }
 
 /// What the D-Bus side should tell clients.
@@ -113,6 +123,7 @@ impl Daemon {
             completed: watch::channel((0, Ok(Report::default()))).0,
             wake_reminders: Notify::new(),
             wake_github: Notify::new(),
+            gh_state: Mutex::default(),
             events,
         };
         (Arc::new(daemon), rx)
@@ -777,13 +788,37 @@ impl Daemon {
                     .find_list(&href)
                     .map(|l| l.name)
                     .unwrap_or_else(|_| href.clone());
+                let state = self
+                    .gh_state
+                    .lock()
+                    .expect("not poisoned")
+                    .get(&repo)
+                    .cloned()
+                    .unwrap_or_default();
                 Ok(LinkView {
                     repo,
                     list: href,
                     name,
+                    synced: state.synced,
+                    error: state.error,
                 })
             })
             .collect()
+    }
+
+    /// A GitHub pass over `repo` ended: it worked, or this is why not.
+    pub fn gh_pass_done(&self, repo: &str, outcome: std::result::Result<(), String>) {
+        let mut state = self.gh_state.lock().expect("not poisoned");
+        let entry = state.entry(repo.to_string()).or_default();
+        match outcome {
+            Ok(()) => {
+                *entry = GhState {
+                    synced: Some(Utc::now()),
+                    error: None,
+                }
+            }
+            Err(e) => entry.error = Some(e),
+        }
     }
 
     /// Tie a list to a GitHub repo (`owner/repo`): its issues are synced
@@ -815,6 +850,8 @@ impl Daemon {
             repo: repo.to_string(),
             list: l.href,
             name: l.name,
+            synced: None,
+            error: None,
         })
     }
 

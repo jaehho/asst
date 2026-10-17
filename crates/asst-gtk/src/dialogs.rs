@@ -11,11 +11,13 @@ use relm4::gtk::{self, gdk};
 
 use crate::ui;
 
-/// New list (`list` is None) or edit one. `on_save` gets the name and color.
+/// New list (`list` is None) or edit one. `on_save` gets the name, the
+/// color and the icon (none: the plain ring).
 pub fn list_dialog(
     parent: &impl IsA<gtk::Widget>,
     list: Option<&ListView>,
-    on_save: impl Fn(String, String) + 'static,
+    icon: Option<&str>,
+    on_save: impl Fn(String, String, Option<String>) + 'static,
 ) {
     let editing = list.is_some();
     let dialog = adw::Dialog::builder()
@@ -103,6 +105,54 @@ pub fn list_dialog(
     colors.add(&flow);
     page.add(&colors);
 
+    let icons = adw::PreferencesGroup::builder().title("Icon").build();
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(12)
+        .min_children_per_line(6)
+        .row_spacing(2)
+        .column_spacing(2)
+        .homogeneous(true)
+        .build();
+    let picked: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(icon.map(str::to_string)));
+    let mut group: Option<gtk::ToggleButton> = None;
+    // None first: the plain ring in the list's color.
+    for name in std::iter::once("").chain(ui::list_icon_names()) {
+        let button = gtk::ToggleButton::new();
+        button.add_css_class("flat");
+        if name.is_empty() {
+            let ring = ui::ring(Some(&chosen.borrow()), 16);
+            button.set_child(Some(&ring));
+            button.set_tooltip_text(Some("No icon"));
+        } else {
+            button.set_child(Some(&ui::icon(&format!("lucide-{name}-symbolic"), 18)));
+            button.set_tooltip_text(Some(&name.replace('-', " ")));
+        }
+        match &group {
+            Some(g) => button.set_group(Some(g)),
+            None => group = Some(button.clone()),
+        }
+        if picked.borrow().as_deref().unwrap_or("") == name {
+            button.set_active(true);
+        }
+        let picked = picked.clone();
+        let name = name.to_string();
+        button.connect_toggled(move |b| {
+            if b.is_active() {
+                *picked.borrow_mut() = Some(name.clone()).filter(|n| !n.is_empty());
+            }
+        });
+        flow.append(&button);
+    }
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&flow)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(160)
+        .max_content_height(220)
+        .build();
+    icons.add(&scroller);
+    page.add(&icons);
+
     let view = adw::ToolbarView::new();
     view.add_top_bar(&header);
     view.set_content(Some(&page));
@@ -117,7 +167,7 @@ pub fn list_dialog(
                 name.add_css_class("error");
                 return;
             }
-            on_save(text, chosen.borrow().clone());
+            on_save(text, chosen.borrow().clone(), picked.borrow().clone());
             dialog.close();
         }
     };
@@ -231,6 +281,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                     "Pick a date or reminders for the open task",
                     "<Control>d <Control>r",
                 ),
+                ("Finish editing the open task", "<Control>Return"),
                 ("Close the task or selection", "Escape"),
             ],
         ),
@@ -250,12 +301,13 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             "Adding",
             &[
                 ("Add and keep going", "Return"),
-                ("Add from the notes", "<Control>Return"),
+                ("Add from the notes", "Return <Control>Return"),
+                ("New line in the notes", "<Shift>Return"),
                 ("Add a task from the clipboard", "<Control>v"),
                 ("Pick a date", "<Control>d"),
                 ("Pick reminders", "<Control>r"),
                 ("Keep quick add open", "<Control>k"),
-                ("Stop adding", "Escape"),
+                ("Stop adding, keeping what is typed", "Escape"),
             ],
         ),
         (

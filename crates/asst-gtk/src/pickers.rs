@@ -985,6 +985,17 @@ pub fn list_popover(
     current: Option<&str>,
     on_pick: impl Fn(String) + 'static,
 ) -> gtk::Popover {
+    list_popover_with(lists, current, on_pick, None)
+}
+
+/// `list_popover`, and with `on_create`, a last row that makes the list
+/// being searched for when none has that name.
+pub fn list_popover_with(
+    lists: &[ListView],
+    current: Option<&str>,
+    on_pick: impl Fn(String) + 'static,
+    on_create: Option<Rc<dyn Fn(String)>>,
+) -> gtk::Popover {
     let on_pick = Rc::new(on_pick);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
     root.set_margin_top(9);
@@ -1006,7 +1017,7 @@ pub fn list_popover(
         line.set_margin_bottom(6);
         line.set_margin_start(6);
         line.set_margin_end(6);
-        line.append(&ui::ring(l.color.as_deref(), 14));
+        line.append(&ui::list_mark(l, 14));
         let name = ui::label(&l.name, &[]);
         name.set_hexpand(true);
         line.append(&name);
@@ -1018,6 +1029,27 @@ pub fn list_popover(
         listbox.append(&row);
         hrefs.push(l.href.clone());
     }
+    // The row that makes a list, shown while the search names none.
+    let create_label = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(pango::EllipsizeMode::End)
+        .build();
+    let create_row = gtk::ListBoxRow::new();
+    {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        line.set_margin_top(6);
+        line.set_margin_bottom(6);
+        line.set_margin_start(6);
+        line.set_margin_end(6);
+        line.append(&gtk::Image::from_icon_name("plus-large-symbolic"));
+        line.append(&create_label);
+        create_row.set_child(Some(&line));
+        create_row.set_visible(false);
+        if on_create.is_some() {
+            listbox.append(&create_row);
+        }
+    }
     let scroller = gtk::ScrolledWindow::builder()
         .child(&listbox)
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1028,10 +1060,21 @@ pub fn list_popover(
     let popover = ui::popover(&root);
     popover.set_width_request(260);
     let hrefs = Rc::new(hrefs);
+    let names: Rc<Vec<String>> = Rc::new(lists.iter().map(|l| l.name.to_lowercase()).collect());
     {
         let (hrefs, on_pick, popover) = (hrefs.clone(), on_pick.clone(), popover.clone());
+        let (on_create, search, create_row) =
+            (on_create.clone(), search.clone(), create_row.clone());
         listbox.connect_row_activated(move |_, row| {
-            if let Some(h) = hrefs.get(row.index() as usize) {
+            if *row == create_row {
+                let name = search.text().trim().to_string();
+                if let Some(create) = &on_create
+                    && !name.is_empty()
+                {
+                    popover.popdown();
+                    create(name);
+                }
+            } else if let Some(h) = hrefs.get(row.index() as usize) {
                 popover.popdown();
                 on_pick(h.clone());
             }
@@ -1039,13 +1082,20 @@ pub fn list_popover(
     }
     {
         let listbox = listbox.clone();
+        let create_row = create_row.clone();
         search.connect_search_changed(move |e| {
-            let q = e.text().to_lowercase();
+            let text = e.text();
+            let q = text.trim().to_lowercase();
             let mut i = 0;
             while let Some(row) = listbox.row_at_index(i) {
-                row.set_visible(row.widget_name().contains(q.as_str()));
+                if row != create_row {
+                    row.set_visible(row.widget_name().contains(q.as_str()));
+                }
                 i += 1;
             }
+            let new = !q.is_empty() && !names.contains(&q);
+            create_row.set_visible(new);
+            create_label.set_text(&format!("Create list “{}”", text.trim()));
         });
     }
     {
@@ -1183,7 +1233,7 @@ pub fn reminder_popover(
             for a in &task.location_alarms {
                 let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 line.set_margin_start(6);
-                line.append(&gtk::Image::from_icon_name("location-symbolic"));
+                line.append(&gtk::Image::from_icon_name("lucide-map-pin-symbolic"));
                 let text = ui::label(&format!("On arrival at {}", a.title), &[]);
                 text.set_hexpand(true);
                 line.append(&text);
@@ -1386,7 +1436,7 @@ pub fn reminder_popover(
             .hexpand(true)
             .build();
         bar.append(&entry);
-        let go = gtk::Button::from_icon_name("magnifier-symbolic");
+        let go = gtk::Button::from_icon_name("edit-find-symbolic");
         go.add_css_class("flat");
         go.set_tooltip_text(Some("Search"));
         bar.append(&go);

@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use asst_core::api::{Change, ListView, StatusView, SyncState, TaskView};
+use asst_core::api::{Change, LinkView, ListView, StatusView, SyncState, TaskView};
 use asst_core::fmt;
 use asst_core::task::{Task, priority_level};
 use asst_core::time::{Trigger, When, resolve, weekday_code};
@@ -112,7 +112,7 @@ impl Nav {
         match self {
             Nav::Inbox => "mailbox-symbolic",
             Nav::Today => "star-outline-thick-symbolic",
-            Nav::Day => "calendar-hollow-symbolic",
+            Nav::Day => "work-week-symbolic",
             Nav::Matrix => "flag-outline-thick-symbolic",
             Nav::Scheduled => "month-symbolic",
             Nav::Completed => "check-round-outline-symbolic",
@@ -1328,6 +1328,50 @@ pub fn sync_state(s: &StatusView, now: DateTime<Tz>) -> String {
     state
 }
 
+/// `owner/repo` of an issue's URL.
+pub fn issue_repo(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let (owner, repo) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+}
+
+/// Where a repo is checked out: its name under the projects folder
+/// (`~` in it is the home folder).
+pub fn checkout_dir(projects: &str, repo: &str, home: &str) -> std::path::PathBuf {
+    let projects = match projects.trim() {
+        "" => "~/projects",
+        p => p,
+    };
+    let projects = match projects.strip_prefix('~') {
+        Some(rest) => format!("{home}{rest}"),
+        None => projects.to_string(),
+    };
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    std::path::Path::new(&projects).join(name)
+}
+
+/// The command to run for "start work": `template` with `{dir}`, `{repo}`,
+/// `{number}` and `{url}` replaced, each quoted for `sh`.
+pub fn work_command(template: &str, dir: &str, repo: &str, number: u32, url: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    template
+        .replace("{dir}", &quote(dir))
+        .replace("{repo}", &quote(repo))
+        .replace("{number}", &number.to_string())
+        .replace("{url}", &quote(url))
+}
+
+/// A list's GitHub link, as its sidebar mark's tooltip says it.
+pub fn link_state(l: &LinkView, now: DateTime<Tz>) -> String {
+    match (&l.error, l.synced) {
+        (Some(e), Some(t)) => format!("{}: {e} (last read {})", l.repo, ago(t, now)),
+        (Some(e), None) => format!("{}: {e}", l.repo),
+        (None, Some(t)) => format!("Issues of {} read {}", l.repo, ago(t, now)),
+        (None, None) => format!("Issues of {}: not read yet", l.repo),
+    }
+}
+
 /// `just now`, `12 seconds ago`, `5 minutes ago`, `3 hours ago`, then the
 /// day. Seconds, because the daemon checks every minute: "Synced just now"
 /// would be all it ever said.
@@ -1913,6 +1957,56 @@ mod tests {
         assert_eq!(ago(at(7300), now()), "2 hours ago");
         assert_eq!(ago(at(3 * 86400), now()), "on Sep 11");
         assert_eq!(ago(at(400 * 86400), now()), "on Aug 10, 2025");
+    }
+
+    #[test]
+    fn work_starts_in_the_checkout_of_the_issues_repo() {
+        assert_eq!(
+            issue_repo("https://github.com/jaehho/asst/issues/12").as_deref(),
+            Some("jaehho/asst")
+        );
+        assert_eq!(issue_repo("https://example.com/a/b/issues/1"), None);
+        assert_eq!(
+            checkout_dir("~/projects", "jaehho/asst", "/home/jaeho"),
+            std::path::PathBuf::from("/home/jaeho/projects/asst")
+        );
+        assert_eq!(
+            checkout_dir("/srv/src", "jaehho/asst", "/home/jaeho"),
+            std::path::PathBuf::from("/srv/src/asst")
+        );
+        assert_eq!(
+            work_command(
+                "kitty --directory {dir} gh-co {number}",
+                "/home/jaeho/my projects/it's",
+                "jaehho/asst",
+                12,
+                "https://github.com/jaehho/asst/issues/12"
+            ),
+            "kitty --directory '/home/jaeho/my projects/it'\\''s' gh-co 12"
+        );
+    }
+
+    #[test]
+    fn a_link_says_when_it_was_read_or_what_is_wrong() {
+        let link = |synced: Option<i64>, error: Option<&str>| LinkView {
+            repo: "jaehho/asst".into(),
+            list: "/cal/asst/".into(),
+            name: "asst".into(),
+            synced: synced.map(|s| now().with_timezone(&Utc) - Duration::seconds(s)),
+            error: error.map(str::to_string),
+        };
+        assert_eq!(
+            link_state(&link(Some(150), None), now()),
+            "Issues of jaehho/asst read 2 minutes ago"
+        );
+        assert_eq!(
+            link_state(&link(None, None), now()),
+            "Issues of jaehho/asst: not read yet"
+        );
+        assert_eq!(
+            link_state(&link(Some(61), Some("the server answered 403")), now()),
+            "jaehho/asst: the server answered 403 (last read 1 minute ago)"
+        );
     }
 
     #[test]

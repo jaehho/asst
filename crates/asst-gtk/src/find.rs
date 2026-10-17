@@ -253,12 +253,7 @@ pub fn open(
                 for l in found_lists {
                     let sub = archived.contains(&l.href).then_some("Archived");
                     add(
-                        result_row(
-                            ui::ring(l.color.as_deref(), 16).upcast(),
-                            &bold(&l.name, &q),
-                            sub,
-                            None,
-                        ),
+                        result_row(ui::list_mark(l, 16), &bold(&l.name, &q), sub, None),
                         Hit::Nav(Nav::List(l.href.clone())),
                     );
                 }

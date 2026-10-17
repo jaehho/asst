@@ -29,6 +29,9 @@ pub struct Prefs {
     /// The order lists were dragged into, as hrefs. Lists not in it follow,
     /// in the server's order.
     pub list_order: Vec<String>,
+    /// A list's icon (a Lucide name, see `ui::list_icon_names`), by href.
+    /// Window-only: the server has nowhere to keep one.
+    pub list_icons: BTreeMap<String, String>,
     /// Lists put away (hrefs): out of the sidebar, the views and the counts.
     /// They still sync, and their reminders still ring.
     pub archived: Vec<String>,
@@ -38,6 +41,12 @@ pub struct Prefs {
     pub default_priority: u8,
     /// A date or repeat typed in a new task's title becomes its own.
     pub read_dates: bool,
+    /// Where checkouts of linked repos live: a folder holding one folder
+    /// per repo, named for it. `~` is the home folder.
+    pub projects_dir: String,
+    /// What "Start work" on a GitHub issue runs, through `sh`: `{dir}` is
+    /// the repo's checkout, `{number}` the issue, `{repo}` and `{url}`.
+    pub work_command: String,
     /// The views in the sidebar, in order, as `Nav::key`s. Unset: the default.
     pub sidebar: Option<Vec<String>>,
     /// Before `sidebar`: views shown besides Inbox, Today, Scheduled and
@@ -68,10 +77,13 @@ impl Default for Prefs {
             background: true,
             lists_by_name: false,
             list_order: Vec::new(),
+            list_icons: BTreeMap::new(),
             archived: Vec::new(),
             remember_list: false,
             default_priority: 4,
             read_dates: true,
+            projects_dir: "~/projects".into(),
+            work_command: "kitty --directory {dir} gh-co {number}".into(),
             sidebar: None,
             filters: Vec::new(),
             plan: Vec::new(),

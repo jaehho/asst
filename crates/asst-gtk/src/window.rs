@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use asst_core::api::{
-    AddSpec, Added, Change, ListChange, ListSpec, ListView, Settings, SettingsChange, StatusView,
-    SyncState, TaskView, query,
+    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings, SettingsChange,
+    StatusView, SyncState, TaskView, query,
 };
 use asst_core::fmt;
 use asst_core::store::{Query, View};
@@ -112,6 +112,15 @@ pub enum Batch {
     Copy,
 }
 
+/// What a list made on the spot is for.
+#[derive(Debug, Clone)]
+pub enum Then {
+    /// The add card's list.
+    AddCard,
+    /// Where this task goes.
+    Move(String),
+}
+
 #[derive(Debug)]
 pub enum Msg {
     Navigate(Nav),
@@ -161,7 +170,8 @@ pub enum Msg {
     /// Undo a plan change: restore this slot on `date`, or take the task
     /// off when there was none. Carries what the toast is holding.
     PlanUndo(String, chrono::NaiveDate, Option<(u32, u32)>),
-    Add(Box<AddSpec>),
+    /// A new task, and whether the add card was left with it typed.
+    Add(Box<AddSpec>, bool),
     ShowAdd(Option<Target>),
     HideAdd,
     /// The add card has folded away.
@@ -171,8 +181,18 @@ pub enum Msg {
     Batch(Batch),
     SetViewOpts(ViewOpts),
     NewList,
+    /// Take back a task added by leaving the add card.
+    Unadd(String),
+    /// Run the work command in the checkout of the task's issue's repo.
+    StartWork(String),
+    /// A link, in the browser.
+    OpenUrl(String),
+    /// A list made from a picker that found none by that name, and what
+    /// to do with it once it exists.
+    MakeList(String, Then),
     EditList(String),
-    SaveList(Option<String>, String, String),
+    /// href (none for a new list), name, color, icon
+    SaveList(Option<String>, String, String, Option<String>),
     AskDeleteList(String),
     DeleteList(String),
     /// A list's completed tasks, or every list's: ask first.
@@ -280,6 +300,7 @@ pub struct Loaded {
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     status: StatusView,
+    links: Vec<LinkView>,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -306,9 +327,12 @@ pub enum Cmd {
     Settings(client::Result<Settings>),
     Toast(client::Result<String>),
     Completed(String, client::Result<TaskView>),
-    Added(client::Result<Added>),
+    /// Whether it was added by leaving the add card, which says so.
+    Added(bool, client::Result<Added>),
     Opened(client::Result<TaskView>),
-    ListSaved(client::Result<ListView>),
+    /// The icon a list just made is to have, and the list.
+    ListSaved(Option<String>, client::Result<ListView>),
+    ListMade(client::Result<ListView>, Then),
     /// A task's iCalendar object, to save.
     Ics(String, client::Result<String>),
     /// Places found for a location reminder's search.
@@ -363,6 +387,8 @@ pub struct Window {
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
     status: Option<StatusView>,
+    /// The lists tied to GitHub repos, and how the last pass went.
+    links: Vec<LinkView>,
     settings: Option<Settings>,
     error: Option<String>,
     loaded: bool,
@@ -728,6 +754,10 @@ impl Component for Window {
         window.add_breakpoint(narrow);
 
         let add_card = AddCard::for_window(tx.clone());
+        {
+            let tx = tx.clone();
+            add_card.on_create_list(move |name| tx.emit(Msg::MakeList(name, Then::AddCard)));
+        }
         add_card.set_defaults(prefs.default_priority, prefs.read_dates);
 
         // View options: sort, show completed, priorities.
@@ -857,6 +887,7 @@ impl Component for Window {
             day_day: chrono::Local::now().date_naive(),
             zoom_hold: None,
             status: None,
+            links: Vec::new(),
             settings: None,
             error: None,
             loaded: false,
@@ -949,7 +980,9 @@ impl Component for Window {
                     self.nav = nav;
                     self.prefs.view = self.nav.key();
                     self.prefs.save();
-                    self.adding = None;
+                    if self.adding.take().is_some() {
+                        let _ = w.add_card.save_draft();
+                    }
                     self.cursor = None;
                     if self.select_mode {
                         self.select_mode = false;
@@ -1305,8 +1338,9 @@ impl Component for Window {
                     self.shown = 0;
                 }
             }
-            Msg::Add(spec) => {
-                sender.oneshot_command(async move { Cmd::Added(client::add(&spec).await) });
+            Msg::Add(spec, implicit) => {
+                sender
+                    .oneshot_command(async move { Cmd::Added(implicit, client::add(&spec).await) });
             }
             Msg::ShowAdd(target) => {
                 self.show_add(w, &sender, target);
@@ -1374,39 +1408,124 @@ impl Component for Window {
             }
             Msg::NewList => {
                 let tx = tx.clone();
-                dialogs::list_dialog(&w.window, None, move |name, color| {
-                    tx.emit(Msg::SaveList(None, name, color))
+                dialogs::list_dialog(&w.window, None, None, move |name, color, icon| {
+                    tx.emit(Msg::SaveList(None, name, color, icon))
+                });
+            }
+            Msg::Unadd(href) => {
+                self.hidden.insert(href.clone());
+                sender.oneshot_command(async move {
+                    Cmd::Toast(client::delete(&href).await.map(|()| String::new()))
+                });
+            }
+            Msg::OpenUrl(url) => {
+                gtk::UriLauncher::new(&url).launch(
+                    Some(&w.window),
+                    None::<&gio::Cancellable>,
+                    |_| {},
+                );
+            }
+            Msg::StartWork(href) => {
+                let Some(issue) = self.find(&href).and_then(|t| t.issue.clone()) else {
+                    return;
+                };
+                let Some(repo) = model::issue_repo(&issue.url) else {
+                    return;
+                };
+                if self.prefs.work_command.trim().is_empty() {
+                    toast(w, "Set what Start work runs in Preferences → GitHub");
+                    return;
+                }
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dir = model::checkout_dir(&self.prefs.projects_dir, &repo, &home);
+                if !dir.is_dir() {
+                    toast(
+                        w,
+                        &format!(
+                            "No checkout of {repo} at {} (Preferences → GitHub)",
+                            dir.display()
+                        ),
+                    );
+                    return;
+                }
+                let command = model::work_command(
+                    &self.prefs.work_command,
+                    &dir.to_string_lossy(),
+                    &repo,
+                    issue.number,
+                    &issue.url,
+                );
+                match std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .current_dir(&dir)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    // Reaped when it ends, so it doesn't linger as a zombie.
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => toast(w, &format!("Could not run {command}: {e}")),
+                }
+            }
+            Msg::MakeList(name, then) => {
+                let color = ui::unused_color(self.lists.iter().map(|l| l.color.as_deref()));
+                sender.oneshot_command(async move {
+                    let made = client::create_list(&ListSpec {
+                        name,
+                        color: Some(color.to_string()),
+                    })
+                    .await;
+                    Cmd::ListMade(made, then)
                 });
             }
             Msg::EditList(href) => {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
                     let tx = tx.clone();
-                    dialogs::list_dialog(&w.window, Some(l), move |name, color| {
-                        tx.emit(Msg::SaveList(Some(href.clone()), name, color))
-                    });
+                    let icon = self.prefs.list_icons.get(&href).cloned();
+                    dialogs::list_dialog(
+                        &w.window,
+                        Some(l),
+                        icon.as_deref(),
+                        move |name, color, icon| {
+                            tx.emit(Msg::SaveList(Some(href.clone()), name, color, icon))
+                        },
+                    );
                 }
             }
-            Msg::SaveList(href, name, color) => {
+            Msg::SaveList(href, name, color, icon) => {
+                if let Some(h) = &href {
+                    self.set_list_icon(h, icon.as_deref());
+                }
+                // A new list has no href until the server has made it.
+                let new_icon = if href.is_none() { icon } else { None };
                 sender.oneshot_command(async move {
-                    Cmd::ListSaved(match href {
-                        None => {
-                            client::create_list(&ListSpec {
-                                name,
-                                color: Some(color),
-                            })
-                            .await
-                        }
-                        Some(h) => {
-                            client::update_list(
-                                &h,
-                                &ListChange {
-                                    name: Some(name),
+                    Cmd::ListSaved(
+                        new_icon,
+                        match href {
+                            None => {
+                                client::create_list(&ListSpec {
+                                    name,
                                     color: Some(color),
-                                },
-                            )
-                            .await
-                        }
-                    })
+                                })
+                                .await
+                            }
+                            Some(h) => {
+                                client::update_list(
+                                    &h,
+                                    &ListChange {
+                                        name: Some(name),
+                                        color: Some(color),
+                                    },
+                                )
+                                .await
+                            }
+                        },
+                    )
                 });
             }
             Msg::AskDeleteList(href) => {
@@ -1566,7 +1685,9 @@ impl Component for Window {
                     self.close_editor(w, &sender);
                     self.nav = Nav::List(t.list.clone());
                     self.prefs.view = self.nav.key();
-                    self.adding = None;
+                    if self.adding.take().is_some() {
+                        let _ = w.add_card.save_draft();
+                    }
                     if !t.task.is_open() {
                         let mut opts = self.prefs.view_opts(&self.nav);
                         opts.show_completed = true;
@@ -1660,7 +1781,7 @@ impl Component for Window {
             }
             Msg::Quit => {
                 self.remember_size(w);
-                let waiting = w.editor.has_pending();
+                let waiting = w.add_card.save_draft() || w.editor.has_pending();
                 self.close_editor(w, &sender);
                 let deletes: Vec<String> = self.hidden.iter().cloned().collect();
                 sender.oneshot_command(async move {
@@ -1708,6 +1829,7 @@ impl Component for Window {
                         self.open = l.open;
                         if let Some(Settings { .. }) = &self.settings {}
                         self.status = Some(l.status);
+                        self.links = l.links;
                         self.settle();
                         w.add_card.set_lists(&self.lists, self.prefs.sunday_first);
                         if let Nav::List(href) = &self.nav
@@ -1829,11 +1951,27 @@ impl Component for Window {
                     toast(w, &e);
                 }
             },
-            Cmd::Added(result) => match result {
+            Cmd::Added(implicit, result) => match result {
                 Ok(a) if a.existed => toast(
                     w,
                     &format!("Already there: {}", quoted(&a.task.task.summary)),
                 ),
+                // Added by leaving the card: say so, and let it be taken back.
+                Ok(a) if implicit => {
+                    let t = &a.task;
+                    let toast = adw::Toast::builder()
+                        .title(glib::markup_escape_text(&format!(
+                            "Added {} to {}",
+                            quoted(&t.task.summary),
+                            t.list_name
+                        )))
+                        .button_label("Undo")
+                        .timeout(5)
+                        .build();
+                    let (tx, href) = (tx.clone(), t.href.clone());
+                    toast.connect_button_clicked(move |_| tx.emit(Msg::Unadd(href.clone())));
+                    w.toasts.add_toast(toast);
+                }
                 Ok(a) => {
                     // Show where it went when that isn't this view.
                     let t = &a.task;
@@ -1889,8 +2027,11 @@ impl Component for Window {
                 }
                 Err(e) => toast(w, &e),
             },
-            Cmd::ListSaved(result) => match result {
+            Cmd::ListSaved(icon, result) => match result {
                 Ok(l) => {
+                    if icon.is_some() {
+                        self.set_list_icon(&l.href, icon.as_deref());
+                    }
                     if !self.lists.iter().any(|x| x.href == l.href) {
                         self.lists.push(l.clone());
                         self.nav = Nav::List(l.href.clone());
@@ -1898,6 +2039,22 @@ impl Component for Window {
                     self.reload(&sender);
                 }
                 Err(e) => toast(w, &e),
+            },
+            Cmd::ListMade(result, then) => match result {
+                Ok(l) => {
+                    if !self.lists.iter().any(|x| x.href == l.href) {
+                        self.lists.push(l.clone());
+                    }
+                    match then {
+                        Then::AddCard => w.add_card.list_made(&l),
+                        Then::Move(href) => sender.input(Msg::Move(href, l.href.clone())),
+                    }
+                    self.reload(&sender);
+                }
+                Err(e) => {
+                    w.add_card.list_failed();
+                    toast(w, &e);
+                }
             },
             Cmd::Places(result) => match result {
                 Ok(places) => w.editor.show_places(places),
@@ -2024,6 +2181,8 @@ impl Window {
                     lists: client::lists().await?,
                     open: client::tasks(&query(View::Open)).await?,
                     status: client::status().await?,
+                    // A daemon that can't say is not a failed load.
+                    links: client::links().await.unwrap_or_default(),
                 })
             }
             .await;
@@ -2122,6 +2281,7 @@ impl Window {
     /// now, since their toasts go with the window.
     fn hide(&mut self, w: &Widgets, sender: &ComponentSender<Self>) {
         self.remember_size(w);
+        let _ = w.add_card.save_draft();
         self.close_editor(w, sender);
         w.toasts.dismiss_all();
         w.window.set_visible(false);
@@ -2137,6 +2297,7 @@ impl Window {
         self.close_editor(w, sender);
         let target = target.unwrap_or_else(|| self.default_target());
         if self.adding.as_ref() != Some(&target) {
+            let _ = w.add_card.save_draft();
             w.add_card.open(target.clone());
         }
         self.adding = Some(target);
@@ -2144,6 +2305,23 @@ impl Window {
         self.shown = 0;
         self.render(w, sender, false);
         w.add_card.focus();
+    }
+
+    /// A list's icon, or none; kept with the window's prefs.
+    fn set_list_icon(&mut self, href: &str, icon: Option<&str>) {
+        let was = self.prefs.list_icons.get(href).map(String::as_str);
+        if was == icon {
+            return;
+        }
+        match icon {
+            Some(i) => self
+                .prefs
+                .list_icons
+                .insert(href.to_string(), i.to_string()),
+            None => self.prefs.list_icons.remove(href),
+        };
+        self.prefs.save();
+        self.shown = 0;
     }
 
     fn default_target(&self) -> Target {
@@ -2518,7 +2696,7 @@ impl Window {
                 } else if self.editing.is_some() {
                     sender.input(Msg::CloseEditor);
                 } else if self.adding.is_some() {
-                    sender.input(Msg::HideAdd);
+                    w.add_card.leave();
                 }
             }
             Key::PrevView | Key::NextView => {
@@ -2665,6 +2843,7 @@ impl Window {
                 self.prefs.save();
             }
         }
+        ui::set_list_icons(&self.prefs.list_icons);
         let (lists, open, completed) = self.view_data();
         let data = Data {
             lists: &lists,
@@ -2686,6 +2865,7 @@ impl Window {
             counts: &counts,
             status: self.status.as_ref(),
             prefs: &self.prefs,
+            links: &self.links,
         });
         w.header_title.set_text(&self.nav.title(&self.lists));
         // The view button is marked while a filter hides tasks.
@@ -3276,6 +3456,26 @@ impl Window {
             }
             "add" => sender.input(Msg::ShowAdd(None)),
             // Choose a row or a button in the open popover by its words.
+            // `search <text>`: into the open popover's search field.
+            "search" => {
+                let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
+                    eprintln!("drive: no popover open");
+                    return;
+                };
+                let mut stack: Vec<gtk::Widget> = p.child().into_iter().collect();
+                while let Some(widget) = stack.pop() {
+                    if let Some(entry) = widget.downcast_ref::<gtk::SearchEntry>() {
+                        entry.set_text(arg);
+                        return;
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(c) = child {
+                        child = c.next_sibling();
+                        stack.push(c);
+                    }
+                }
+                eprintln!("drive: no search field in the popover");
+            }
             "pick" => {
                 let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
                     eprintln!("drive: no popover open");
@@ -3634,7 +3834,7 @@ fn view_menu(tx: Tx) -> gtk::Popover {
                 }
                 next.hide_lists.push(l.href.clone());
             }
-            let ring = ui::ring(l.color.as_deref(), 12);
+            let ring = ui::list_mark(l, 12);
             let item = Item::new(None, &l.name).checked(!hidden).build(set(next));
             if let Some(content) = item.child().and_downcast::<gtk::Box>() {
                 content.prepend(&ring);

@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use asst_core::api::{ListView, StatusView, SyncState};
+use asst_core::api::{LinkView, ListView, StatusView, SyncState};
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk::{self, gdk, glib, pango};
@@ -29,6 +29,8 @@ struct ListRow {
     href: String,
     row: gtk::ListBoxRow,
     count: gtk::Label,
+    /// Shown while the list is tied to a GitHub repo.
+    link: gtk::Image,
 }
 
 /// What a dragged list carries.
@@ -116,6 +118,7 @@ pub struct State<'a> {
     pub counts: &'a Counts,
     pub status: Option<&'a StatusView>,
     pub prefs: &'a Prefs,
+    pub links: &'a [LinkView],
 }
 
 /// A drop of a task onto `widget` sends `DropTask` with `nav`.
@@ -344,12 +347,13 @@ impl Sidebar {
 
         let signed_in = st.status.is_some_and(|s| s.state != SyncState::NoAccount);
         let lists_key = format!(
-            "{:?}{}",
+            "{:?}{}{:?}",
             st.lists
                 .iter()
                 .map(|l| (&l.href, &l.name, &l.color, l.writable))
                 .collect::<Vec<_>>(),
-            st.prefs.lists_by_name
+            st.prefs.lists_by_name,
+            st.prefs.list_icons
         );
         if *self.lists_key.borrow() != lists_key {
             *self.lists_key.borrow_mut() = lists_key;
@@ -362,6 +366,19 @@ impl Sidebar {
             } else {
                 String::new()
             });
+            match st.links.iter().find(|l| l.list == r.href) {
+                Some(l) => {
+                    r.link.set_visible(true);
+                    r.link
+                        .set_tooltip_text(Some(&model::link_state(l, pickers::now())));
+                    if l.error.is_some() {
+                        r.link.add_css_class("warning");
+                    } else {
+                        r.link.remove_css_class("warning");
+                    }
+                }
+                None => r.link.set_visible(false),
+            }
             if *st.nav == Nav::List(r.href.clone()) {
                 r.row.add_css_class("selected");
             } else {
@@ -523,7 +540,7 @@ impl Sidebar {
         for l in lists {
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             line.add_css_class("list-line");
-            line.append(&ui::ring(l.color.as_deref(), 18));
+            line.append(&ui::list_mark(l, 18));
             let name = ui::label(&l.name, &[]);
             name.set_hexpand(true);
             line.append(&name);
@@ -533,6 +550,10 @@ impl Sidebar {
                 lock.set_tooltip_text(Some("Read-only"));
                 line.append(&lock);
             }
+            let link = ui::icon("chain-link-loose-symbolic", 12);
+            link.add_css_class("dim-label");
+            link.set_visible(false);
+            line.append(&link);
             let count = ui::label("", &["caption", "dim-label"]);
             line.append(&count);
             let row = gtk::ListBoxRow::new();
@@ -575,6 +596,7 @@ impl Sidebar {
                 href: l.href.clone(),
                 row,
                 count,
+                link,
             });
         }
         *self.rows.borrow_mut() = rows;

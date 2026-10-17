@@ -576,7 +576,8 @@ pub fn tray(
             t,
             &row::RowOpts {
                 now: o.now,
-                show_list: true,
+                show_list: false,
+                compact: true,
                 completing: o.completing.contains(&t.href),
                 just_checked: false,
                 rolled: false,

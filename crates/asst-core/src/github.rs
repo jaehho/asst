@@ -306,6 +306,21 @@ impl GitHub {
         body: Option<serde_json::Value>,
         etag: Option<&str>,
     ) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
+        let out = self.raw(method, url, body, etag).await?;
+        match out.0 {
+            s if s.is_success() || s == StatusCode::NOT_MODIFIED => Ok(out),
+            s => Err(caldav::status_error(s)),
+        }
+    }
+
+    /// `call` without judging the status.
+    async fn raw(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<serde_json::Value>,
+        etag: Option<&str>,
+    ) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
         let mut req = Request::builder()
             .method(method)
             .uri(url)
@@ -318,11 +333,33 @@ impl GitHub {
         let req = req
             .body(body.map(|b| b.to_string()).unwrap_or_default())
             .map_err(|e| RemoteError::Protocol(e.to_string()))?;
-        let out = caldav::send(req).await?;
-        match out.0 {
-            s if s.is_success() || s == StatusCode::NOT_MODIFIED => Ok(out),
-            s => Err(caldav::status_error(s)),
+        caldav::send(req).await
+    }
+
+    /// Where `repo` is called now, if it was renamed or moved to another
+    /// owner. GitHub answers the old name with a redirect to the
+    /// repository's id, and the id's record has the name.
+    pub async fn renamed(&self, repo: &str) -> Result<Option<String>, RemoteError> {
+        let (status, headers, _) = self
+            .raw(Method::GET, &format!("{API}/repos/{repo}"), None, None)
+            .await?;
+        if status != StatusCode::MOVED_PERMANENTLY {
+            return Ok(None);
         }
+        let id = headers
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .and_then(repository_id)
+            .ok_or_else(|| RemoteError::Protocol("a redirect that names no repository".into()))?;
+        let (_, _, body) = self
+            .call(Method::GET, &format!("{API}/repositories/{id}"), None, None)
+            .await?;
+        #[derive(Deserialize)]
+        struct Repo {
+            full_name: String,
+        }
+        let name = parse::<Repo>(&body)?.full_name;
+        Ok(valid_repo(&name).then_some(name).filter(|n| n != repo))
     }
 
     /// Every issue of `repo`, open and closed, pull requests left out, and
@@ -445,6 +482,13 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, RemoteError> 
 }
 
 /// The `rel="next"` URL of a `Link` header.
+/// The id in a redirect's `Location`: `…/repositories/<id>/…`.
+fn repository_id(location: &str) -> Option<u64> {
+    let rest = location.split_once("/repositories/")?.1;
+    let digits = rest.split(['/', '?']).next()?;
+    digits.parse().ok()
+}
+
 fn next_page(link: &str) -> Option<String> {
     link.split(',').find_map(|part| {
         let (url, rel) = part.split_once(';')?;
@@ -751,6 +795,23 @@ mod tests {
         for bad in ["asst", "/asst", "jaehho/", "a/b/c", "a/..", "a b/c", ""] {
             assert!(!valid_repo(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_redirect_names_the_repository_by_id() {
+        assert_eq!(
+            repository_id("https://api.github.com/repositories/1379104135/issues?state=all"),
+            Some(1379104135)
+        );
+        assert_eq!(
+            repository_id("https://api.github.com/repositories/42"),
+            Some(42)
+        );
+        assert_eq!(repository_id("https://api.github.com/repos/a/b"), None);
+        assert_eq!(
+            repository_id("https://api.github.com/repositories/x/y"),
+            None
+        );
     }
 
     #[test]

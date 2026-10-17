@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::f64::consts::PI;
 
+use asst_core::api::ListView;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{self, gdk, glib, pango};
 
@@ -30,6 +31,91 @@ pub const COLORS: [(&str, &str); 20] = [
     ("Grey", "#a0a0a0"),
     ("Taupe", "#b99780"),
 ];
+
+/// The icons a list can wear (Lucide, see `scripts/lucide-icons.py`).
+pub fn list_icon_names() -> impl Iterator<Item = &'static str> {
+    include_str!("../icons/lucide-names.txt")
+        .lines()
+        .filter(|l| !l.is_empty())
+}
+
+thread_local! {
+    /// href → icon name, as the window's prefs have it: lists are drawn
+    /// in many places that have no prefs at hand.
+    static LIST_ICONS: RefCell<std::collections::BTreeMap<String, String>> = RefCell::default();
+    /// Colors that have a `.tint-xxxxxx` rule by now.
+    static TINTS: RefCell<std::collections::HashSet<String>> = RefCell::default();
+}
+
+pub fn set_list_icons(icons: &std::collections::BTreeMap<String, String>) {
+    LIST_ICONS.with(|i| *i.borrow_mut() = icons.clone());
+}
+
+fn list_icon(href: &str) -> Option<String> {
+    LIST_ICONS.with(|i| i.borrow().get(href).cloned())
+}
+
+/// The CSS class that sets `color` to `hex` (`#rrggbb`), made on first use.
+fn tint(hex: &str) -> Option<String> {
+    let digits = hex.strip_prefix('#')?.to_lowercase();
+    if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let class = format!("tint-{digits}");
+    let new = TINTS.with(|t| t.borrow_mut().insert(class.clone()));
+    if new && let Some(display) = gdk::Display::default() {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&format!(".{class} {{ color: #{digits}; }}"));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+    Some(class)
+}
+
+/// What marks a list: its icon in its color when it has one, otherwise
+/// the colored ring.
+pub fn list_mark(list: &ListView, size: i32) -> gtk::Widget {
+    mark(
+        list.color.as_deref(),
+        list_icon(&list.href).as_deref(),
+        size,
+    )
+}
+
+/// `list_mark` for a list that may not be known.
+pub fn list_mark_of(list: Option<&ListView>, size: i32) -> gtk::Widget {
+    list.map_or_else(|| ring(None, size).upcast(), |l| list_mark(l, size))
+}
+
+pub fn mark(color: Option<&str>, icon: Option<&str>, size: i32) -> gtk::Widget {
+    let Some(icon) = icon else {
+        return ring(color, size).upcast();
+    };
+    // The glyph fills more of its box than the ring does its own.
+    let image = self::icon(&format!("lucide-{icon}-symbolic"), size + 2);
+    image.set_valign(gtk::Align::Center);
+    image.set_halign(gtk::Align::Center);
+    match color.and_then(tint) {
+        Some(class) => image.add_css_class(&class),
+        None => image.add_css_class("dim-label"),
+    }
+    image.upcast()
+}
+
+/// A color for a list made without the color dialog: the first of
+/// `COLORS` no list wears yet, or Blue (the dialog's own default) when
+/// every one is taken.
+pub fn unused_color<'a>(used: impl IntoIterator<Item = Option<&'a str>>) -> &'static str {
+    let used: Vec<String> = used.into_iter().flatten().map(str::to_lowercase).collect();
+    COLORS
+        .iter()
+        .map(|(_, hex)| *hex)
+        .find(|hex| !used.iter().any(|u| u == hex))
+        .unwrap_or(COLORS[11].1)
+}
 
 pub fn icon(name: &str, px: i32) -> gtk::Image {
     let image = gtk::Image::from_icon_name(name);
@@ -339,4 +425,22 @@ pub fn tip(w: &impl IsA<gtk::Widget>, text: &str, keys: &str) {
         glib::markup_escape_text(text),
         glib::markup_escape_text(keys)
     )));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_list_takes_the_first_color_nobody_wears() {
+        assert_eq!(unused_color([]), COLORS[0].1);
+        let used = [Some("#C42D78"), None, Some("#e23d3d")];
+        assert_eq!(unused_color(used), COLORS[2].1);
+    }
+
+    #[test]
+    fn with_every_color_taken_it_is_blue() {
+        let all: Vec<Option<&str>> = COLORS.iter().map(|(_, h)| Some(*h)).collect();
+        assert_eq!(unused_color(all), "#3c6dff");
+    }
 }

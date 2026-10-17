@@ -11,6 +11,9 @@
 #   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
+#   scripts/dev keys [MOD+]KEY...  real key presses to the window, unfocused (Hyprland send_shortcut):
+#                                  `keys Tab h i SHIFT+Return CTRL+Return`. Goes to the main
+#                                  surface, so not into an open popover (those don't take focus here)
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
@@ -283,6 +286,15 @@ CONF
     on_bus
     gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
       --method dev.jaeho.Test.Click "$2" "$3" > /dev/null
+    ;;
+  keys)
+    shift
+    for k in "$@"; do
+      mods="" key="$k"
+      case "$k" in *+*) mods="${k%+*}"; key="${k##*+}"; mods="${mods//+/ }" ;; esac
+      hyprctl eval "hl.dispatch(hl.dsp.send_shortcut({mods=\"${mods}\", key=\"${key}\", window=\"class:^dev.jaeho.Asst.Devel\$\"}))" > /dev/null
+      sleep 0.05
+    done
     ;;
   snap) action snapshot "$(realpath -m "$2")" ;;
   snap-popover) action snapshot-popover "$(realpath -m "$2")" ;;

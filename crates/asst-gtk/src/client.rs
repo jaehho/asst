@@ -2,8 +2,8 @@
 //! the GTK thread as command outputs.
 
 use asst_core::api::{
-    AddSpec, Added, AsstProxy, BlockRange, BlockView, Change, ListChange, ListSpec, ListView,
-    Settings, SettingsChange, StatusView, TaskView, TrackIngested,
+    AddSpec, Added, AsstProxy, BlockRange, BlockView, Change, LinkView, ListChange, ListSpec,
+    ListView, Settings, SettingsChange, StatusView, TaskView, TrackIngested,
 };
 use asst_core::store::Query;
 use serde::de::DeserializeOwned;
@@ -55,6 +55,10 @@ pub async fn status() -> Result<StatusView> {
 
 pub async fn lists() -> Result<Vec<ListView>> {
     json(proxy().await?.lists().await)
+}
+
+pub async fn links() -> Result<Vec<LinkView>> {
+    json(proxy().await?.links().await)
 }
 
 pub async fn tasks(q: &Query) -> Result<Vec<TaskView>> {

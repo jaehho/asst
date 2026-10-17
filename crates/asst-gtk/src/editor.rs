@@ -23,7 +23,7 @@ use crate::motion;
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::row::schedule_change;
 use crate::ui::{self, Item};
-use crate::window::{Msg, Tx};
+use crate::window::{Msg, Then, Tx};
 
 pub struct Editor {
     pub root: gtk::Box,
@@ -51,6 +51,8 @@ pub struct Editor {
     reminders: gtk::MenuButton,
     reminder_dot: gtk::Widget,
     menu: gtk::MenuButton,
+    /// Start work on the task's GitHub issue; shown for a paired task.
+    work: gtk::Button,
     /// The place picker's shared state: its results list, and the places
     /// found so far.
     place_results: pickers::PlaceSlot,
@@ -169,6 +171,10 @@ impl Editor {
         let right = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         right.set_hexpand(true);
         right.set_halign(gtk::Align::End);
+        let work = gtk::Button::from_icon_name("go-next-symbolic");
+        work.add_css_class("flat");
+        work.set_visible(false);
+        right.append(&work);
         right.append(&list);
         let priority_icon = gtk::Image::from_icon_name("flag-outline-thick-symbolic");
         let priority = gtk::MenuButton::builder()
@@ -211,6 +217,7 @@ impl Editor {
             reminders,
             reminder_dot,
             menu,
+            work,
             place_results: Rc::default(),
             places: Rc::default(),
             loading: Cell::new(false),
@@ -244,6 +251,17 @@ impl Editor {
                     && let Some(href) = e.href()
                 {
                     e.tx.emit(Msg::Check(href, c.is_active()));
+                }
+            });
+        }
+
+        {
+            let weak = Rc::downgrade(self);
+            self.work.connect_clicked(move |_| {
+                if let Some(e) = weak.upgrade()
+                    && let Some(href) = e.href()
+                {
+                    e.tx.emit(Msg::StartWork(href));
                 }
             });
         }
@@ -284,15 +302,23 @@ impl Editor {
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             let weak = Rc::downgrade(self);
-            keys.connect_key_pressed(move |_, key, _, _| {
-                // Shift+Tab reads as ISO_Left_Tab.
-                if key == gdk::Key::ISO_Left_Tab
-                    && let Some(e) = weak.upgrade()
-                {
-                    e.focus();
-                    return glib::Propagation::Stop;
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let Some(e) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                match key {
+                    // Shift+Tab reads as ISO_Left_Tab.
+                    gdk::Key::ISO_Left_Tab => e.focus(),
+                    // Enter is a new line here; Ctrl+Enter is done.
+                    gdk::Key::Return | gdk::Key::KP_Enter
+                        if state.contains(gdk::ModifierType::CONTROL_MASK) =>
+                    {
+                        // Closing sends what is typed.
+                        e.tx.emit(Msg::CloseEditor);
+                    }
+                    _ => return glib::Propagation::Proceed,
                 }
-                glib::Propagation::Proceed
+                glib::Propagation::Stop
             });
             self.notes.add_controller(keys);
         }
@@ -406,10 +432,16 @@ impl Editor {
                 };
                 let tx = e.tx.clone();
                 let lists = e.lists.borrow().clone();
-                mb.set_popover(Some(&pickers::list_popover(
+                let make = {
+                    let (tx, href) = (tx.clone(), t.href.clone());
+                    Rc::new(move |name| tx.emit(Msg::MakeList(name, Then::Move(href.clone()))))
+                        as crate::addcard::MakeList
+                };
+                mb.set_popover(Some(&pickers::list_popover_with(
                     &lists,
                     Some(&t.list),
                     move |to| tx.emit(Msg::Move(t.href.clone(), to)),
+                    Some(make),
                 )));
             });
         }
@@ -510,7 +542,29 @@ impl Editor {
     /// Duplicate, copy, save, delete, and when it was made and changed.
     fn task_menu(&self, t: &TaskView) -> gtk::Popover {
         let tx = self.tx.clone();
-        let mut items: Vec<gtk::Widget> = vec![
+        let mut items: Vec<gtk::Widget> = Vec::new();
+        if let Some(issue) = &t.issue {
+            let (tx2, h) = (tx.clone(), t.href.clone());
+            items.push(
+                Item::new(
+                    Some("go-next-symbolic"),
+                    &format!("Start work on #{}…", issue.number),
+                )
+                .build(move || tx2.emit(Msg::StartWork(h.clone())))
+                .upcast(),
+            );
+            let (tx2, url) = (tx.clone(), issue.url.clone());
+            items.push(
+                Item::new(
+                    Some("external-link-symbolic"),
+                    &format!("Open #{} on GitHub", issue.number),
+                )
+                .build(move || tx2.emit(Msg::OpenUrl(url.clone())))
+                .upcast(),
+            );
+            items.push(ui::separator());
+        }
+        items.extend::<Vec<gtk::Widget>>(vec![
             {
                 let (tx, h) = (tx.clone(), t.href.clone());
                 Item::new(Some("tabs-stack-symbolic"), "Duplicate")
@@ -538,7 +592,7 @@ impl Editor {
                     .build(move || tx.emit(Msg::Delete(h.clone())))
                     .upcast()
             },
-        ];
+        ]);
         let info = history(t);
         if !info.is_empty() {
             items.push(ui::separator());
@@ -761,6 +815,14 @@ impl Editor {
         }
         self.check.set_active(!open);
         self.loading.set(false);
+        match &t.issue {
+            Some(issue) => {
+                self.work.set_visible(true);
+                self.work
+                    .set_tooltip_text(Some(&format!("Start work on #{}", issue.number)));
+            }
+            None => self.work.set_visible(false),
+        }
 
         let level = priority_level(t.task.priority);
         for l in 1..=4 {
@@ -808,8 +870,7 @@ impl Editor {
 
         let list = lists.iter().find(|l| l.href == t.list);
         ui::clear(&self.list_ring);
-        self.list_ring
-            .append(&ui::ring(list.and_then(|l| l.color.as_deref()), 14));
+        self.list_ring.append(&ui::list_mark_of(list, 14));
         self.list_label.set_text(&t.list_name);
 
         self.reminder_dot

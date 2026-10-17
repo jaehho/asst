@@ -238,12 +238,8 @@ fn title(o: &Opts, open: usize) -> gtk::Box {
     b.add_css_class("view-title");
     match o.nav {
         Nav::List(href) => {
-            let color = o
-                .lists
-                .iter()
-                .find(|l| &l.href == href)
-                .and_then(|l| l.color.as_deref());
-            b.append(&ui::ring(color, 24));
+            let list = o.lists.iter().find(|l| &l.href == href);
+            b.append(&ui::list_mark_of(list, 24));
         }
         nav => {
             let icon = ui::icon(nav.icon(), 18);
@@ -360,6 +356,7 @@ fn section(
         let r = row::task_row(
             t,
             &RowOpts {
+                compact: false,
                 now: o.now,
                 show_list,
                 completing: o.completing.contains(&t.href),
