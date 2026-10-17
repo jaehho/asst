@@ -4,20 +4,23 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use asst_core::api::ListView;
+use asst_core::api::{LinkView, ListView};
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk::{self, gdk};
 
-use crate::ui;
+use crate::model::{self, LinkEdit};
+use crate::{pickers, ui};
 
-/// New list (`list` is None) or edit one. `on_save` gets the name, the
-/// color and the icon (none: the plain ring).
+/// New list (`list` is None) or edit one. `link` is the list's GitHub tie
+/// now. `on_save` gets the name, the color, the icon (none: the plain ring)
+/// and what to do to the tie.
 pub fn list_dialog(
     parent: &impl IsA<gtk::Widget>,
     list: Option<&ListView>,
     icon: Option<&str>,
-    on_save: impl Fn(String, String, Option<String>) + 'static,
+    link: Option<&LinkView>,
+    on_save: impl Fn(String, String, Option<String>, LinkEdit) + 'static,
 ) {
     let editing = list.is_some();
     let dialog = adw::Dialog::builder()
@@ -42,6 +45,27 @@ pub fn list_dialog(
         .build();
     group.add(&name);
     page.add(&group);
+
+    // The repo whose issues this list keeps: its tie shown, and linked,
+    // moved or dropped by editing it (#17). Empty unlinks.
+    let github = adw::PreferencesGroup::builder().title("GitHub").build();
+    if let Some(l) = link {
+        github.set_description(Some(&model::link_state(l, pickers::now())));
+    }
+    let repo = adw::EntryRow::builder()
+        .title("Repository (owner/repo)")
+        .text(link.map_or("", |l| l.repo.as_str()))
+        .build();
+    {
+        let github = github.clone();
+        let shown = link.map(|l| model::link_state(l, pickers::now()));
+        repo.connect_changed(move |r| {
+            r.remove_css_class("error");
+            github.set_description(shown.as_deref());
+        });
+    }
+    github.add(&repo);
+    page.add(&github);
 
     let colors = adw::PreferencesGroup::builder().title("Color").build();
     let flow = gtk::FlowBox::builder()
@@ -158,16 +182,26 @@ pub fn list_dialog(
     view.set_content(Some(&page));
     dialog.set_child(Some(&view));
 
+    let current = link.map(|l| l.repo.clone());
     let submit = {
         let dialog = dialog.clone();
         let name = name.clone();
+        let repo = repo.clone();
         move || {
             let text = name.text().trim().to_string();
             if text.is_empty() {
                 name.add_css_class("error");
                 return;
             }
-            on_save(text, chosen.borrow().clone(), picked.borrow().clone());
+            let edit = match model::link_edit(current.as_deref(), &repo.text()) {
+                Ok(edit) => edit,
+                Err(message) => {
+                    repo.add_css_class("error");
+                    github.set_description(Some(&message));
+                    return;
+                }
+            };
+            on_save(text, chosen.borrow().clone(), picked.borrow().clone(), edit);
             dialog.close();
         }
     };
@@ -176,9 +210,9 @@ pub fn list_dialog(
         let submit = submit.clone();
         save.connect_clicked(move |_| submit());
     }
-    {
+    for entry in [&name, &repo] {
         let submit = submit.clone();
-        name.connect_entry_activated(move |_| submit());
+        entry.connect_entry_activated(move |_| submit());
     }
     {
         let dialog = dialog.clone();
