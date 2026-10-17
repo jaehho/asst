@@ -1,7 +1,13 @@
 //! Location alarms: asstd follows GeoClue and rings a reminder on arrival,
 //! the way the phone does for an iPhone-made one. Each alarm rings once per
 //! arrival: it re-arms when the position leaves its radius. GeoClue missing
-//! (or refusing us) is logged once and retried on the next wake.
+//! (or refusing us) is logged once and retried on the next wake. With no
+//! location alarm on any open task asstd does not talk to GeoClue at all,
+//! and a GeoClue that never reports a position is said so once (#12).
+//!
+//! # IP or timezone fallback: not done on purpose. An alarm's radius is
+//! about 100 m; an IP guess is off by kilometres, so it would ring at the
+//! wrong place or never, which is worse than staying quiet.
 //!
 //! # ponytail: the arrived-set is memory only, so a restart while inside a
 //! radius rings that reminder once more; move it into the `fired` table if
@@ -82,13 +88,18 @@ pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
     let inside: Inside = Arc::default();
     let mut warned = false;
     loop {
-        if let Err(e) = one_round(&daemon, &conn, &inside).await {
-            if !warned {
-                log::info!("location reminders wait for GeoClue: {e}");
-                warned = true;
+        // With no alarm to watch for, leave GeoClue alone: it would be
+        // started every round just to say nothing.
+        if has_alarms(&daemon) {
+            match one_round(&daemon, &conn, &inside).await {
+                Err(e) => {
+                    if !warned {
+                        log::info!("location reminders wait for GeoClue: {e}");
+                        warned = true;
+                    }
+                }
+                Ok(()) => warned = false,
             }
-        } else {
-            warned = false;
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(10 * 60)) => {}
@@ -96,6 +107,17 @@ pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
         }
     }
 }
+
+fn has_alarms(daemon: &Daemon) -> bool {
+    daemon
+        .store()
+        .with_location_alarms()
+        .map(|r| !r.is_empty())
+        .unwrap_or(false)
+}
+
+/// How long a started client may stay silent before we say so.
+const NO_FIX_AFTER: Duration = Duration::from_secs(120);
 
 /// Subscribe and follow the position until woken; an error means GeoClue is
 /// not there (or says no). Returns when the subscription ends.
@@ -133,9 +155,23 @@ async fn one_round(
         .await
         .map_err(|e| e.to_string())?;
     client.start().await.map_err(|e| e.to_string())?;
+    let mut fixed = false;
+    let silence = tokio::time::sleep(NO_FIX_AFTER);
+    tokio::pin!(silence);
     loop {
         let position;
         tokio::select! {
+            () = &mut silence, if !fixed => {
+                // Once per round; the sleep stays done, so the branch is off.
+                fixed = true;
+                log::warn!(
+                    "GeoClue has reported no position in {}s (no GPS, and no \
+                     working wifi/IP source?); location reminders cannot ring \
+                     until it has one",
+                    NO_FIX_AFTER.as_secs()
+                );
+                continue;
+            }
             signal = updates.next() => {
                 let Some(args) = signal else { return Err("geoclue went away".into()) };
                 let args = match args.args() {
@@ -152,16 +188,12 @@ async fn one_round(
                         continue;
                     }
                 };
+                fixed = true;
                 position = (lat, lon);
             }
             _ = daemon.wake_reminders.notified() => {
                 // Keep the subscription unless the last location alarm went.
-                if daemon
-                    .store()
-                    .with_location_alarms()
-                    .map(|r| r.is_empty())
-                    .unwrap_or(true)
-                {
+                if !has_alarms(daemon) {
                     return Ok(());
                 }
                 continue;
