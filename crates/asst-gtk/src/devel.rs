@@ -7,13 +7,17 @@
 //! - `drive(command)` does what a click or a key would (see `Window::drive`).
 //! - `dump(path)` writes the machine-readable state agents assert on
 //!   (see [`dump_json`]); empty path prints it on `window.log`.
+//! - `texts(path)` writes what the window, an open dialog and the open
+//!   popover show, widget by widget (see [`texts_json`]): labels, entries,
+//!   buttons, icons and tooltips. For checks on words, with no pixels.
 //!
 //! A popover in a window without keyboard focus closes as soon as it opens;
 //! `ASST_NO_AUTOHIDE=1` keeps them up for these checks. The quick-add popup
 //! takes no keyboard in development builds.
 
 use chrono::NaiveDate;
-use relm4::gtk::prelude::*;
+use relm4::adw;
+use relm4::adw::prelude::*;
 use relm4::gtk::{self, gio, glib, graphene};
 use serde::Serialize;
 
@@ -69,6 +73,98 @@ pub fn install(window: &impl IsA<gtk::Window>, tx: Tx) {
         ));
     });
     app.add_action(&dump);
+    let texts = gio::SimpleAction::new("texts", Some(glib::VariantTy::STRING));
+    {
+        let window = window.as_ref().clone();
+        texts.connect_activate(move |_, path| {
+            let Some(path) = path.and_then(|p| p.str()) else {
+                return;
+            };
+            let mut roots = vec![("window", window.clone().upcast::<gtk::Widget>())];
+            if let Some(dialog) = window.downcast_ref::<adw::ApplicationWindow>()
+                && let Some(d) = dialog.visible_dialog()
+            {
+                roots.push(("dialog", d.upcast()));
+            }
+            if let Some(p) = crate::ui::last_popover().filter(|p| p.is_visible()) {
+                roots.push(("popover", p.upcast()));
+            }
+            if let Err(e) = std::fs::write(path, texts_json(&roots)) {
+                eprintln!("texts {path}: {e}");
+            }
+        });
+    }
+    app.add_action(&texts);
+}
+
+/// One thing the window shows, for [`texts_json`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Shown {
+    /// `window`, `dialog` or `popover`: which root it was found under.
+    pub root: &'static str,
+    /// `label`, `entry`, `text`, `button` or `icon`.
+    pub kind: &'static str,
+    /// The words (a button's own label, an entry's text, a label's text).
+    pub text: String,
+    /// The icon's name, for `icon` and icon-only `button`s.
+    pub icon: Option<String>,
+    pub tooltip: Option<String>,
+    pub classes: Vec<String>,
+}
+
+/// Every mapped label, entry, text view, labelled or icon button and icon
+/// under `roots`, in tree order.
+pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
+    let mut out = Vec::new();
+    for (root, widget) in roots {
+        let mut stack = vec![widget.clone()];
+        while let Some(w) = stack.pop() {
+            if !w.is_mapped() {
+                continue;
+            }
+            let item = |kind, text: String, icon: Option<String>| Shown {
+                root,
+                kind,
+                text,
+                icon,
+                tooltip: w.tooltip_text().map(|t| t.to_string()),
+                classes: w.css_classes().iter().map(|c| c.to_string()).collect(),
+            };
+            if let Some(l) = w.downcast_ref::<gtk::Label>() {
+                out.push(item("label", l.text().to_string(), None));
+            } else if let Some(b) = w.downcast_ref::<gtk::Button>() {
+                let text = b.label().map(|t| t.to_string()).unwrap_or_default();
+                let icon = b.icon_name().map(|i| i.to_string());
+                if !text.is_empty() || icon.is_some() {
+                    out.push(item("button", text, icon));
+                }
+            } else if let Some(i) = w.downcast_ref::<gtk::Image>() {
+                out.push(item(
+                    "icon",
+                    String::new(),
+                    i.icon_name().map(|n| n.to_string()),
+                ));
+            } else if let Some(e) = w.downcast_ref::<gtk::Text>() {
+                out.push(item("entry", e.text().to_string(), None));
+            } else if let Some(t) = w.downcast_ref::<gtk::TextView>() {
+                let b = t.buffer();
+                let text = b.text(&b.start_iter(), &b.end_iter(), false);
+                out.push(item("text", text.to_string(), None));
+            }
+            // Last child first, so the stack pops them in tree order.
+            let mut child = w.last_child();
+            while let Some(c) = child {
+                child = c.prev_sibling();
+                stack.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// The JSON `texts` writes.
+pub fn texts_json(roots: &[(&'static str, gtk::Widget)]) -> String {
+    serde_json::to_string_pretty(&shown(roots)).unwrap_or_else(|_| "[]".into())
 }
 
 /// One visible row: what j/k walks. `kind` is the section it sits in

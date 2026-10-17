@@ -16,6 +16,8 @@
 #                                  surface, so not into an open popover (those don't take focus here)
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
+#   scripts/dev texts [FILE]       what the window, an open dialog and popover show, as JSON:
+#                                  labels, entries, buttons, icons, tooltips (default $DEV/texts.json)
 #   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
 #   scripts/dev reset              wipe this instance's state, then up and seed
 #   scripts/dev down [--all]       stop the window, the tray, asstd and the bus;
@@ -120,7 +122,7 @@ print(json.dumps(slots))
 # Files older harness versions left in the instance dir. The live set is
 # the bus file, the logs and session.conf, plus config/ state/ data/ notes/.
 clear_stale() {
-  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|up\.lock|config|state|data|notes)$'
+  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|config|state|data|notes)$'
   local f base
   for f in "$DEV"/* "$DEV"/.*; do
     [ -e "$f" ] || continue
@@ -306,6 +308,15 @@ CONF
     # The action only queues the write on the GTK loop.
     for _ in $(seq 40); do [ -f "$out" ] && break; sleep 0.05; done
     [ -f "$out" ] || { echo "dump did not write $out; see $DEV/window.log" >&2; exit 1; }
+    [ -n "${2:-}" ] || cat "$out"
+    ;;
+  texts)
+    on_bus
+    out="$(realpath -m "${2:-$DEV/texts.json}")"
+    rm -f "$out"
+    action texts "$out"
+    for _ in $(seq 40); do [ -f "$out" ] && break; sleep 0.05; done
+    [ -f "$out" ] || { echo "texts did not write $out; see $DEV/window.log" >&2; exit 1; }
     [ -n "${2:-}" ] || cat "$out"
     ;;
   seed)
