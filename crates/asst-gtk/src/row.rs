@@ -183,7 +183,12 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
             "mail" => "From mail-digest",
             _ => "Another CalDAV client",
         };
-        let o = gtk::Label::builder().label(&t.origin).build();
+        // A paired issue's number rides on the same line (#18).
+        let label = match &t.issue {
+            Some(issue) => format!("{} #{}", t.origin, issue.number),
+            None => t.origin.clone(),
+        };
+        let o = gtk::Label::builder().label(&label).build();
         o.add_css_class("caption");
         o.add_css_class("dim-label");
         o.set_tooltip_text(Some(tip));
