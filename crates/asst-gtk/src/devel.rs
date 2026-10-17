@@ -110,6 +110,9 @@ pub struct Shown {
     pub icon: Option<String>,
     pub tooltip: Option<String>,
     pub classes: Vec<String>,
+    /// `[x, y, width, height]` in pixels, relative to the root it was found
+    /// under.
+    pub bounds: Option<[f32; 4]>,
 }
 
 /// Every mapped label, entry, text view, labelled or icon button and icon
@@ -129,6 +132,9 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
                 icon,
                 tooltip: w.tooltip_text().map(|t| t.to_string()),
                 classes: w.css_classes().iter().map(|c| c.to_string()).collect(),
+                bounds: w
+                    .compute_bounds(widget)
+                    .map(|b| [b.x(), b.y(), b.width(), b.height()]),
             };
             if let Some(l) = w.downcast_ref::<gtk::Label>() {
                 out.push(item("label", l.text().to_string(), None));

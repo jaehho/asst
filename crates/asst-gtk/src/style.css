@@ -596,6 +596,11 @@ textview.editor-notes {
   text-decoration: line-through;
 }
 
+/* The paired issue's number, level with the title's first line. */
+.editor-issue {
+  margin: 8px 2px 0 6px;
+}
+
 .editor-collapse {
   min-width: 28px;
   min-height: 28px;
