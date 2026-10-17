@@ -1069,6 +1069,71 @@ pub fn prune_slots(slots: &mut Vec<PlanSlot>, live: &HashSet<&str>) -> bool {
     slots.len() != before
 }
 
+/// Where carrying a day's unfinished blocks forward takes them: the next
+/// day, but never a day that is already over.
+pub fn carry_target(viewed: NaiveDate, today: NaiveDate) -> NaiveDate {
+    viewed.succ_opt().unwrap_or(viewed).max(today)
+}
+
+/// What a carry did, so that it can be taken back.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Carried {
+    pub from: Option<NaiveDate>,
+    pub to: Option<NaiveDate>,
+    /// The slots as they were on `from`.
+    pub moved: Vec<PlanSlot>,
+    /// Tasks that had nothing on `to` before, and so have a slot there now.
+    pub created: Vec<String>,
+}
+
+/// Move the slots on `from` whose tasks are `open` onto `to`, at the same
+/// time of day. A task already planned on `to` keeps that slot and just
+/// leaves `from`. Slots of tasks that are not open stay as they are (the
+/// day view does not show them, and pruning is not this).
+pub fn carry_forward(
+    slots: &mut Vec<PlanSlot>,
+    open: &HashSet<&str>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Carried {
+    let mut out = Carried::default();
+    if from == to {
+        return out;
+    }
+    let moving: Vec<PlanSlot> = slots
+        .iter()
+        .filter(|s| s.date == from && open.contains(s.uid.as_str()))
+        .cloned()
+        .collect();
+    for s in &moving {
+        if !slots.iter().any(|o| o.uid == s.uid && o.date == to) {
+            place(slots, &s.uid, to, s.start, s.duration);
+            out.created.push(s.uid.clone());
+        }
+        unplace(slots, &s.uid, from);
+    }
+    if !moving.is_empty() {
+        out.from = Some(from);
+        out.to = Some(to);
+    }
+    out.moved = moving;
+    out
+}
+
+/// Put a carry back: the slots return to their day, and the ones it made
+/// on the target day go.
+pub fn uncarry(slots: &mut Vec<PlanSlot>, carried: &Carried) {
+    let (Some(from), Some(to)) = (carried.from, carried.to) else {
+        return;
+    };
+    for uid in &carried.created {
+        unplace(slots, uid, to);
+    }
+    for s in &carried.moved {
+        place(slots, &s.uid, from, s.start, s.duration);
+    }
+}
+
 /// The day plan for `viewed`. Blocks are the open tasks with a slot on that
 /// day; the tray is the open/overdue backlog (due on or before the
 /// wall-clock today) minus the tasks placed on `viewed`. The same task may
@@ -2425,6 +2490,69 @@ mod tests {
         let mut floor = Vec::new();
         place(&mut floor, "a", today, 9 * 60, 5);
         assert_eq!(floor[0].duration, PLAN_MIN_DURATION);
+    }
+
+    #[test]
+    fn carrying_a_day_forward_moves_only_its_open_slots() {
+        let (mon, tue, wed) = (date(9, 14), date(9, 15), date(9, 16));
+        // Never into a day that is over
+        assert_eq!(carry_target(mon, mon), tue);
+        assert_eq!(carry_target(tue, mon), wed);
+        assert_eq!(carry_target(date(9, 10), mon), mon);
+        assert_eq!(carry_target(date(9, 13), mon), mon);
+
+        let mut slots = Vec::new();
+        place(&mut slots, "a", mon, 9 * 60, 30);
+        place(&mut slots, "b", mon, 10 * 60, 60);
+        place(&mut slots, "done", mon, 11 * 60, 30);
+        place(&mut slots, "c", tue, 8 * 60, 30);
+        // b is on tomorrow already, at its own time
+        place(&mut slots, "b", tue, 15 * 60, 45);
+        let original = slots.clone();
+        let open: HashSet<&str> = ["a", "b", "c"].into_iter().collect();
+
+        let carried = carry_forward(&mut slots, &open, mon, tue);
+        assert_eq!(carried.moved.len(), 2);
+        assert_eq!(carried.created, ["a"]);
+        let on = |d: NaiveDate| {
+            let mut v: Vec<(String, u32, u32)> = slots
+                .iter()
+                .filter(|s| s.date == d)
+                .map(|s| (s.uid.clone(), s.start, s.duration))
+                .collect();
+            v.sort();
+            v
+        };
+        // a keeps its time of day; b keeps the slot it had; the finished
+        // task's slot is left where it was
+        assert_eq!(on(mon), [("done".to_string(), 11 * 60, 30)]);
+        assert_eq!(
+            on(tue),
+            [
+                ("a".to_string(), 9 * 60, 30),
+                ("b".to_string(), 15 * 60, 45),
+                ("c".to_string(), 8 * 60, 30),
+            ]
+        );
+        // Nothing left to carry, nothing happens
+        let again = carry_forward(&mut slots, &open, mon, tue);
+        assert_eq!(again, Carried::default());
+        assert_eq!(
+            carry_forward(&mut slots, &open, tue, tue),
+            Carried::default()
+        );
+
+        // Taking it back restores every slot, as it was
+        uncarry(&mut slots, &carried);
+        let key = |v: &mut Vec<PlanSlot>| v.sort_by_key(|s| (s.date, s.uid.clone()));
+        let mut restored = slots.clone();
+        let mut expected = original;
+        key(&mut restored);
+        key(&mut expected);
+        assert_eq!(restored, expected);
+        // An empty carry takes nothing back
+        uncarry(&mut slots, &Carried::default());
+        assert_eq!(slots.len(), 5);
     }
 
     #[test]

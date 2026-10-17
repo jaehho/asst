@@ -170,6 +170,10 @@ pub enum Msg {
     /// Undo a plan change: restore this slot on `date`, or take the task
     /// off when there was none. Carries what the toast is holding.
     PlanUndo(String, chrono::NaiveDate, Option<(u32, u32)>),
+    /// The Day view's button: this day's unfinished blocks to the next day.
+    PlanCarry,
+    /// Take a carry back.
+    PlanUncarry(model::Carried),
     /// A new task, and whether the add card was left with it typed.
     Add(Box<AddSpec>, bool),
     ShowAdd(Option<Target>),
@@ -522,8 +526,9 @@ fn button_words(b: &gtk::Button) -> String {
     words
 }
 
-/// The first widget under the open dialog, or a window of its own like the
-/// snooze chooser (breadth first), that `want` likes, for scripted checks.
+/// The first widget under the open dialog, a window of its own like the
+/// snooze chooser, or else the window (breadth first), that `want` likes,
+/// for scripted checks.
 fn dialog_widget(w: &Widgets, want: impl Fn(&gtk::Widget) -> bool) -> Option<gtk::Widget> {
     let main: gtk::Widget = w.window.clone().upcast();
     let mut queue: std::collections::VecDeque<gtk::Widget> = w
@@ -536,6 +541,8 @@ fn dialog_widget(w: &Widgets, want: impl Fn(&gtk::Widget) -> bool) -> Option<gtk
                 .into_iter()
                 .filter(|t| *t != main && t.is_visible()),
         )
+        // The window itself, last: its own buttons (Carry, …).
+        .chain(Some(main.clone()))
         .collect();
     while let Some(widget) = queue.pop_front() {
         if want(&widget) {
@@ -1400,6 +1407,39 @@ impl Component for Window {
                     }
                     w.toasts.add_toast(toast);
                 }
+            }
+            Msg::PlanCarry => {
+                let from = self.day_day;
+                let to = model::carry_target(from, self.now().date_naive());
+                let live: HashSet<&str> = self.open.iter().map(|t| t.task.uid.as_str()).collect();
+                let carried = model::carry_forward(&mut self.prefs.plan, &live, from, to);
+                let n = carried.moved.len();
+                if n == 0 {
+                    return;
+                }
+                self.prefs.save();
+                self.shown = 0;
+                let said = format!(
+                    "Carried {n} to {}",
+                    fmt::day_label(to, self.now().date_naive())
+                );
+                let toast = adw::Toast::builder()
+                    .title(glib::markup_escape_text(&said))
+                    .button_label("Undo")
+                    .timeout(4)
+                    .build();
+                {
+                    let tx = tx.clone();
+                    toast.connect_button_clicked(move |_| {
+                        tx.emit(Msg::PlanUncarry(carried.clone()));
+                    });
+                }
+                w.toasts.add_toast(toast);
+            }
+            Msg::PlanUncarry(carried) => {
+                model::uncarry(&mut self.prefs.plan, &carried);
+                self.prefs.save();
+                self.shown = 0;
             }
             Msg::PlanUndo(href, day, prior) => {
                 let ok = match prior {
@@ -3416,6 +3456,8 @@ impl Window {
                     .unwrap_or(model::PLAN_DEFAULT_DURATION);
                 sender.input(Msg::PlanSet(h, start, duration));
             }
+            // The Day view's Carry button.
+            "carry" => sender.input(Msg::PlanCarry),
             "planoff" => {
                 if let Some(h) = task(arg) {
                     sender.input(Msg::PlanUnplace(h));

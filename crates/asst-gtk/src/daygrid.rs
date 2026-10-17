@@ -304,14 +304,15 @@ fn step_button(icon: &str, tip: &str, delta: i32, step: DayStep, tx: &Tx) -> gtk
     b
 }
 
-/// The day header both views wear: title and date on the left, prev/next
-/// and Today on the right, and the view's note line under them.
+/// The day header both views wear: title and date on the left, an optional
+/// action of the view's, prev/next and Today on the right, and the view's note line under them.
 pub fn day_header(
     title: &str,
     day: NaiveDate,
     note: &str,
     today: NaiveDate,
     step: DayStep,
+    action: Option<gtk::Button>,
     tx: &Tx,
 ) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -330,6 +331,11 @@ pub fn day_header(
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     controls.add_css_class("time-controls");
+    // The view's own action, ahead of the stepping buttons.
+    if let Some(action) = action {
+        action.add_css_class("time-action");
+        controls.append(&action);
+    }
     let today_btn = gtk::Button::with_label("Today");
     today_btn.add_css_class("pill");
     {

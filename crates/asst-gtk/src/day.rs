@@ -33,12 +33,30 @@ pub fn build_column(
         p.tray.len(),
         time::day_note(o.blocks)
     );
+    // Unfinished work on this day can be carried to the next: one button,
+    // there only while there is something to carry.
+    let carry = (!p.blocks.is_empty()).then(|| {
+        let to = crate::model::carry_target(day, today);
+        let button = gtk::Button::with_label(&format!(
+            "Carry {} to {}",
+            p.blocks.len(),
+            asst_core::fmt::day_label(to, today)
+        ));
+        button.add_css_class("pill");
+        button.set_tooltip_text(Some(
+            "Move this day's unfinished blocks to the next day, at the same times",
+        ));
+        let tx = tx.clone();
+        button.connect_clicked(move |_| tx.emit(crate::window::Msg::PlanCarry));
+        button
+    });
     root.append(&daygrid::day_header(
         "Day",
         day,
         &note,
         today,
         DayStep::Day,
+        carry,
         tx,
     ));
 
