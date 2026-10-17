@@ -1,4 +1,5 @@
-//! Alarms become desktop notifications with Complete and Snooze buttons; a
+//! Alarms become desktop notifications with Complete and Snooze buttons,
+//! and a Snooze… that opens the window's chooser for any other time; a
 //! click on one opens its task in the window.
 //!
 //! Timers sleep at most a minute and re-read the wall clock, so an alarm
@@ -52,6 +53,9 @@ trait Notifications {
     #[zbus(signal)]
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
+
+/// The action that opens the window's snooze chooser.
+const SNOOZE_MORE: &str = "snooze-more";
 
 type Shown = Arc<Mutex<HashMap<u32, String>>>;
 
@@ -187,6 +191,8 @@ async fn show(
     for (key, label) in &snoozes {
         actions.extend([key.as_str(), label.as_str()]);
     }
+    // Any other time: the window's chooser (#20).
+    actions.extend([SNOOZE_MORE, "Snooze…"]);
     proxy
         .notify(
             "asst",
@@ -229,6 +235,13 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
                         let conn = proxy.inner().connection();
                         if let Err(e) = asst_core::api::open_in_window(conn, &href, token).await {
                             log::info!("opening a task from its notification: {e}");
+                        }
+                        Ok(())
+                    }
+                    SNOOZE_MORE => {
+                        let conn = proxy.inner().connection();
+                        if let Err(e) = asst_core::api::snooze_in_window(conn, &href, token).await {
+                            log::info!("opening the snooze chooser from a notification: {e}");
                         }
                         Ok(())
                     }

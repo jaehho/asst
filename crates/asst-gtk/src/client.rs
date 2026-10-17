@@ -140,6 +140,15 @@ pub async fn reopen(id: &str) -> Result<TaskView> {
     json(proxy().await?.reopen(id).await)
 }
 
+/// Ring the task's reminder again at `at`.
+pub async fn snooze(id: &str, at: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    proxy()
+        .await?
+        .snooze(id, &at.to_rfc3339())
+        .await
+        .map_err(|e| describe(&e))
+}
+
 pub async fn delete(id: &str) -> Result<()> {
     proxy().await?.delete(id).await.map_err(|e| describe(&e))
 }

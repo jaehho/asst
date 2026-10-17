@@ -216,6 +216,9 @@ pub enum Msg {
     /// Show the window at a task: the `open-task` action, as a reminder's
     /// notification sends it.
     OpenTask(String),
+    /// The chooser for when to ring a task's reminder again: the
+    /// `snooze-task` action, from a notification's Snooze….
+    SnoozePrompt(String),
     /// Light or dark changed.
     ThemeChanged,
     QuickFind,
@@ -332,6 +335,8 @@ pub enum Cmd {
     Added(bool, client::Result<Added>),
     Opened(client::Result<TaskView>),
     /// The icon a list just made is to have, and the list.
+    /// A task the snooze chooser is for, as the daemon has it.
+    SnoozeAsk(String, client::Result<TaskView>),
     /// The new list's icon, the list, and what became of its GitHub tie
     /// (a sentence to toast, or why not).
     ListSaved(
@@ -485,14 +490,52 @@ fn on_background(target: &gtk::Widget) -> bool {
     .any(|t| target.ancestor(t).is_some())
 }
 
-/// The first widget under the open dialog (breadth first) that `want`
-/// likes, for scripted checks.
+/// An entry row (by its title) or an entry (by its placeholder) whose
+/// words contain `title`, lowercase.
+fn entry_titled(x: &gtk::Widget, title: &str) -> bool {
+    x.downcast_ref::<adw::EntryRow>()
+        .is_some_and(|r| r.title().to_lowercase().contains(title))
+        || x.downcast_ref::<gtk::Entry>().is_some_and(|e| {
+            e.placeholder_text()
+                .is_some_and(|p| p.to_lowercase().contains(title))
+        })
+}
+
+/// A button's words, lowercase: its label, or the labels inside it.
+fn button_words(b: &gtk::Button) -> String {
+    if let Some(l) = b.label() {
+        return l.to_lowercase();
+    }
+    let mut words = String::new();
+    let mut stack: Vec<gtk::Widget> = b.child().into_iter().collect();
+    while let Some(w) = stack.pop() {
+        if let Some(l) = w.downcast_ref::<gtk::Label>() {
+            words.push_str(&l.text().to_lowercase());
+            words.push(' ');
+        }
+        let mut child = w.last_child();
+        while let Some(c) = child {
+            child = c.prev_sibling();
+            stack.push(c);
+        }
+    }
+    words
+}
+
+/// The first widget under the open dialog, or a window of its own like the
+/// snooze chooser (breadth first), that `want` likes, for scripted checks.
 fn dialog_widget(w: &Widgets, want: impl Fn(&gtk::Widget) -> bool) -> Option<gtk::Widget> {
+    let main: gtk::Widget = w.window.clone().upcast();
     let mut queue: std::collections::VecDeque<gtk::Widget> = w
         .window
         .visible_dialog()
         .map(|d| d.upcast())
         .into_iter()
+        .chain(
+            gtk::Window::list_toplevels()
+                .into_iter()
+                .filter(|t| *t != main && t.is_visible()),
+        )
         .collect();
     while let Some(widget) = queue.pop_front() {
         if want(&widget) {
@@ -834,13 +877,21 @@ impl Component for Window {
             // On the bus, for a reminder's notification (and anything else)
             // to show a task.
             let open = gio::SimpleAction::new("open-task", Some(glib::VariantTy::STRING));
-            let tx = tx.clone();
+            let open_tx = tx.clone();
             open.connect_activate(move |_, id| {
                 if let Some(id) = id.and_then(|v| v.str()) {
-                    tx.emit(Msg::OpenTask(id.to_string()));
+                    open_tx.emit(Msg::OpenTask(id.to_string()));
                 }
             });
             relm4::main_application().add_action(&open);
+            let snooze = gio::SimpleAction::new("snooze-task", Some(glib::VariantTy::STRING));
+            let tx = tx.clone();
+            snooze.connect_activate(move |_, id| {
+                if let Some(id) = id.and_then(|v| v.str()) {
+                    tx.emit(Msg::SnoozePrompt(id.to_string()));
+                }
+            });
+            relm4::main_application().add_action(&snooze);
         }
         let quitting = Rc::new(Cell::new(false));
         {
@@ -1702,6 +1753,14 @@ impl Component for Window {
                 w.window.present();
                 sender.input(Msg::Reveal(id));
             }
+            // Ask the daemon, not the window's copy: a window the bus just
+            // started has not loaded yet.
+            Msg::SnoozePrompt(href) => {
+                sender.oneshot_command(async move {
+                    let task = client::get(&href).await;
+                    Cmd::SnoozeAsk(href, task)
+                });
+            }
             Msg::ThemeChanged => {
                 // GTK draws a text view shown for the first time after a
                 // switch between light and dark in the old text color, as
@@ -2088,6 +2147,20 @@ impl Component for Window {
                     Err(e) => toast(w, &e),
                 }
             }
+            Cmd::SnoozeAsk(href, result) => match result {
+                Ok(t) if t.task.is_open() => {
+                    crate::snooze::present(
+                        &t.task.summary,
+                        Box::new(move |at, done| {
+                            let href = href.clone();
+                            client::call(async move { client::snooze(&href, at).await }, done);
+                        }),
+                    );
+                }
+                // Done in the meantime: nothing left to ring.
+                Ok(_) => {}
+                Err(e) => toast(w, &e),
+            },
             Cmd::ListMade(result, then) => match result {
                 Ok(l) => {
                     if !self.lists.iter().any(|x| x.href == l.href) {
@@ -3684,6 +3757,12 @@ impl Window {
             "shortcuts" => sender.input(Msg::Shortcuts),
             "about" => sender.input(Msg::About),
             "newlist" => sender.input(Msg::NewList),
+            // The snooze chooser, as a notification's Snooze… asks for it.
+            "snooze" => {
+                if let Some(h) = task(arg) {
+                    sender.input(Msg::SnoozePrompt(h));
+                }
+            }
             "editlist" => {
                 if let Some(h) = list(arg) {
                     sender.input(Msg::EditList(h));
@@ -3697,14 +3776,14 @@ impl Window {
                     return;
                 };
                 let title = title.trim().to_lowercase();
-                match dialog_widget(w, |x| {
-                    x.downcast_ref::<adw::EntryRow>()
-                        .is_some_and(|r| r.title().to_lowercase().contains(&title))
-                }) {
-                    Some(r) => r
-                        .downcast_ref::<adw::EntryRow>()
-                        .expect("an entry row")
-                        .set_text(text),
+                match dialog_widget(w, |x| entry_titled(x, &title)) {
+                    Some(x) => {
+                        if let Some(r) = x.downcast_ref::<adw::EntryRow>() {
+                            r.set_text(text);
+                        } else if let Some(e) = x.downcast_ref::<gtk::Entry>() {
+                            e.set_text(text);
+                        }
+                    }
                     None => eprintln!("drive: no entry {title:?} in the dialog"),
                 }
             }
@@ -3712,10 +3791,8 @@ impl Window {
                 let want = arg.trim().to_lowercase();
                 let found = dialog_widget(w, |x| {
                     x.downcast_ref::<gtk::Button>()
-                        .and_then(|b| b.label())
-                        .is_some_and(|l| l.to_lowercase() == want)
-                        || x.downcast_ref::<adw::EntryRow>()
-                            .is_some_and(|r| r.title().to_lowercase().contains(&want))
+                        .is_some_and(|b| button_words(b).contains(&want))
+                        || entry_titled(x, &want)
                 });
                 match found {
                     Some(x) => {
@@ -3723,6 +3800,8 @@ impl Window {
                             b.emit_clicked();
                         } else if let Some(r) = x.downcast_ref::<adw::EntryRow>() {
                             r.emit_by_name::<()>("entry-activated", &[]);
+                        } else if let Some(e) = x.downcast_ref::<gtk::Entry>() {
+                            e.emit_activate();
                         }
                     }
                     None => eprintln!("drive: nothing in the dialog says {want:?}"),

@@ -89,6 +89,12 @@ pub fn install(window: &impl IsA<gtk::Window>, tx: Tx) {
             if let Some(p) = crate::ui::last_popover().filter(|p| p.is_visible()) {
                 roots.push(("popover", p.upcast()));
             }
+            // Windows of their own, like the snooze chooser.
+            for other in gtk::Window::list_toplevels() {
+                if other != window.clone().upcast::<gtk::Widget>() && other.is_visible() {
+                    roots.push(("toplevel", other));
+                }
+            }
             if let Err(e) = std::fs::write(path, texts_json(&roots)) {
                 eprintln!("texts {path}: {e}");
             }
@@ -100,7 +106,8 @@ pub fn install(window: &impl IsA<gtk::Window>, tx: Tx) {
 /// One thing the window shows, for [`texts_json`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Shown {
-    /// `window`, `dialog` or `popover`: which root it was found under.
+    /// `window`, `dialog`, `popover` or `toplevel` (a window of its own):
+    /// which root it was found under.
     pub root: &'static str,
     /// `label`, `entry`, `text`, `button` or `icon`.
     pub kind: &'static str,

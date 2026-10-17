@@ -21,6 +21,7 @@ mod quick_add;
 mod row;
 mod settings;
 mod sidebar;
+mod snooze;
 mod time;
 mod tray;
 mod ui;

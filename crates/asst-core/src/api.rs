@@ -40,6 +40,9 @@ pub trait Asst {
     /// id → `TaskView` (a repeating task comes back open, moved on)
     fn complete(&self, id: &str) -> zbus::Result<String>;
     fn reopen(&self, id: &str) -> zbus::Result<String>;
+    /// id, an RFC 3339 instant: the task's reminder rings again then. In
+    /// the future, within a year, and the task open.
+    fn snooze(&self, id: &str, until: &str) -> zbus::Result<()>;
     fn delete(&self, id: &str) -> zbus::Result<()>;
     /// id → the iCalendar object as asst would send it
     fn ics(&self, id: &str) -> zbus::Result<String>;
@@ -404,6 +407,25 @@ pub async fn open_in_window(
     href: &str,
     token: Option<String>,
 ) -> zbus::Result<()> {
+    activate_in_window(conn, "open-task", href, token).await
+}
+
+/// The window's chooser for when to ring a task's reminder again
+/// (`snooze-task`), started the same way.
+pub async fn snooze_in_window(
+    conn: &zbus::Connection,
+    href: &str,
+    token: Option<String>,
+) -> zbus::Result<()> {
+    activate_in_window(conn, "snooze-task", href, token).await
+}
+
+async fn activate_in_window(
+    conn: &zbus::Connection,
+    action: &str,
+    href: &str,
+    token: Option<String>,
+) -> zbus::Result<()> {
     use zbus::zvariant::Value;
     let app = crate::config::gui_app_id();
     let path = format!("/{}", app.replace('.', "/"));
@@ -416,7 +438,7 @@ pub async fn open_in_window(
         path.as_str(),
         Some("org.freedesktop.Application"),
         "ActivateAction",
-        &("open-task", vec![Value::from(href)], platform),
+        &(action, vec![Value::from(href)], platform),
     )
     .await
     .map(|_| ())
