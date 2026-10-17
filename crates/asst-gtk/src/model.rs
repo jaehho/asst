@@ -1362,6 +1362,61 @@ pub fn work_command(template: &str, dir: &str, repo: &str, number: u32, url: &st
         .replace("{url}", &quote(url))
 }
 
+/// What saving a list's dialog does to its GitHub tie, from the repo
+/// typed there (#17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkEdit {
+    /// The field was left as it was.
+    Keep,
+    Link(String),
+    Unlink(String),
+    /// A list holds one repo, so the old tie goes before the new one.
+    Move {
+        from: String,
+        to: String,
+    },
+}
+
+/// `owner/repo` from what was typed or pasted: the name itself, or the
+/// repo's page, clone URL or ssh address. None when it is none of those.
+pub fn repo_from_text(text: &str) -> Option<String> {
+    let t = text.trim().trim_end_matches('/');
+    let t = [
+        "https://github.com/",
+        "http://github.com/",
+        "github.com/",
+        "git@github.com:",
+    ]
+    .iter()
+    .find_map(|p| t.strip_prefix(p))
+    .unwrap_or(t);
+    let t = t.strip_suffix(".git").unwrap_or(t);
+    // A page inside the repo (…/issues/3) is still that repo.
+    let mut parts = t.split('/');
+    let repo = format!("{}/{}", parts.next()?, parts.next()?);
+    let rest_ok = text.trim().contains("github.com") || parts.next().is_none();
+    (rest_ok && asst_core::github::valid_repo(&repo)).then_some(repo)
+}
+
+/// The change from `current` (the list's tie now) to what the dialog's
+/// field says. An empty field unlinks; anything else must name a repo.
+pub fn link_edit(current: Option<&str>, typed: &str) -> Result<LinkEdit, String> {
+    if typed.trim().is_empty() {
+        return Ok(current.map_or(LinkEdit::Keep, |c| LinkEdit::Unlink(c.to_string())));
+    }
+    let Some(wanted) = repo_from_text(typed) else {
+        return Err(format!("“{}” is not owner/repo", typed.trim()));
+    };
+    Ok(match current {
+        Some(c) if c.eq_ignore_ascii_case(&wanted) => LinkEdit::Keep,
+        Some(c) => LinkEdit::Move {
+            from: c.to_string(),
+            to: wanted,
+        },
+        None => LinkEdit::Link(wanted),
+    })
+}
+
 /// A list's GitHub link, as its sidebar mark's tooltip says it.
 pub fn link_state(l: &LinkView, now: DateTime<Tz>) -> String {
     match (&l.error, l.synced) {
@@ -1983,6 +2038,60 @@ mod tests {
                 "https://github.com/jaehho/asst/issues/12"
             ),
             "kitty --directory '/home/jaeho/my projects/it'\\''s' gh-co 12"
+        );
+    }
+
+    #[test]
+    fn a_lists_repo_field_links_moves_or_unlinks() {
+        for typed in [
+            "jaehho/asst",
+            "  jaehho/asst  ",
+            "https://github.com/jaehho/asst",
+            "https://github.com/jaehho/asst/",
+            "https://github.com/jaehho/asst.git",
+            "git@github.com:jaehho/asst.git",
+            "github.com/jaehho/asst/issues/12",
+        ] {
+            assert_eq!(
+                repo_from_text(typed).as_deref(),
+                Some("jaehho/asst"),
+                "{typed}"
+            );
+        }
+        for typed in [
+            "asst",
+            "jaehho/",
+            "/asst",
+            "a/b/c",
+            "has space/x",
+            "https://example.com/a/b",
+        ] {
+            assert_eq!(repo_from_text(typed), None, "{typed}");
+        }
+        assert_eq!(link_edit(None, ""), Ok(LinkEdit::Keep));
+        assert_eq!(link_edit(None, " \n"), Ok(LinkEdit::Keep));
+        assert_eq!(
+            link_edit(None, "jaehho/asst"),
+            Ok(LinkEdit::Link("jaehho/asst".into()))
+        );
+        assert_eq!(
+            link_edit(Some("jaehho/asst"), ""),
+            Ok(LinkEdit::Unlink("jaehho/asst".into()))
+        );
+        assert_eq!(
+            link_edit(Some("jaehho/asst"), "Jaehho/Asst"),
+            Ok(LinkEdit::Keep)
+        );
+        assert_eq!(
+            link_edit(Some("jaehho/asst"), "https://github.com/jaehho/dash"),
+            Ok(LinkEdit::Move {
+                from: "jaehho/asst".into(),
+                to: "jaehho/dash".into()
+            })
+        );
+        assert_eq!(
+            link_edit(None, "dash"),
+            Err("“dash” is not owner/repo".into())
         );
     }
 

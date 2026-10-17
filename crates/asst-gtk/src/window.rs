@@ -25,7 +25,7 @@ use relm4::{Component, ComponentParts, ComponentSender, RelmApp, adw};
 use crate::addcard::{AddCard, Target};
 use crate::content::{self, Opts};
 use crate::editor::Editor;
-use crate::model::{self, Counts, Data, Nav, Quadrant, Sort, ViewOpts};
+use crate::model::{self, Counts, Data, LinkEdit, Nav, Quadrant, Sort, ViewOpts};
 use crate::motion;
 use crate::pickers::{self, DateOpts};
 use crate::prefs::Prefs;
@@ -191,8 +191,9 @@ pub enum Msg {
     /// to do with it once it exists.
     MakeList(String, Then),
     EditList(String),
-    /// href (none for a new list), name, color, icon
-    SaveList(Option<String>, String, String, Option<String>),
+    /// href (none for a new list), name, color, icon, and the change to its
+    /// GitHub tie
+    SaveList(Option<String>, String, String, Option<String>, LinkEdit),
     AskDeleteList(String),
     DeleteList(String),
     /// A list's completed tasks, or every list's: ask first.
@@ -331,7 +332,13 @@ pub enum Cmd {
     Added(bool, client::Result<Added>),
     Opened(client::Result<TaskView>),
     /// The icon a list just made is to have, and the list.
-    ListSaved(Option<String>, client::Result<ListView>),
+    /// The new list's icon, the list, and what became of its GitHub tie
+    /// (a sentence to toast, or why not).
+    ListSaved(
+        Option<String>,
+        client::Result<ListView>,
+        client::Result<String>,
+    ),
     ListMade(client::Result<ListView>, Then),
     /// A task's iCalendar object, to save.
     Ics(String, client::Result<String>),
@@ -476,6 +483,28 @@ fn on_background(target: &gtk::Widget) -> bool {
     ]
     .into_iter()
     .any(|t| target.ancestor(t).is_some())
+}
+
+/// The first widget under the open dialog (breadth first) that `want`
+/// likes, for scripted checks.
+fn dialog_widget(w: &Widgets, want: impl Fn(&gtk::Widget) -> bool) -> Option<gtk::Widget> {
+    let mut queue: std::collections::VecDeque<gtk::Widget> = w
+        .window
+        .visible_dialog()
+        .map(|d| d.upcast())
+        .into_iter()
+        .collect();
+    while let Some(widget) = queue.pop_front() {
+        if want(&widget) {
+            return Some(widget);
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            queue.push_back(c);
+        }
+    }
+    None
 }
 
 fn toast(w: &Widgets, text: &str) {
@@ -1408,9 +1437,15 @@ impl Component for Window {
             }
             Msg::NewList => {
                 let tx = tx.clone();
-                dialogs::list_dialog(&w.window, None, None, move |name, color, icon| {
-                    tx.emit(Msg::SaveList(None, name, color, icon))
-                });
+                dialogs::list_dialog(
+                    &w.window,
+                    None,
+                    None,
+                    None,
+                    move |name, color, icon, link| {
+                        tx.emit(Msg::SaveList(None, name, color, icon, link))
+                    },
+                );
             }
             Msg::Unadd(href) => {
                 self.hidden.insert(href.clone());
@@ -1487,45 +1522,51 @@ impl Component for Window {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
                     let tx = tx.clone();
                     let icon = self.prefs.list_icons.get(&href).cloned();
+                    let link = self.links.iter().find(|k| k.list == href);
                     dialogs::list_dialog(
                         &w.window,
                         Some(l),
                         icon.as_deref(),
-                        move |name, color, icon| {
-                            tx.emit(Msg::SaveList(Some(href.clone()), name, color, icon))
+                        link,
+                        move |name, color, icon, link| {
+                            tx.emit(Msg::SaveList(Some(href.clone()), name, color, icon, link))
                         },
                     );
                 }
             }
-            Msg::SaveList(href, name, color, icon) => {
+            Msg::SaveList(href, name, color, icon, link) => {
                 if let Some(h) = &href {
                     self.set_list_icon(h, icon.as_deref());
                 }
                 // A new list has no href until the server has made it.
                 let new_icon = if href.is_none() { icon } else { None };
                 sender.oneshot_command(async move {
-                    Cmd::ListSaved(
-                        new_icon,
-                        match href {
-                            None => {
-                                client::create_list(&ListSpec {
-                                    name,
+                    let saved = match href {
+                        None => {
+                            client::create_list(&ListSpec {
+                                name,
+                                color: Some(color),
+                            })
+                            .await
+                        }
+                        Some(h) => {
+                            client::update_list(
+                                &h,
+                                &ListChange {
+                                    name: Some(name),
                                     color: Some(color),
-                                })
-                                .await
-                            }
-                            Some(h) => {
-                                client::update_list(
-                                    &h,
-                                    &ListChange {
-                                        name: Some(name),
-                                        color: Some(color),
-                                    },
-                                )
-                                .await
-                            }
-                        },
-                    )
+                                },
+                            )
+                            .await
+                        }
+                    };
+                    // The list is saved either way; the tie has its own
+                    // answer.
+                    let tied = match &saved {
+                        Ok(l) => client::link_edit(&l.href, &link).await,
+                        Err(_) => Ok(String::new()),
+                    };
+                    Cmd::ListSaved(new_icon, saved, tied)
                 });
             }
             Msg::AskDeleteList(href) => {
@@ -2027,19 +2068,26 @@ impl Component for Window {
                 }
                 Err(e) => toast(w, &e),
             },
-            Cmd::ListSaved(icon, result) => match result {
-                Ok(l) => {
-                    if icon.is_some() {
-                        self.set_list_icon(&l.href, icon.as_deref());
+            Cmd::ListSaved(icon, result, tied) => {
+                match result {
+                    Ok(l) => {
+                        if icon.is_some() {
+                            self.set_list_icon(&l.href, icon.as_deref());
+                        }
+                        if !self.lists.iter().any(|x| x.href == l.href) {
+                            self.lists.push(l.clone());
+                            self.nav = Nav::List(l.href.clone());
+                        }
+                        self.reload(&sender);
                     }
-                    if !self.lists.iter().any(|x| x.href == l.href) {
-                        self.lists.push(l.clone());
-                        self.nav = Nav::List(l.href.clone());
-                    }
-                    self.reload(&sender);
+                    Err(e) => toast(w, &e),
                 }
-                Err(e) => toast(w, &e),
-            },
+                match tied {
+                    Ok(text) if !text.is_empty() => toast(w, &text),
+                    Ok(_) => {}
+                    Err(e) => toast(w, &e),
+                }
+            }
             Cmd::ListMade(result, then) => match result {
                 Ok(l) => {
                     if !self.lists.iter().any(|x| x.href == l.href) {
@@ -3636,6 +3684,50 @@ impl Window {
             "shortcuts" => sender.input(Msg::Shortcuts),
             "about" => sender.input(Msg::About),
             "newlist" => sender.input(Msg::NewList),
+            "editlist" => {
+                if let Some(h) = list(arg) {
+                    sender.input(Msg::EditList(h));
+                }
+            }
+            // `field <title words>=<text>` types into the open dialog's
+            // entry row with that title; `press <label>` clicks its button
+            // (or the entry row's Enter, `press <title words>`).
+            "field" => {
+                let Some((title, text)) = arg.split_once('=') else {
+                    return;
+                };
+                let title = title.trim().to_lowercase();
+                match dialog_widget(w, |x| {
+                    x.downcast_ref::<adw::EntryRow>()
+                        .is_some_and(|r| r.title().to_lowercase().contains(&title))
+                }) {
+                    Some(r) => r
+                        .downcast_ref::<adw::EntryRow>()
+                        .expect("an entry row")
+                        .set_text(text),
+                    None => eprintln!("drive: no entry {title:?} in the dialog"),
+                }
+            }
+            "press" => {
+                let want = arg.trim().to_lowercase();
+                let found = dialog_widget(w, |x| {
+                    x.downcast_ref::<gtk::Button>()
+                        .and_then(|b| b.label())
+                        .is_some_and(|l| l.to_lowercase() == want)
+                        || x.downcast_ref::<adw::EntryRow>()
+                            .is_some_and(|r| r.title().to_lowercase().contains(&want))
+                });
+                match found {
+                    Some(x) => {
+                        if let Some(b) = x.downcast_ref::<gtk::Button>() {
+                            b.emit_clicked();
+                        } else if let Some(r) = x.downcast_ref::<adw::EntryRow>() {
+                            r.emit_by_name::<()>("entry-activated", &[]);
+                        }
+                    }
+                    None => eprintln!("drive: nothing in the dialog says {want:?}"),
+                }
+            }
             "scheme" => adw::StyleManager::default().set_color_scheme(match arg {
                 "dark" => adw::ColorScheme::ForceDark,
                 "light" => adw::ColorScheme::ForceLight,

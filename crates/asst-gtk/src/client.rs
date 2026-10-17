@@ -6,6 +6,8 @@ use asst_core::api::{
     ListView, Settings, SettingsChange, StatusView, TaskView, TrackIngested,
 };
 use asst_core::store::Query;
+
+use crate::model::LinkEdit;
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
 
@@ -59,6 +61,32 @@ pub async fn lists() -> Result<Vec<ListView>> {
 
 pub async fn links() -> Result<Vec<LinkView>> {
     json(proxy().await?.links().await)
+}
+
+/// Do what a list dialog's repo field asked of the list's tie: a sentence
+/// for a toast, empty when nothing changed.
+pub async fn link_edit(list: &str, edit: &LinkEdit) -> Result<String> {
+    let proxy = proxy().await?;
+    let unlink = |repo: String| {
+        let proxy = proxy.clone();
+        async move { proxy.unlink(&repo).await.map_err(|e| describe(&e)) }
+    };
+    match edit {
+        LinkEdit::Keep => Ok(String::new()),
+        LinkEdit::Unlink(repo) => {
+            unlink(repo.clone()).await?;
+            Ok(format!("Unlinked {repo}"))
+        }
+        LinkEdit::Link(repo) => {
+            proxy.link(list, repo).await.map_err(|e| describe(&e))?;
+            Ok(format!("Linked to {repo}"))
+        }
+        LinkEdit::Move { from, to } => {
+            unlink(from.clone()).await?;
+            proxy.link(list, to).await.map_err(|e| describe(&e))?;
+            Ok(format!("Linked to {to}"))
+        }
+    }
 }
 
 pub async fn tasks(q: &Query) -> Result<Vec<TaskView>> {
