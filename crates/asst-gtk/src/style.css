@@ -954,6 +954,10 @@ button.pill {
   margin-left: 8px;
 }
 
+.time-controls > .time-action {
+  margin-right: 8px;
+}
+
 /* Time view chips: tracked blocks, tinted by label. */
 .time-block {
   border-radius: 6px;
