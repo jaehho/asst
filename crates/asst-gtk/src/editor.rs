@@ -53,6 +53,8 @@ pub struct Editor {
     menu: gtk::MenuButton,
     /// Start work on the task's GitHub issue; shown for a paired task.
     work: gtk::Button,
+    /// The paired issue's number, at the end of the title line (#18).
+    issue: gtk::Label,
     /// The place picker's shared state: its results list, and the places
     /// found so far.
     place_results: pickers::PlaceSlot,
@@ -102,6 +104,12 @@ impl Editor {
         let title = ui::text_view("Task name");
         title.add_css_class("editor-title");
         top.append(&title);
+        let issue = gtk::Label::builder().valign(gtk::Align::Start).build();
+        issue.add_css_class("caption");
+        issue.add_css_class("dim-label");
+        issue.add_css_class("editor-issue");
+        issue.set_visible(false);
+        top.append(&issue);
         let collapse = gtk::Button::from_icon_name("go-up-symbolic");
         collapse.add_css_class("flat");
         collapse.add_css_class("editor-collapse");
@@ -218,6 +226,7 @@ impl Editor {
             reminder_dot,
             menu,
             work,
+            issue,
             place_results: Rc::default(),
             places: Rc::default(),
             loading: Cell::new(false),
@@ -820,8 +829,18 @@ impl Editor {
                 self.work.set_visible(true);
                 self.work
                     .set_tooltip_text(Some(&format!("Start work on #{}", issue.number)));
+                self.issue.set_text(&format!("#{}", issue.number));
+                self.issue
+                    .set_tooltip_text(Some(&match model::issue_repo(&issue.url) {
+                        Some(repo) => format!("GitHub issue #{} of {repo}", issue.number),
+                        None => format!("GitHub issue #{}", issue.number),
+                    }));
+                self.issue.set_visible(true);
             }
-            None => self.work.set_visible(false),
+            None => {
+                self.work.set_visible(false);
+                self.issue.set_visible(false);
+            }
         }
 
         let level = priority_level(t.task.priority);
