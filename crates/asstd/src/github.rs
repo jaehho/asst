@@ -1647,6 +1647,49 @@ mod tests {
         assert_eq!(rig.link("jaehho/x").state, None);
     }
 
+    /// The two statuses the spec names among the answers that settle
+    /// nothing and the table above leaves out. 401: the token is the
+    /// trouble, so the round ends and asks for it again, and nothing is
+    /// read or written. 410: GitHub's other word for gone, no more
+    /// evidence of a deletion than a 404.
+    #[tokio::test]
+    async fn a_rejected_token_and_a_410_settle_nothing_either() {
+        let mut rig = Rig::new(&["jaehho/x", "jaehho/y"]).await;
+        rig.publish(5, "jaehho/x", false);
+        rig.publish(6, "jaehho/y", false);
+        rig.go().await;
+        rig.pair_up("jaehho/x", 3, "Three");
+        let before = rig.snap();
+        let (x, y) = (rig.issues_asked("jaehho/x"), rig.issues_asked("jaehho/y"));
+
+        rig.fake.reply(
+            "GET",
+            "/repositories/5",
+            Reply::json(401, r#"{"message":"Bad credentials"}"#),
+        );
+        assert_eq!(rig.go().await, Round::Rejected);
+        assert_eq!(rig.snap(), before, "links, pairs, tasks and log");
+        assert_eq!(rig.issues_asked("jaehho/x"), x);
+        assert_eq!(rig.issues_asked("jaehho/y"), y, "the round ended at x");
+        let link = rig.link("jaehho/x");
+        assert_eq!(link.state, None, "no finding");
+        assert_eq!(link.error.as_deref(), Some("GitHub rejected the token"));
+
+        // Gone for the id and for the name: reported, never taken for a
+        // deletion, and nothing is logged
+        rig.later(1);
+        rig.fake.reply("GET", "/repositories/5", Reply::status(410));
+        rig.fake.reply("GET", "/repos/jaehho/x", Reply::status(410));
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.snap(), before);
+        assert_eq!(rig.issues_asked("jaehho/x"), x);
+        assert_eq!(
+            rig.link("jaehho/x").state,
+            Some(asst_core::api::LinkState::Unreachable)
+        );
+        assert_eq!(rig.issues_asked("jaehho/y"), y + 1, "the other goes on");
+    }
+
     #[tokio::test]
     async fn a_refusal_that_says_when_to_come_back_is_waited_out() {
         let mut rig = Rig::new(&["jaehho/a", "jaehho/b"]).await;
