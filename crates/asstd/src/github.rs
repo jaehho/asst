@@ -3214,10 +3214,14 @@ mod tests {
                     assert_eq!(word("to"), short(&word("repo_to")), "{}\n{at}", row.text);
                 }
                 let hour = (rig.now - chrono::Duration::hours(1)).timestamp();
+                // (a clock set back has rows from its future, which count
+                // against the daemon and not against this)
                 let renamed = snap
                     .log
                     .iter()
-                    .filter(|r| r.kind == "list-renamed" && r.at > hour)
+                    .filter(|r| {
+                        r.kind == "list-renamed" && r.at > hour && r.at <= rig.now.timestamp()
+                    })
                     .count();
                 assert!(
                     renamed <= limits::RENAMES_PER_HOUR,

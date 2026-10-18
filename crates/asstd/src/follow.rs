@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::{Daemon, Result};
 use crate::github::AUTO;
 
-/// The lists renamed this way in the last hour may not come to more than
-/// this, whatever the repos do. A rename past it waits.
+/// The lists renamed this way (or begun to be) in the last hour may not come
+/// to more than this, whatever the repos do. A rename past it waits.
 const RENAMES_PER_HOUR: usize = limits::RENAMES_PER_HOUR;
 
 /// A marker this old is dropped: a name that has waited this long to change
