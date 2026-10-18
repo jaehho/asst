@@ -413,7 +413,11 @@ CONF
   reset)
     # Not `down --all`: Radicale and the other instances stay as they are.
     "$0" down
-    rm -f "$DEV/config/asst/window.toml" "$DEV"/state/asst/asst.db*
+    # window.toml and the copies the window keeps beside it (.v0 before a
+    # migration, .bad for a file it could not read): a leftover would pass
+    # for the next run's, and a stale .v0 makes back_up_v0 skip a real backup.
+    rm -f "$DEV/config/asst/window.toml" "$DEV/config/asst/window.toml.v0" \
+      "$DEV/config/asst/window.toml.bad" "$DEV"/state/asst/asst.db*
     # This instance's CalDAV collection only; other instances share Radicale.
     rm -rf "$RADICALE/data/collection-root/$(basename "$DEV")"
     clear_stale
