@@ -178,6 +178,10 @@ pub enum Msg {
     PlanCarry,
     /// Fold the tray's No date section open or shut.
     ToggleNoDate,
+    /// The keyboard came to this task's row (Tab, a click): the cursor goes
+    /// there, so the keys that act on the cursor task act on what has the
+    /// focus.
+    CursorTo(String),
     /// Take a carry back.
     PlanUncarry(model::Carried),
     /// A new task, and whether the add card was left with it typed.
@@ -1125,6 +1129,21 @@ impl Component for Window {
             Msg::ToggleNoDate => {
                 self.no_date_open = !self.no_date_open;
                 self.shown = 0;
+            }
+            Msg::CursorTo(href) => {
+                // Painted here, as a walk with the keys paints it: nothing
+                // rebuilds for a move of the cursor.
+                if self.cursor.as_ref() != Some(&href) && w.rows.iter().any(|(h, _)| *h == href) {
+                    for (h, row) in &w.rows {
+                        if *h == href {
+                            row.add_css_class("cursor");
+                        } else {
+                            row.remove_css_class("cursor");
+                        }
+                    }
+                    self.cursor = Some(href);
+                }
+                return;
             }
             Msg::Zoom(px, hold) => {
                 self.prefs.day_zoom = model::clamp_px_per_hour(px);
@@ -3389,6 +3408,14 @@ impl Window {
                 &w.add_card.root,
                 &tx,
             );
+            // The cursor follows the keyboard: the row that takes the focus
+            // (Tab, a click) is the task Space and the task letters act on.
+            for (href, row) in &built.rows {
+                let follow = gtk::EventControllerFocus::new();
+                let (tx, href) = (tx.clone(), href.clone());
+                follow.connect_enter(move |_| tx.emit(Msg::CursorTo(href.clone())));
+                row.add_controller(follow);
+            }
             // The pin is for this rebuild only.
             self.zoom_hold = None;
             w.clamp.set_child(Some(&built.root));
@@ -3965,15 +3992,21 @@ impl Window {
             // What has the keyboard, to window.log.
             "focus" => {
                 let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
+                let inside =
+                    |root: &gtk::Widget| focus.as_ref().is_some_and(|f| f.is_ancestor(root));
+                // The row the focus is on or in, by its task's href.
+                let row = focus.as_ref().and_then(|f| {
+                    w.rows
+                        .iter()
+                        .find(|(_, r)| f == r || f.is_ancestor(r))
+                        .map(|(h, _)| h.rsplit('/').next().unwrap_or(h).to_string())
+                });
                 eprintln!(
-                    "focus: {:?} in editor: {} in add card: {}",
+                    "focus: {:?} in editor: {} in add card: {} in column: {} row: {row:?}",
                     focus.as_ref().map(|f| f.type_().name()),
-                    focus
-                        .as_ref()
-                        .is_some_and(|f| f.is_ancestor(&w.editor.root)),
-                    focus
-                        .as_ref()
-                        .is_some_and(|f| f.is_ancestor(&w.add_card.root)),
+                    inside(w.editor.root.upcast_ref()),
+                    inside(w.add_card.root.upcast_ref()),
+                    inside(w.scroller.upcast_ref()),
                 );
             }
             // A click on the column's background at a point in the window.
