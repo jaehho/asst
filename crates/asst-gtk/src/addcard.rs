@@ -509,7 +509,8 @@ impl AddCard {
     }
 
     /// `archived` lists stay known, so a `#name` typed out in full still
-    /// finds one, but are not suggested or offered in the picker.
+    /// finds one, but are not suggested or offered in the picker, nor found
+    /// by the start of their name (`parsed`).
     pub fn set_lists(&self, lists: &[ListView], archived: &[String], sunday_first: bool) {
         *self.lists.borrow_mut() = lists.to_vec();
         *self.archived.borrow_mut() = archived.to_vec();
@@ -673,12 +674,23 @@ impl AddCard {
             .unwrap_or(self.default_priority.get())
     }
 
+    /// What the text says. A `#word` finds the lists the suggestions offer
+    /// by the start of their name, and the others (`pickable`) only by the
+    /// whole of it, so what resolves is what the popover shows.
     fn parsed(&self) -> quickadd::Parsed {
-        let names: Vec<String> = self.lists.borrow().iter().map(|l| l.name.clone()).collect();
-        quickadd::parse_with(
+        let offered = self.pickable();
+        let lists = self.lists.borrow();
+        let names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
+        let whole_only: Vec<String> = lists
+            .iter()
+            .filter(|l| !offered.iter().any(|o| o.href == l.href))
+            .map(|l| l.name.clone())
+            .collect();
+        quickadd::parse_scoped(
             &self.entry.text(),
             pickers::now(),
             &names,
+            &whole_only,
             self.read_dates.get(),
         )
     }
@@ -969,13 +981,13 @@ impl AddCard {
             let default = self.default_priority.get();
             (parsed.priority.is_none() && default < 4).then_some(default)
         });
+        // Without a list in the text the task goes where this card says: the
+        // daemon reads `#word` too and knows no archived lists, so it would
+        // file a word that was declined here into one.
         spec.list = chosen
             .list
             .clone()
-            .or_else(|| match &*self.target.borrow() {
-                Target::List(h) if parsed.list.is_none() => Some(h.clone()),
-                _ => None,
-            });
+            .or_else(|| parsed.list.is_none().then(|| self.list_href()).flatten());
         drop(chosen);
         (self.on_add)(spec, self.leaving.get());
         self.entry.set_text("");

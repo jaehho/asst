@@ -150,6 +150,21 @@ pub fn parse(text: &str, now: DateTime<Tz>, lists: &[String]) -> Parsed {
 /// `parse`; with `dates` off, a date or a repeat stays part of the title
 /// (`#list`, `p1` and `!` still count).
 pub fn parse_with(text: &str, now: DateTime<Tz>, lists: &[String], dates: bool) -> Parsed {
+    parse_scoped(text, now, lists, &[], dates)
+}
+
+/// `parse_with`, where a `#word` finds the lists in `whole_only` (names
+/// from `lists`) only by spelling the whole name, not by being the start of
+/// it. For a caller that keeps some lists out of its pickers, and so out of
+/// reach of a half-typed name. They still count for whether a start is
+/// ambiguous, so on every other word this agrees with `parse_with`.
+pub fn parse_scoped(
+    text: &str,
+    now: DateTime<Tz>,
+    lists: &[String],
+    whole_only: &[String],
+    dates: bool,
+) -> Parsed {
     let toks = tokenize(text);
     let mut used = vec![false; toks.len()];
     let mut out = Parsed {
@@ -165,7 +180,7 @@ pub fn parse_with(text: &str, now: DateTime<Tz>, lists: &[String], dates: bool) 
     let mut have_date = false;
     let mut i = 0;
     while i < toks.len() {
-        let Some((n, hit)) = match_at(&toks, i, now, lists) else {
+        let Some((n, hit)) = match_at(&toks, i, now, lists, whole_only) else {
             i += 1;
             continue;
         };
@@ -264,10 +279,16 @@ pub fn parse_when(text: &str, now: DateTime<Tz>) -> Option<When> {
     whole.then_some(parsed.due).flatten()
 }
 
-fn match_at(toks: &[Tok], i: usize, now: DateTime<Tz>, lists: &[String]) -> Option<(usize, Hit)> {
+fn match_at(
+    toks: &[Tok],
+    i: usize,
+    now: DateTime<Tz>,
+    lists: &[String],
+    whole_only: &[String],
+) -> Option<(usize, Hit)> {
     let t = &toks[i];
     if let Some(name) = t.core.strip_prefix('#').filter(|n| !n.is_empty()) {
-        return find_list(name, lists).map(|l| (1, Hit::List(l)));
+        return find_list(name, lists, whole_only).map(|l| (1, Hit::List(l)));
     }
     if let Some(p) = t
         .lower
@@ -297,7 +318,7 @@ fn match_at(toks: &[Tok], i: usize, now: DateTime<Tz>, lists: &[String]) -> Opti
     date_phrase_at(toks, i, now)
 }
 
-fn find_list(name: &str, lists: &[String]) -> Option<String> {
+fn find_list(name: &str, lists: &[String], whole_only: &[String]) -> Option<String> {
     let squash = |s: &str| {
         s.chars()
             .filter(|c| !c.is_whitespace())
@@ -310,7 +331,7 @@ fn find_list(name: &str, lists: &[String]) -> Option<String> {
     }
     let mut prefixed = lists.iter().filter(|l| squash(l).starts_with(&want));
     match (prefixed.next(), prefixed.next()) {
-        (Some(l), None) => Some(l.clone()),
+        (Some(l), None) if !whole_only.contains(l) => Some(l.clone()),
         _ => None,
     }
 }
@@ -1015,6 +1036,36 @@ mod tests {
             "first date wins"
         );
         assert_eq!(p("#work Fix the bug").list.as_deref(), Some("Work stuff"));
+    }
+
+    #[test]
+    fn a_list_kept_to_its_whole_name_is_not_found_by_its_start() {
+        let all = lists();
+        let scoped = |text: &str, whole: &[&str]| {
+            let whole: Vec<String> = whole.iter().map(|n| (*n).to_string()).collect();
+            parse_scoped(text, now(), &all, &whole, true)
+        };
+        // Spelled out, in any case and with the spaces left out, it is found.
+        let r = scoped("#WorkStuff Fix the bug", &["Work stuff"]);
+        assert_eq!(r.list.as_deref(), Some("Work stuff"));
+        assert_eq!(r.summary, "Fix the bug");
+        // The start of it is left in the title, as if there were no such list.
+        let r = scoped("#work Fix the bug", &["Work stuff"]);
+        assert_eq!((r.list, r.summary.as_str()), (None, "#work Fix the bug"));
+        // Other lists still go by their starts, and an ambiguous start finds
+        // nothing, kept lists included.
+        let r = scoped("#err Buy milk", &["Work stuff"]);
+        assert_eq!(r.list.as_deref(), Some("Errands"));
+        let more: Vec<String> = ["Inbox", "Errands", "Work stuff", "Workout"]
+            .map(String::from)
+            .into();
+        let kept = ["Work stuff".to_string()];
+        let r = parse_scoped("#wor Go", now(), &more, &kept, true);
+        assert_eq!((r.list, r.summary.as_str()), (None, "#wor Go"));
+        let r = parse_scoped("#workout Go", now(), &more, &kept, true);
+        assert_eq!(r.list.as_deref(), Some("Workout"));
+        // Nothing kept is `parse_with`.
+        assert_eq!(scoped("#work Fix", &[]), p("#work Fix"));
     }
 
     #[test]
