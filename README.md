@@ -25,7 +25,8 @@ asst done ID | asst edit ID --due "fri 9am" --repeat "every fri" | asst rm ID
 asst show ID [--raw] | asst dup ID | asst open ID | asst sync | asst status
 asst lists | asst list new NAME [--color '#rrggbb'] | asst list rename LIST NAME
 asst list color LIST '#rrggbb' | asst list rm LIST [--yes]
-asst settings [--inbox LIST|default] [--interval SECONDS] [--snooze MINUTES,…] [--alarm-at-due yes|no] [--alarm-before MINUTES]
+asst settings [--inbox LIST|default] [--interval SECONDS] [--snooze MINUTES,…] [--alarm-at-due yes|no] [--alarm-before MINUTES] [--follow-rename list|off]
+asst link [LIST] [OWNER/REPO] | asst unlink OWNER/REPO | asst projects | asst projects log [-n N] [--repo OWNER/REPO]
 asst track ingest [--date YYYY-MM-DD] [--dry-run] | asst track tags | asst track suggest
 ```
 
@@ -33,7 +34,7 @@ IDs are the shortest unambiguous UID prefix shown in listings. `--json` works ev
 
 **ActivityWatch:** sensors live in `~/projects/aw-watchers`; raw rollups are stock AW (`aw` / webui). The **Time** sidebar view shows one day of tagged blocks. `asst track ingest` (CLI, for tools) tags AFK-clipped spans (`~/.config/asst/tags.toml`) into `blocks` (`planned=0`); `suggest` prints rule stubs for untagged sources.
 
-**GitHub issues:** `asst link <list> <owner/repo>` keeps a list and a repo's issues in step: title, notes (as the issue body), open/closed and priority (`P1`–`P3` labels) both ways; a task's other labels are left alone. `asst link <owner/repo>` does it with the list the repo is linked to, else the list named for it, making that if needed; a repo linked to one list is not moved to another (`asst unlink` it first); a renamed repo is followed. `asst link` shows the links, `asst unlink <owner/repo>` drops one. The window does the same in a list's New List / Edit List dialog: the Repository field shows the tie and takes `owner/repo` or a GitHub URL; clearing it unlinks. asstd uses `$GITHUB_TOKEN`, or the token `gh auth login` stored. A linked list shows a link mark in the sidebar (hover for when its issues were last read, or what went wrong). A task paired with an issue shows its number (`github #12` on its row, `#12` on its open card) and has Start work (its ⋮ menu, the arrow beside its list, or right-click): it runs Preferences → GitHub's command (default `kitty --directory {dir} gh-co {number}`) in the repo's checkout under the projects folder (`~/projects/<repo>`), and Open on GitHub.
+**GitHub issues:** `asst link <list> <owner/repo>` keeps a list and a repo's issues in step: title, notes (as the issue body), open/closed and priority (`P1`–`P3` labels) both ways; a task's other labels are left alone. `asst link <owner/repo>` does it with the list the repo is linked to, else the list named for it, making that if needed; a repo linked to one list is not moved to another (`asst unlink` it first); a renamed repo is followed (see Renaming a project). `asst link` shows the links, `asst unlink <owner/repo>` drops one. The window does the same in a list's New List / Edit List dialog: the Repository field shows the tie and takes `owner/repo` or a GitHub URL; clearing it unlinks. asstd uses `$GITHUB_TOKEN`, or the token `gh auth login` stored. A linked list shows a link mark in the sidebar (hover for when its issues were last read, or what went wrong). A task paired with an issue shows its number (`github #12` on its row, `#12` on its open card) and has Start work (its ⋮ menu, the arrow beside its list, or right-click): it runs Preferences → GitHub's command (default `kitty --directory {dir} gh-co {number}`) in the repo's checkout under the projects folder (`~/projects/<repo>`), and Open on GitHub.
 
 **Quick-add syntax** (CLI, popup and window): `#list`, `p1`…`p4`, dates (`today`, `tomorrow`, `fri`, `next week`, `in 3 days`, `sep 20`, `9/20`, `5pm`, `at 9`, `in 2h`, `tonight`, `this evening`, `tomorrow morning`, `midnight`), repeats (`every day`, `every weekday`, `every mon, thu`, `every 2 weeks`, `every 15th`), reminders (`!` at the due time, `!30m` before, `!9am` at a time). Preferences → New Tasks → Read dates in titles off leaves dates and repeats in the title.
 
@@ -74,6 +75,40 @@ hl.bind(mainMod .. " + SHIFT + A", hl.dsp.exec_cmd("asst-gtk quick-add")) -- qui
 
 Classes: `overdue`, `due`, `clear`, `offline`, `error`.
 
+## Renaming a project
+
+A linked repo is known by its GitHub id, which a rename leaves alone, so renaming the repo on GitHub is safe: asstd sees it on its next pass, moves the link and its issue pairs to the new name, and goes on syncing. What it does beyond that is small, and written down.
+
+- **The list** is renamed too, once, only if asstd saw the rename happen and the list is named exactly for the old repo (`champalimaud` for `jaehho/champalimaud`; not `Champalimaud`, not `Lab work`), is not the inbox, can be written, and no other list already has the new name. The server gets one display-name change. The list keeps its place, color, icon and tasks, and the phone shows the new name once it fetches. At most three an hour. `follow_rename = "off"` in `config.toml`, or `asst settings --follow-rename off`, leaves the list alone and says so.
+- **Everything else is reported, not done.** `asst projects` lists each link with what needs a look (`archived`, `renamed`, `unreachable`, `replaced`, `conflict`), the lists waiting for their new name, and, for a list still named for an old name that asstd did not see change, the command that renames it (`asst list rename "champalimaud" "lab"`). It changes nothing. `asst projects log` is every change asstd made by itself, with its reason and the command that undoes it. `--json` on either is for other tools. Nothing is ever deleted, unlinked or archived for you: a repo archived on GitHub is only said to be, and a repo GitHub cannot find is "unreachable", never "gone".
+- **Tracked time** keeps the old name until you move it. For days not yet ingested, add two rules to `~/.config/asst/tags.toml` and keep them (sessions started before the move go on saying the old name until they restart):
+
+  ```toml
+  [[rule]]
+  project = "champalimaud"
+  tag = "lab"
+
+  [[rule]]
+  cwd_prefix = "/home/you/projects/champalimaud"
+  tag = "lab"
+  ```
+
+  For blocks already stored, relabel them in place: `asst track ingest` is not a relabel, since it recomputes the hours from ActivityWatch too. `asst projects` says how many blocks still carry a name the log saw change. The recipe (fish), with a backup and the ids kept for undo:
+
+  ```fish
+  set db ~/.local/state/asst/asst.db
+  set old champalimaud
+  set new lab
+  sqlite3 $db ".backup '$db.pre-relabel'"
+  sqlite3 -readonly $db "select count(*), round(sum(end-start)/3600000.0,2) from blocks where planned=0 and label='$old'"
+  sqlite3 -readonly $db "select group_concat(id) from blocks where planned=0 and label='$old'" > $db.relabel-ids
+  sqlite3 $db ".timeout 5000" "begin; update blocks set label='$new' where planned=0 and label='$old'; select changes(); commit;"
+  sqlite3 -readonly $db "select label, count(*), round(sum(end-start)/3600000.0,2) from blocks where label in ('$old','$new') group by label"
+  ```
+
+  Run the update only when the first count is the one you expect (`asst projects` gives it for a name it knows). Undo with `update blocks set label='champalimaud' where id in (...)`, the ids being those in `$db.relabel-ids`. Planned blocks are not touched.
+- **Left as they were:** ActivityWatch events, steno sessions and closed issues name the project as it was called then.
+
 ## Configure
 
 `~/.config/asst/config.toml` (written by `asst login` and `asst settings`):
@@ -84,6 +119,7 @@ interval = 60          # seconds between checks for server changes
 snooze = [10, 30, 60]  # minutes, a Snooze button each (up to three)
 alarm_at_due = true    # a timed task gets a reminder, as on the iPhone
 alarm_before = 0       # minutes before the due time that reminder rings
+follow_rename = "list" # a renamed repo renames its exactly-named list; "off" only reports it
 ```
 
 The cache is `~/.local/state/asst/asst.db`; deleting it only costs a full re-sync.
