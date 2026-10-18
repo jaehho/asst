@@ -226,7 +226,7 @@ pub fn build(facts: Facts) -> Report {
         })
         .collect();
     Report {
-        proposals: proposals(&links, &lists, &log),
+        proposals: proposals(&links, &lists, &log, follow_rename),
         labels: stale_labels(&links, &lists, &log, &labels),
         links: rows,
         settings: Rules::new(follow_rename),
@@ -267,6 +267,25 @@ fn former_names(repo: &str, log: &[LogRow]) -> Vec<String> {
             }
             _ => return names,
         }
+    }
+}
+
+/// Why asstd did not rename the list itself, from the `repo-renamed` row
+/// that took the repo from `former`: it was found after the fact (asstd
+/// renames a list only when it sees the repo renamed), or following is off.
+/// Nothing, when neither is the reason.
+fn not_done_by_asstd(log: &[LogRow], former: &str, follow: FollowRename) -> Option<&'static str> {
+    let witnessed = log
+        .iter()
+        .filter(|r| renamed(r).is_some_and(|(from, _)| from.eq_ignore_ascii_case(former)))
+        .find_map(|r| {
+            let data: serde_json::Value = serde_json::from_str(r.data.as_deref()?).ok()?;
+            data.get("witnessed")?.as_bool()
+        });
+    match (witnessed, follow) {
+        (Some(false), _) => Some("asstd did not see the rename happen"),
+        (_, FollowRename::Off) => Some("follow_rename is off"),
+        _ => None,
     }
 }
 
@@ -312,7 +331,12 @@ pub fn quoted(word: &str) -> String {
 /// The same judgement it makes (`follow_list_name`), so the report never
 /// proposes what the daemon would refuse. A link whose rename asstd still
 /// means to follow is left to it.
-fn proposals(links: &[LinkView], lists: &[ListView], log: &[LogRow]) -> Vec<Proposal> {
+fn proposals(
+    links: &[LinkView],
+    lists: &[ListView],
+    log: &[LogRow],
+    follow: FollowRename,
+) -> Vec<Proposal> {
     let mut found = Vec::new();
     for link in links.iter().filter(|l| l.pending_rename.is_none()) {
         let Some(list) = lists.iter().find(|l| l.href == link.list) else {
@@ -348,10 +372,16 @@ fn proposals(links: &[LinkView], lists: &[ListView], log: &[LogRow]) -> Vec<Prop
                 list: list.href.clone(),
                 from: list.name.clone(),
                 command: format!("asst list rename {} {}", quoted(which), quoted(&to)),
-                why: format!(
-                    "{former} is now {}; the list is still called {:?}",
-                    link.repo, list.name
-                ),
+                why: match not_done_by_asstd(log, &former, follow) {
+                    Some(reason) => format!(
+                        "{former} is now {}; the list is still called {:?} ({reason})",
+                        link.repo, list.name
+                    ),
+                    None => format!(
+                        "{former} is now {}; the list is still called {:?}",
+                        link.repo, list.name
+                    ),
+                },
                 to,
             });
             break;
@@ -527,7 +557,7 @@ mod tests {
             list("/cal/inbox/", "Inbox", 1),
         ];
         let log = [rename_row(1, "jaehho/champalimaud", "jaehho/lab", HREF)];
-        let p = proposals(&links, &lists, &log);
+        let p = proposals(&links, &lists, &log, FollowRename::List);
         assert_eq!(
             p,
             [Proposal {
@@ -538,7 +568,7 @@ mod tests {
                 to: "lab".into(),
                 command: "asst list rename \"champalimaud\" \"lab\"".into(),
                 why: "jaehho/champalimaud is now jaehho/lab; the list is still called \
-                      \"champalimaud\""
+                      \"champalimaud\" (asstd did not see the rename happen)"
                     .into(),
             }]
         );
@@ -550,7 +580,7 @@ mod tests {
             rename_row(2, "jaehho/b", "jaehho/c", HREF),
             rename_row(1, "jaehho/a", "jaehho/b", HREF),
         ];
-        let p = proposals(&links, &lists, &log);
+        let p = proposals(&links, &lists, &log, FollowRename::List);
         assert_eq!((p[0].from.as_str(), p[0].to.as_str()), ("a", "c"));
         assert_eq!(p.len(), 1);
     }
@@ -561,7 +591,11 @@ mod tests {
         let links = [link("jaehho/lab", HREF, "champalimaud")];
         let named = |name: &str| [list(HREF, name, 0)];
         let none = |links: &[LinkView], lists: &[ListView], log: &[LogRow]| {
-            assert_eq!(proposals(links, lists, log), [], "{lists:?}");
+            assert_eq!(
+                proposals(links, lists, log, FollowRename::List),
+                [],
+                "{lists:?}"
+            );
         };
 
         // Given a name of its own, or already named, nothing to follow
@@ -597,6 +631,44 @@ mod tests {
     }
 
     #[test]
+    fn a_proposal_says_why_asstd_did_not_do_it_itself() {
+        let links = [link("jaehho/lab", HREF, "champalimaud")];
+        let lists = [list(HREF, "champalimaud", 0)];
+        let seen = |witnessed: bool| {
+            let mut row = rename_row(1, "jaehho/champalimaud", "jaehho/lab", HREF);
+            row.data = Some(
+                serde_json::json!({
+                    "from": "jaehho/champalimaud", "to": "jaehho/lab",
+                    "id": 1, "witnessed": witnessed,
+                })
+                .to_string(),
+            );
+            [row]
+        };
+        let why = |log: &[LogRow], follow| proposals(&links, &lists, log, follow)[0].why.clone();
+        let called =
+            "jaehho/champalimaud is now jaehho/lab; the list is still called \"champalimaud\"";
+
+        // Found after the fact: asstd renames a list only when it sees it
+        assert_eq!(
+            why(&seen(false), FollowRename::List),
+            format!("{called} (asstd did not see the rename happen)")
+        );
+        // Seen, and following is off
+        assert_eq!(
+            why(&seen(true), FollowRename::Off),
+            format!("{called} (follow_rename is off)")
+        );
+        // Both: the event is the first reason
+        assert_eq!(
+            why(&seen(false), FollowRename::Off),
+            format!("{called} (asstd did not see the rename happen)")
+        );
+        // Seen, and following is on (the marker ran out): no reason known
+        assert_eq!(why(&seen(true), FollowRename::List), called);
+    }
+
+    #[test]
     fn a_list_given_back_its_name_by_hand_stays_so() {
         let links = [link("jaehho/lab", HREF, "champalimaud")];
         let lists = [list(HREF, "champalimaud", 0)];
@@ -604,14 +676,20 @@ mod tests {
             list_renamed(2, HREF, "champalimaud", "lab"),
             rename_row(1, "jaehho/champalimaud", "jaehho/lab", HREF),
         ];
-        assert_eq!(proposals(&links, &lists, &renamed_by_hand_back), []);
+        assert_eq!(
+            proposals(&links, &lists, &renamed_by_hand_back, FollowRename::List),
+            []
+        );
 
         // Another list's undo says nothing about this one
         let other = [
             list_renamed(2, "/cal/other/", "champalimaud", "lab"),
             rename_row(1, "jaehho/champalimaud", "jaehho/lab", HREF),
         ];
-        assert_eq!(proposals(&links, &lists, &other).len(), 1);
+        assert_eq!(
+            proposals(&links, &lists, &other, FollowRename::List).len(),
+            1
+        );
     }
 
     #[test]
@@ -622,7 +700,7 @@ mod tests {
             list("/cal/second/", "Champalimaud", 0),
         ];
         let log = [rename_row(1, "jaehho/champalimaud", "jaehho/lab", HREF)];
-        let p = proposals(&links, &lists, &log);
+        let p = proposals(&links, &lists, &log, FollowRename::List);
         assert_eq!(
             p[0].command,
             "asst list rename \"/cal/champalimaud-21eefd/\" \"lab\""
@@ -699,7 +777,8 @@ mod tests {
     fn the_report_is_made_of_what_was_read() {
         let mut archived = link("jaehho/mail-digest", "/cal/md/", "mail-digest");
         archived.state = Some(LinkState::Archived);
-        archived.note = Some("first seen archived 2026-10-18; 0 open tasks".into());
+        archived.note =
+            Some("archived on GitHub, first seen 2026-10-18; no open tasks here".into());
         archived.since = Some(at(18));
         archived.repo_id = Some(1379104203);
         let mut waiting = link("jaehho/lab", HREF, "champalimaud");

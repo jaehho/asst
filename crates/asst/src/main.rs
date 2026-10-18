@@ -878,7 +878,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     m => format!("{} before", fmt::minutes(u64::from(m))),
                 },
             );
-            row("follow-rename", s.follow_rename.as_str().into());
+            row("follow-rename", out::follow_rename_words(s.follow_rename));
         }
 
         Cmd::Lists => {

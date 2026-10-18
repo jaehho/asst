@@ -155,6 +155,14 @@ pub fn links_status(s: &Style, links: &[LinkView]) -> Option<String> {
     )
 }
 
+/// What `asst settings` says of `follow_rename`: the word, and what it does.
+pub fn follow_rename_words(f: FollowRename) -> String {
+    match f {
+        FollowRename::List => "list (a renamed repo renames its list)".into(),
+        FollowRename::Off => "off (a rename is only reported)".into(),
+    }
+}
+
 /// A day as the person reads it, in their zone.
 fn day(at: DateTime<Utc>, zone: Tz) -> String {
     at.with_timezone(&zone).format("%Y-%m-%d").to_string()
@@ -205,7 +213,7 @@ pub fn projects_text(s: &Style, r: &Report, zone: Tz) -> String {
                 l.label
             ));
             out.push(format!(
-                "    new days: [[rule]] project = {:?} tag = {:?} in tags.toml",
+                "    new days: add [[rule]] project = {:?} tag = {:?} to ~/.config/asst/tags.toml",
                 l.label, l.now
             ));
             out.push("    history: the relabel recipe in README, \"Renaming a project\"".into());
@@ -256,11 +264,17 @@ fn links_table(s: &Style, links: &[ProjectLink]) -> Vec<String> {
     rows
 }
 
-/// The daemon's note, and what only this machine knows.
+/// The daemon's note, and what only this machine knows: whether the
+/// window has put the list away, which is the one thing left to do about a
+/// repo that is archived, and the owner's to do.
 fn table_note(l: &ProjectLink) -> String {
     let note = l.note.clone().unwrap_or_default();
-    if l.state == "archived" && l.archived_in_window {
+    if l.state != "archived" {
+        note
+    } else if l.archived_in_window {
         format!("{note}; already archived in the window")
+    } else if l.open_tasks == Some(0) {
+        format!("{note}, so the list can be archived in the window")
     } else {
         note
     }
@@ -268,14 +282,8 @@ fn table_note(l: &ProjectLink) -> String {
 
 /// A list that waits to be renamed, and until when.
 fn pending_line(l: &ProjectLink, p: &Pending, r: &Report, zone: Tz) -> String {
-    let what = format!(
-        "list {:?} waits to be renamed {:?}: {} became {} on {}",
-        l.name,
-        short(&l.repo),
-        p.from,
-        l.repo,
-        day(p.since, zone)
-    );
+    // Who renamed what, and when, is in the table's row for the link
+    let what = format!("list {:?} waits to be renamed {:?}", l.name, short(&l.repo));
     let begun = if p.begun {
         "; the rename was begun on the server and is not finished"
     } else {
@@ -283,8 +291,10 @@ fn pending_line(l: &ProjectLink, p: &Pending, r: &Report, zone: Tz) -> String {
     };
     match r.settings.follow_rename {
         FollowRename::List => format!(
-            "  {what}{begun}; asstd tries on every pass until {}",
-            day(p.expires, zone)
+            "  {what}{begun}; asstd tries on every pass until {}, and waits while the server \
+             is out of reach or after {} renames in an hour",
+            day(p.expires, zone),
+            r.settings.renames_per_hour
         ),
         FollowRename::Off => {
             format!("  {what}{begun}; follow_rename is off, so asstd will leave the list as it is")
@@ -354,12 +364,12 @@ mod tests {
         let archived = link(
             "jaehho/mail-digest",
             Some(LinkState::Archived),
-            "first seen archived 2026-10-18; 0 open tasks",
+            "archived on GitHub, first seen 2026-10-18; no open tasks here",
         );
         let links = [link("jaehho/lab", None, ""), archived.clone()];
         assert_eq!(
             link_note(&plain(), &archived).as_deref(),
-            Some("  first seen archived 2026-10-18; 0 open tasks")
+            Some("  archived on GitHub, first seen 2026-10-18; no open tasks here")
         );
         assert_eq!(
             links_hint(&plain(), &links).as_deref(),
@@ -448,7 +458,7 @@ mod tests {
             "jaehho/mail-digest",
             "mail-digest",
             "archived",
-            "first seen archived 2026-10-18; 0 open tasks",
+            "archived on GitHub, first seen 2026-10-18; no open tasks here",
         );
         md.archived_in_window = true;
         let r = report(vec![
@@ -461,7 +471,7 @@ mod tests {
             "\
 LIST         REPO                STATE     NOTE
 lab          jaehho/lab          ok
-mail-digest  jaehho/mail-digest  archived  first seen archived 2026-10-18; 0 open tasks; already archived in the window
+mail-digest  jaehho/mail-digest  archived  archived on GitHub, first seen 2026-10-18; no open tasks here; already archived in the window
 dash         jaehho/dash         conflict  two links claim it"
         );
 
@@ -482,11 +492,12 @@ dash         jaehho/dash         conflict  two links claim it"
     #[test]
     fn the_state_is_painted_in_its_own_cell_and_not_the_row() {
         let color = Style { color: true };
-        let r = report(vec![
+        let mut r = report(vec![
             row("jaehho/lab", "lab", "ok", ""),
             row("jaehho/a", "a", "archived", "n"),
             row("jaehho/b", "b", "unreachable", "n"),
         ]);
+        r.links[1].open_tasks = Some(2);
         let text = projects_text(&color, &r, ny());
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -513,7 +524,7 @@ dash         jaehho/dash         conflict  two links claim it"
             text.lines().skip(3).collect::<Vec<_>>().join("\n"),
             "\
 Pending
-  list \"champalimaud\" waits to be renamed \"lab\": jaehho/champalimaud became jaehho/lab on 2026-10-18; asstd tries on every pass until 2026-11-17"
+  list \"champalimaud\" waits to be renamed \"lab\"; asstd tries on every pass until 2026-11-17, and waits while the server is out of reach or after 3 renames in an hour"
         );
 
         // Begun on the server and not finished
@@ -521,7 +532,8 @@ Pending
         let text = projects_text(&plain(), &r, ny());
         assert!(
             text.contains(
-                "on 2026-10-18; the rename was begun on the server and is not finished; asstd tries"
+                "to be renamed \"lab\"; the rename was begun on the server and is not finished; \
+                 asstd tries"
             ),
             "{text}"
         );
@@ -588,10 +600,10 @@ lab   jaehho/lab  ok
 
 Labels
   127 blocks (42.3 h) still say \"champalimaud\"
-    new days: [[rule]] project = \"champalimaud\" tag = \"lab\" in tags.toml
+    new days: add [[rule]] project = \"champalimaud\" tag = \"lab\" to ~/.config/asst/tags.toml
     history: the relabel recipe in README, \"Renaming a project\"
   1 block (0.0 h) still say \"Champalimaud\"
-    new days: [[rule]] project = \"Champalimaud\" tag = \"lab\" in tags.toml
+    new days: add [[rule]] project = \"Champalimaud\" tag = \"lab\" to ~/.config/asst/tags.toml
     history: the relabel recipe in README, \"Renaming a project\""
         );
     }
@@ -603,6 +615,162 @@ Labels
         assert_eq!(
             projects_text(&plain(), &r, ny()),
             "LIST  REPO        STATE  NOTE\nlab   jaehho/lab  ok\n\nasstd did not give its log"
+        );
+    }
+
+    #[test]
+    fn an_archived_repo_says_whether_the_list_is_put_away_and_can_be() {
+        let note = "archived on GitHub, first seen 2026-10-18; no open tasks here";
+        let table = |tweak: fn(&mut ProjectLink)| {
+            let mut l = row("jaehho/md", "md", "archived", note);
+            tweak(&mut l);
+            projects_text(&plain(), &report(vec![l]), ny())
+                .lines()
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        // Nothing open and not put away: the one thing left, said as such
+        assert_eq!(
+            table(|_| {}),
+            format!("md    jaehho/md  archived  {note}, so the list can be archived in the window")
+        );
+        // Put away already
+        assert_eq!(
+            table(|l| l.archived_in_window = true),
+            format!("md    jaehho/md  archived  {note}; already archived in the window")
+        );
+        // Tasks still open: the daemon's note says what that means, and
+        // archiving is not suggested
+        assert_eq!(
+            table(|l| l.open_tasks = Some(3)),
+            format!("md    jaehho/md  archived  {note}")
+        );
+        // No count (the list is not one asstd knows): no suggestion
+        assert_eq!(
+            table(|l| l.open_tasks = None),
+            format!("md    jaehho/md  archived  {note}")
+        );
+    }
+
+    #[test]
+    fn the_follow_rename_setting_says_what_each_word_does() {
+        assert_eq!(
+            follow_rename_words(FollowRename::List),
+            "list (a renamed repo renames its list)"
+        );
+        assert_eq!(
+            follow_rename_words(FollowRename::Off),
+            "off (a rename is only reported)"
+        );
+    }
+
+    #[test]
+    fn the_whole_report_as_the_terminal_shows_it() {
+        // What asst projects printed on a copy of the live database, with
+        // fake GitHub answering every way it can
+        let mut md = row(
+            "jaehho/mail-digest",
+            "mail-digest",
+            "archived",
+            "archived on GitHub, first seen 2026-10-18; no open tasks here",
+        );
+        md.archived_in_window = true;
+        let mut steno = row(
+            "jaehho/steno-notes",
+            "steno",
+            "renamed",
+            "renamed from jaehho/steno on 2026-10-18; the list is still called \"steno\"",
+        );
+        steno.pending_rename = Some(Pending {
+            from: "jaehho/steno".into(),
+            since: at(10, 18),
+            expires: at(11, 17),
+            begun: false,
+        });
+        let mut thesis = row(
+            "jaehho/thesis",
+            "thesis",
+            "archived",
+            "archived on GitHub, first seen 2026-10-18; 3 tasks are still open here \
+             (a list archived in the window still syncs and rings)",
+        );
+        thesis.open_tasks = Some(3);
+        let mut r = report(vec![
+            row("jaehho/asst", "asst", "ok", ""),
+            row(
+                "jaehho/battery-log",
+                "battery-log",
+                "archived",
+                "archived on GitHub, first seen 2026-10-18; no open tasks here",
+            ),
+            row(
+                "jaehho/dash",
+                "dash",
+                "replaced",
+                "jaehho/dash is a different repository now (GitHub id 1379999002, not \
+                 1379100002), so its issues are not read. To follow the new one, unlink \
+                 jaehho/dash and link it again; the list's open tasks then become issues there",
+            ),
+            md,
+            steno,
+            thesis,
+            row(
+                "jaehho/wallhelper",
+                "wallhelper",
+                "unreachable",
+                "GitHub cannot find it: deleted, or the token cannot see it",
+            ),
+            row(
+                "jaehho/zotero-tray",
+                "zotero-tray",
+                "conflict",
+                "jaehho/zotero-tray is now jaehho/itin, but jaehho/itin is already linked to \
+                 \"itin\". Nothing was changed, and this link's issues are not read until one \
+                 of the two links is removed (asst unlink OWNER/REPO).",
+            ),
+        ]);
+        r.proposals.push(Proposal {
+            kind: "rename-list",
+            repo: "jaehho/new-one".into(),
+            list: "/cal/old-one/".into(),
+            from: "old-one".into(),
+            to: "new-one".into(),
+            command: "asst list rename \"old-one\" \"new-one\"".into(),
+            why: "jaehho/old-one is now jaehho/new-one; the list is still called \"old-one\" \
+                  (asstd did not see the rename happen)"
+                .into(),
+        });
+        r.labels.push(StaleLabel {
+            label: "champalimaud".into(),
+            now: "lab".into(),
+            repo: "jaehho/lab".into(),
+            blocks: 127,
+            seconds: 152_424,
+        });
+        assert_eq!(
+            projects_text(&plain(), &r, ny()),
+            r#"LIST         REPO                STATE        NOTE
+asst         jaehho/asst         ok
+battery-log  jaehho/battery-log  archived     archived on GitHub, first seen 2026-10-18; no open tasks here, so the list can be archived in the window
+dash         jaehho/dash         replaced     jaehho/dash is a different repository now (GitHub id 1379999002, not 1379100002), so its issues are not read. To follow the new one, unlink jaehho/dash and link it again; the list's open tasks then become issues there
+mail-digest  jaehho/mail-digest  archived     archived on GitHub, first seen 2026-10-18; no open tasks here; already archived in the window
+steno        jaehho/steno-notes  renamed      renamed from jaehho/steno on 2026-10-18; the list is still called "steno"
+thesis       jaehho/thesis       archived     archived on GitHub, first seen 2026-10-18; 3 tasks are still open here (a list archived in the window still syncs and rings)
+wallhelper   jaehho/wallhelper   unreachable  GitHub cannot find it: deleted, or the token cannot see it
+zotero-tray  jaehho/zotero-tray  conflict     jaehho/zotero-tray is now jaehho/itin, but jaehho/itin is already linked to "itin". Nothing was changed, and this link's issues are not read until one of the two links is removed (asst unlink OWNER/REPO).
+
+Pending
+  list "steno" waits to be renamed "steno-notes"; asstd tries on every pass until 2026-11-17, and waits while the server is out of reach or after 3 renames in an hour
+
+Proposals (nothing has been changed)
+  jaehho/old-one is now jaehho/new-one; the list is still called "old-one" (asstd did not see the rename happen)
+    asst list rename "old-one" "new-one"
+
+Labels
+  127 blocks (42.3 h) still say "champalimaud"
+    new days: add [[rule]] project = "champalimaud" tag = "lab" to ~/.config/asst/tags.toml
+    history: the relabel recipe in README, "Renaming a project""#
         );
     }
 
