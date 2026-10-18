@@ -252,6 +252,53 @@ impl Prefs {
     }
 }
 
+/// One change from the Preferences dialog, applied to the window's current
+/// `Prefs`. The dialog's copy dates from when it opened, and sending it back
+/// whole would undo what the window changed since (the day zoom, a view's
+/// sort). An enum rather than a closure because `Msg` is `Debug`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrefPatch {
+    ReadDates(bool),
+    DefaultPriority(u8),
+    RememberList(bool),
+    CompleteLater(bool),
+    SundayFirst(bool),
+    Background(bool),
+    ShowCounts(bool),
+    ListsByName(bool),
+    /// Take a list out of `archived`, by href.
+    Unarchive(String),
+    /// The views in the sidebar, in order.
+    SidebarViews(Vec<Nav>),
+    ProjectsDir(String),
+    WorkCommand(String),
+}
+
+impl PrefPatch {
+    pub fn apply(&self, p: &mut Prefs) {
+        match self {
+            PrefPatch::ReadDates(on) => p.read_dates = *on,
+            PrefPatch::DefaultPriority(n) => p.default_priority = *n,
+            PrefPatch::RememberList(on) => p.remember_list = *on,
+            PrefPatch::CompleteLater(on) => p.complete_later = *on,
+            PrefPatch::SundayFirst(on) => p.sunday_first = *on,
+            PrefPatch::Background(on) => p.background = *on,
+            PrefPatch::ShowCounts(on) => p.show_counts = *on,
+            PrefPatch::ListsByName(on) => p.lists_by_name = *on,
+            PrefPatch::Unarchive(href) => p.archived.retain(|h| h != href),
+            PrefPatch::SidebarViews(views) => p.set_sidebar_views(views),
+            PrefPatch::ProjectsDir(dir) => p.projects_dir.clone_from(dir),
+            PrefPatch::WorkCommand(command) => p.work_command.clone_from(command),
+        }
+    }
+
+    /// Whether the open view must be rebuilt. The two strings are only read
+    /// when Start work runs.
+    pub fn redraws(&self) -> bool {
+        !matches!(self, PrefPatch::ProjectsDir(_) | PrefPatch::WorkCommand(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +440,145 @@ mod tests {
         assert_eq!(names(p.arrange(&lists)), ["Work 9", "Work 10", "Home"]);
         p.lists_by_name = true;
         assert_eq!(names(p.arrange(&lists)), ["Home", "Work 9", "Work 10"]);
+    }
+
+    #[test]
+    fn a_patch_changes_one_field_and_only_strings_skip_the_redraw() {
+        // Every field away from its default, so a patch that wrote the
+        // dialog's copy back would show.
+        let base = Prefs {
+            view: "matrix".into(),
+            width: 1234,
+            height: 567,
+            maximized: true,
+            show_counts: false,
+            complete_later: false,
+            sunday_first: false,
+            background: false,
+            lists_by_name: false,
+            list_order: vec!["/b/".into(), "/a/".into()],
+            list_icons: [("/a/".to_string(), "flask".to_string())].into(),
+            archived: vec!["/a/".into(), "/b/".into()],
+            remember_list: false,
+            default_priority: 2,
+            read_dates: false,
+            projects_dir: "/srv".into(),
+            work_command: "true".into(),
+            sidebar: Some(vec!["today".into()]),
+            plan: vec![PlanSlot {
+                uid: "abc".into(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(),
+                start: 540,
+                duration: 30,
+            }],
+            day_zoom: 100.0,
+            views: [("today".to_string(), ViewOpts::default())].into(),
+            ..Prefs::default()
+        };
+        let table: Vec<(PrefPatch, Prefs, bool)> = vec![
+            (
+                PrefPatch::ReadDates(true),
+                Prefs {
+                    read_dates: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::DefaultPriority(4),
+                Prefs {
+                    default_priority: 4,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::RememberList(true),
+                Prefs {
+                    remember_list: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::CompleteLater(true),
+                Prefs {
+                    complete_later: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::SundayFirst(true),
+                Prefs {
+                    sunday_first: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::Background(true),
+                Prefs {
+                    background: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::ShowCounts(true),
+                Prefs {
+                    show_counts: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::ListsByName(true),
+                Prefs {
+                    lists_by_name: true,
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::Unarchive("/a/".into()),
+                Prefs {
+                    archived: vec!["/b/".into()],
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::SidebarViews(vec![Nav::Inbox, Nav::Day]),
+                Prefs {
+                    sidebar: Some(vec!["inbox".into(), "day".into()]),
+                    ..base.clone()
+                },
+                true,
+            ),
+            (
+                PrefPatch::ProjectsDir("~/code".into()),
+                Prefs {
+                    projects_dir: "~/code".into(),
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                PrefPatch::WorkCommand("echo {dir}".into()),
+                Prefs {
+                    work_command: "echo {dir}".into(),
+                    ..base.clone()
+                },
+                false,
+            ),
+        ];
+        for (patch, expected, redraws) in table {
+            let mut p = base.clone();
+            patch.apply(&mut p);
+            assert_ne!(p, base, "{patch:?} changed nothing");
+            assert_eq!(p, expected, "{patch:?} touched more than its field");
+            assert_eq!(patch.redraws(), redraws, "{patch:?}");
+        }
     }
 }

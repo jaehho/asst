@@ -2,7 +2,7 @@
 //! often it checks, where linked notes are), how the window behaves, and
 //! which views the sidebar shows in what order.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use relm4::adw::prelude::*;
 use relm4::gtk::{self, gdk, glib};
 
 use crate::model::{self, Nav};
-use crate::prefs::Prefs;
+use crate::prefs::{PrefPatch, Prefs};
 use crate::window::{Msg, Tx};
 use crate::{autostart, pickers};
 
@@ -26,8 +26,9 @@ pub struct Ctx {
     pub page: Option<&'static str>,
 }
 
-/// Sets one of the window's preferences from a switch.
-type SetPref = Box<dyn Fn(&mut Prefs, bool)>;
+/// Sends one change to the window, which applies it to its own `Prefs`. The
+/// dialog's copy (`Ctx::prefs`) only says what the controls start at.
+type Patch = Rc<dyn Fn(PrefPatch)>;
 
 const INTERVALS: [(u64, &str); 5] = [
     (30, "Every 30 seconds"),
@@ -43,13 +44,12 @@ const VIEW_PREFIX: &str = "asst-view:";
 pub fn open(parent: &impl IsA<gtk::Widget>, ctx: Ctx, tx: Tx) {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_search_enabled(false);
-    let prefs = Rc::new(RefCell::new(ctx.prefs.clone()));
-    let save: Rc<dyn Fn()> = {
-        let (prefs, tx) = (prefs.clone(), tx.clone());
-        Rc::new(move || tx.emit(Msg::SetPrefs(Box::new(prefs.borrow().clone()))))
+    let patch: Patch = {
+        let tx = tx.clone();
+        Rc::new(move |p| tx.emit(Msg::PatchPrefs(p)))
     };
-    dialog.add(&general_page(&dialog, &ctx, &tx, &prefs, &save));
-    dialog.add(&sidebar_page(&ctx.lists, &prefs, &save));
+    dialog.add(&general_page(&dialog, &ctx, &tx, &patch));
+    dialog.add(&sidebar_page(&ctx.lists, &ctx.prefs, &patch));
     if let Some(page) = ctx.page {
         dialog.set_visible_page_name(page);
     }
@@ -59,20 +59,16 @@ pub fn open(parent: &impl IsA<gtk::Widget>, ctx: Ctx, tx: Tx) {
 fn switch_row(
     (title, subtitle): (&str, &str),
     on: bool,
-    prefs: &Rc<RefCell<Prefs>>,
-    save: &Rc<dyn Fn()>,
-    set: SetPref,
+    patch: &Patch,
+    make: fn(bool) -> PrefPatch,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title(title)
         .subtitle(subtitle)
         .active(on)
         .build();
-    let (prefs, save) = (prefs.clone(), save.clone());
-    row.connect_active_notify(move |r| {
-        set(&mut prefs.borrow_mut(), r.is_active());
-        save();
-    });
+    let patch = patch.clone();
+    row.connect_active_notify(move |r| patch(make(r.is_active())));
     row
 }
 
@@ -80,8 +76,7 @@ fn general_page(
     dialog: &adw::PreferencesDialog,
     ctx: &Ctx,
     tx: &Tx,
-    prefs: &Rc<RefCell<Prefs>>,
-    save: &Rc<dyn Fn()>,
+    patch: &Patch,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("General")
@@ -240,7 +235,7 @@ fn general_page(
     }
 
     // -- the window's own
-    let p = prefs.borrow().clone();
+    let p = &ctx.prefs;
     let adding = adw::PreferencesGroup::builder().title("New Tasks").build();
     adding.add(&switch_row(
         (
@@ -248,9 +243,8 @@ fn general_page(
             "Words like “tomorrow 5pm” or “every monday” set the date; off, they stay in the title",
         ),
         p.read_dates,
-        prefs,
-        save,
-        Box::new(|p, on| p.read_dates = on),
+        patch,
+        PrefPatch::ReadDates,
     ));
     let names: Vec<&str> = (1..=4).map(model::priority_name).collect();
     let priority = adw::ComboRow::builder()
@@ -260,10 +254,9 @@ fn general_page(
         .selected(u32::from(p.default_priority.clamp(1, 4) - 1))
         .build();
     {
-        let (prefs, save) = (prefs.clone(), save.clone());
+        let patch = patch.clone();
         priority.connect_selected_notify(move |c| {
-            prefs.borrow_mut().default_priority = c.selected() as u8 + 1;
-            save();
+            patch(PrefPatch::DefaultPriority(c.selected() as u8 + 1));
         });
     }
     adding.add(&priority);
@@ -273,9 +266,8 @@ fn general_page(
             "Start in the list the last task went to, instead of the inbox",
         ),
         p.remember_list,
-        prefs,
-        save,
-        Box::new(|p, on| p.remember_list = on),
+        patch,
+        PrefPatch::RememberList,
     ));
     page.add(&adding);
 
@@ -286,55 +278,46 @@ fn general_page(
             "A checked task is struck through first, so a slip can be unchecked",
         ),
         p.complete_later,
-        prefs,
-        save,
-        Box::new(|p, on| p.complete_later = on),
+        patch,
+        PrefPatch::CompleteLater,
     ));
     window_group.add(&switch_row(
         ("Week starts on Sunday", "In the date picker"),
         p.sunday_first,
-        prefs,
-        save,
-        Box::new(|p, on| p.sunday_first = on),
+        patch,
+        PrefPatch::SundayFirst,
     ));
     page.add(&window_group);
-    page.add(&github_group(&p, prefs, save));
-    page.add(&background_group(dialog, p.background, prefs, save));
+    page.add(&github_group(p, patch));
+    page.add(&background_group(dialog, p.background, patch));
     page
 }
 
 /// Where checkouts are, and what Start work runs for a task's issue.
-fn github_group(
-    p: &Prefs,
-    prefs: &Rc<RefCell<Prefs>>,
-    save: &Rc<dyn Fn()>,
-) -> adw::PreferencesGroup {
+fn github_group(p: &Prefs, patch: &Patch) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("GitHub")
         .description("For tasks in lists linked to a repo (asst link)")
         .build();
-    let entry = |title: &str, text: &str, set: fn(&mut Prefs, String)| {
+    let entry = |title: &str, text: &str, make: fn(String) -> PrefPatch| {
         let row = adw::EntryRow::builder()
             .title(title)
             .text(text)
             .show_apply_button(true)
             .build();
-        let (prefs, save) = (prefs.clone(), save.clone());
-        row.connect_apply(move |e| {
-            set(&mut prefs.borrow_mut(), e.text().trim().to_string());
-            save();
-        });
+        let patch = patch.clone();
+        row.connect_apply(move |e| patch(make(e.text().trim().to_string())));
         row
     };
     group.add(&entry(
         "Projects folder (a checkout per repo, named for it)",
         &p.projects_dir,
-        |p, v| p.projects_dir = v,
+        PrefPatch::ProjectsDir,
     ));
     group.add(&entry(
         "Start work runs ({dir} {number} {repo} {url})",
         &p.work_command,
-        |p, v| p.work_command = v,
+        PrefPatch::WorkCommand,
     ));
     group
 }
@@ -456,19 +439,16 @@ fn snooze_group(
 }
 
 /// Lists put away, each with a way back.
-fn archived_group(
-    lists: &[ListView],
-    prefs: &Rc<RefCell<Prefs>>,
-    save: &Rc<dyn Fn()>,
-) -> adw::PreferencesGroup {
+fn archived_group(lists: &[ListView], prefs: &Prefs, patch: &Patch) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Archived Lists")
         .description("Out of the sidebar, the views and the counts. They still sync, and their reminders still ring.")
         .build();
     let archived: Vec<&ListView> = lists
         .iter()
-        .filter(|l| prefs.borrow().is_archived(&l.href))
+        .filter(|l| prefs.is_archived(&l.href))
         .collect();
+    let left = Rc::new(Cell::new(archived.len()));
     let none = adw::ActionRow::builder()
         .title("None")
         .subtitle("Archive a list from its menu")
@@ -481,15 +461,15 @@ fn archived_group(
         row.add_prefix(&crate::ui::list_mark(l, 16));
         let restore = gtk::Button::with_label("Unarchive");
         restore.set_valign(gtk::Align::Center);
-        let (prefs, save, href) = (prefs.clone(), save.clone(), l.href.clone());
+        let (patch, href, left) = (patch.clone(), l.href.clone(), left.clone());
         let (row_weak, none) = (row.downgrade(), none.clone());
         restore.connect_clicked(move |_| {
-            prefs.borrow_mut().archived.retain(|h| *h != href);
-            save();
+            patch(PrefPatch::Unarchive(href.clone()));
             if let Some(row) = row_weak.upgrade() {
                 row.set_visible(false);
             }
-            none.set_visible(prefs.borrow().archived.is_empty());
+            left.set(left.get().saturating_sub(1));
+            none.set_visible(left.get() == 0);
         });
         row.add_suffix(&restore);
         group.add(&row);
@@ -501,8 +481,7 @@ fn archived_group(
 fn background_group(
     dialog: &adw::PreferencesDialog,
     on: bool,
-    prefs: &Rc<RefCell<Prefs>>,
-    save: &Rc<dyn Fn()>,
+    patch: &Patch,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Background")
@@ -514,9 +493,8 @@ fn background_group(
             "Keep asst in the tray when the window closes",
         ),
         on,
-        prefs,
-        save,
-        Box::new(|p, on| p.background = on),
+        patch,
+        PrefPatch::Background,
     );
     group.add(&background);
 
@@ -565,11 +543,7 @@ fn background_group(
 
 /// The sidebar page: every view with a switch, dragged into order;
 /// how lists are ordered, and the ones archived.
-fn sidebar_page(
-    lists: &[ListView],
-    prefs: &Rc<RefCell<Prefs>>,
-    save: &Rc<dyn Fn()>,
-) -> adw::PreferencesPage {
+fn sidebar_page(lists: &[ListView], prefs: &Prefs, patch: &Patch) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Sidebar")
         .name("sidebar")
@@ -577,30 +551,25 @@ fn sidebar_page(
         .build();
 
     let general = adw::PreferencesGroup::new();
-    let counts = prefs.borrow().show_counts;
     general.add(&switch_row(
         ("Show task counts", "Beside views and lists"),
-        counts,
-        prefs,
-        save,
-        Box::new(|p, on| p.show_counts = on),
+        prefs.show_counts,
+        patch,
+        PrefPatch::ShowCounts,
     ));
     let order = adw::ComboRow::builder()
         .title("Lists")
         .subtitle("Drag a list in the sidebar to move it")
         .model(&gtk::StringList::new(&["In the order dragged", "By name"]))
-        .selected(u32::from(prefs.borrow().lists_by_name))
+        .selected(u32::from(prefs.lists_by_name))
         .build();
     {
-        let (prefs, save) = (prefs.clone(), save.clone());
-        order.connect_selected_notify(move |c| {
-            prefs.borrow_mut().lists_by_name = c.selected() == 1;
-            save();
-        });
+        let patch = patch.clone();
+        order.connect_selected_notify(move |c| patch(PrefPatch::ListsByName(c.selected() == 1)));
     }
     general.add(&order);
     page.add(&general);
-    page.add(&archived_group(lists, prefs, save));
+    page.add(&archived_group(lists, prefs, patch));
 
     let group = adw::PreferencesGroup::builder()
         .title("Views")
@@ -614,7 +583,7 @@ fn sidebar_page(
     group.add(&listbox);
     page.add(&group);
 
-    let shown = prefs.borrow().sidebar_views();
+    let shown = prefs.sidebar_views();
     let mut order = shown.clone();
     order.extend(Nav::filters().into_iter().filter(|n| !shown.contains(n)));
 
@@ -622,8 +591,7 @@ fn sidebar_page(
     let rows: Rc<RefCell<Vec<ViewRow>>> = Rc::default();
     // The switched-on views, in the order the rows are in.
     let store: Rc<dyn Fn()> = {
-        let (listbox, rows, prefs, save) =
-            (listbox.clone(), rows.clone(), prefs.clone(), save.clone());
+        let (listbox, rows, patch) = (listbox.clone(), rows.clone(), patch.clone());
         Rc::new(move || {
             let visible: Vec<Nav> = {
                 let rows = rows.borrow();
@@ -641,8 +609,7 @@ fn sidebar_page(
                 }
                 out
             };
-            prefs.borrow_mut().set_sidebar_views(&visible);
-            save();
+            patch(PrefPatch::SidebarViews(visible));
         })
     };
 

@@ -28,7 +28,7 @@ use crate::editor::Editor;
 use crate::model::{self, Counts, Data, LinkEdit, Nav, Quadrant, Sort, ViewOpts};
 use crate::motion;
 use crate::pickers::{self, DateOpts};
-use crate::prefs::Prefs;
+use crate::prefs::{PrefPatch, Prefs};
 use crate::sidebar::{self, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
@@ -232,7 +232,8 @@ pub enum Msg {
     Preferences(Option<&'static str>),
     Shortcuts,
     About,
-    SetPrefs(Box<Prefs>),
+    /// One preference changed in the dialog (see `PrefPatch`).
+    PatchPrefs(PrefPatch),
     /// Take a view out of the sidebar.
     HideView(Nav),
     SetSidebar(Vec<Nav>),
@@ -1855,10 +1856,12 @@ impl Component for Window {
             }
             Msg::Shortcuts => dialogs::shortcuts(&w.window),
             Msg::About => dialogs::about(&w.window),
-            Msg::SetPrefs(prefs) => {
-                self.prefs = *prefs;
+            Msg::PatchPrefs(patch) => {
+                patch.apply(&mut self.prefs);
                 self.prefs.save();
-                self.shown = 0;
+                if patch.redraws() {
+                    self.shown = 0;
+                }
                 w.add_card
                     .set_defaults(self.prefs.default_priority, self.prefs.read_dates);
                 if self.prefs.background != w.tray.is_some() {
@@ -3854,6 +3857,22 @@ impl Window {
                     None => eprintln!("drive: no entry {title:?} in the dialog"),
                 }
             }
+            // `combo <title words>=<n>` picks the open dialog's combo row
+            // with that title, entry n counted from 0.
+            "combo" => {
+                let Some((title, n)) = arg.split_once('=') else {
+                    return;
+                };
+                let title = title.trim().to_lowercase();
+                let found = dialog_widget(w, |x| {
+                    x.downcast_ref::<adw::ComboRow>()
+                        .is_some_and(|r| r.title().to_lowercase().contains(&title))
+                });
+                match (found.and_downcast::<adw::ComboRow>(), n.trim().parse()) {
+                    (Some(r), Ok(n)) => r.set_selected(n),
+                    _ => eprintln!("drive: no combo {title:?} in the dialog"),
+                }
+            }
             "press" => {
                 let want = arg.trim().to_lowercase();
                 let found = dialog_widget(w, |x| {
@@ -3866,7 +3885,14 @@ impl Window {
                         if let Some(b) = x.downcast_ref::<gtk::Button>() {
                             b.emit_clicked();
                         } else if let Some(r) = x.downcast_ref::<adw::EntryRow>() {
-                            r.emit_by_name::<()>("entry-activated", &[]);
+                            // Enter on a row with an apply button applies it
+                            // and is not an `entry-activated`.
+                            let signal = if r.shows_apply_button() {
+                                "apply"
+                            } else {
+                                "entry-activated"
+                            };
+                            r.emit_by_name::<()>(signal, &[]);
                         } else if let Some(e) = x.downcast_ref::<gtk::Entry>() {
                             e.emit_activate();
                         }
