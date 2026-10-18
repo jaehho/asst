@@ -3,6 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::f64::consts::PI;
+use std::rc::Rc;
 
 use asst_core::api::ListView;
 use relm4::gtk::prelude::*;
@@ -436,6 +437,45 @@ pub fn tip(w: &impl IsA<gtk::Widget>, text: &str, keys: &str) {
         glib::markup_escape_text(text),
         glib::markup_escape_text(keys)
     )));
+}
+
+/// Scroll the view while something dragged over it nears its top or bottom
+/// edge, faster the nearer, so a task can be dragged past what's on screen.
+pub fn scroll_while_dragging(scroller: &gtk::ScrolledWindow) {
+    const EDGE: f64 = 56.0;
+    let speed = Rc::new(Cell::new(0.0));
+    let ticking: Rc<Cell<bool>> = Rc::default();
+    let motion = gtk::DropControllerMotion::new();
+    {
+        let (speed, ticking, scroller) = (speed.clone(), ticking.clone(), scroller.clone());
+        motion.connect_motion(move |_, _, y| {
+            let height = f64::from(scroller.height());
+            speed.set(if y < EDGE {
+                -(EDGE - y) / 3.0
+            } else if y > height - EDGE {
+                (y - (height - EDGE)) / 3.0
+            } else {
+                0.0
+            });
+            // A frame clock only while scrolling, not for the whole drag.
+            if speed.get() != 0.0 && !ticking.replace(true) {
+                let (speed, ticking) = (speed.clone(), ticking.clone());
+                scroller.add_tick_callback(move |s, _| {
+                    let step = speed.get();
+                    let adj = s.vadjustment();
+                    let before = adj.value();
+                    adj.set_value(before + step);
+                    if step == 0.0 || adj.value() == before {
+                        ticking.set(false);
+                        return glib::ControlFlow::Break;
+                    }
+                    glib::ControlFlow::Continue
+                });
+            }
+        });
+    }
+    motion.connect_leave(move |_| speed.set(0.0));
+    scroller.add_controller(motion);
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ use crate::model::{self, Counts, Data, LinkEdit, Nav, Quadrant, Sort, ViewOpts};
 use crate::motion;
 use crate::pickers::{self, DateOpts};
 use crate::prefs::{PrefPatch, Prefs};
-use crate::sidebar::{self, Sidebar};
+use crate::sidebar::{self, Reach, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
 use crate::{client, dialogs, find, plan, settings};
@@ -38,6 +38,10 @@ pub type Tx = relm4::Sender<Msg>;
 
 /// How long a repeating task's new date stays lit (`.due-chip.rolled`).
 const ROLLED_MS: u32 = 1200;
+
+/// Seconds an Undo for a change to the sidebar stays on screen: long enough
+/// to read where the view can be added back.
+const UNDO_SECS: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
@@ -178,6 +182,10 @@ pub enum Msg {
     PlanCarry,
     /// Fold the tray's No date section open or shut.
     ToggleNoDate,
+    /// The keyboard came to this task's row (Tab, a click): the cursor goes
+    /// there, so the keys that act on the cursor task act on what has the
+    /// focus.
+    CursorTo(String),
     /// Take a carry back.
     PlanUncarry(model::Carried),
     /// A new task, and whether the add card was left with it typed.
@@ -209,10 +217,17 @@ pub enum Msg {
     /// A list's completed tasks, or every list's: ask first.
     AskDeleteCompleted(Option<String>),
     DeleteCompleted(Option<String>),
-    /// Lists dragged into a new order (hrefs, top to bottom).
+    /// Lists dragged into a new order (hrefs, top to bottom): the ones on
+    /// show trade the places they held, the others keep theirs.
     ReorderLists(Vec<String>),
+    /// Sort A-Z, once; the Undo is `SetListOrder`.
+    SortLists,
+    /// Put back an order as it was saved, and whether it was by name.
+    SetListOrder(Vec<String>, bool),
     /// Put a list away, or bring it back.
     Archive(String, bool),
+    /// New tasks go to this list from now on (`config.toml`'s `inbox`).
+    UseAsInbox(String),
     /// A list's open tasks to the clipboard, as Markdown.
     CopyList(String),
     /// A task's iCalendar object, to a file.
@@ -234,15 +249,25 @@ pub enum Msg {
     QuickFind,
     /// Go to where a task lives and open it.
     Reveal(String),
-    /// On the page named, or the first.
-    Preferences(Option<&'static str>),
+    Preferences,
     Shortcuts,
     About,
     /// One preference changed in the dialog (see `PrefPatch`).
     PatchPrefs(PrefPatch),
     /// Take a view out of the sidebar.
     HideView(Nav),
-    SetSidebar(Vec<Nav>),
+    /// Put a view in the sidebar, at the place given (clamped) else last.
+    ShowView(Nav, Option<usize>),
+    /// A tile earlier (negative) or later in the sidebar.
+    MoveView(Nav, i32),
+    /// Back to the default sidebar.
+    ResetSidebar,
+    /// The sidebar as it was, as saved (`None`: the default): the Undo of
+    /// the migration to Inbox and Day, and of a reset.
+    RestoreSidebar(Option<Vec<String>>),
+    /// The saved sidebar, replaced on load by Inbox and Day (see
+    /// `Prefs::migrated_from`), now that there is a window to say so in.
+    SidebarMigrated(Vec<String>),
     SetSettings(Box<SettingsChange>),
     SignIn(String),
     SignOut,
@@ -295,11 +320,17 @@ pub enum Key {
     Today,
     Tomorrow,
     NextWeek,
-    PrevView,
-    NextView,
+    /// Go `i32` places (1 or -1) on in the walk, wrapping: `[ ]` through the
+    /// tiles, `{ }` through the lists, Ctrl+PgUp/PgDn through both.
+    Step(Walk, i32),
     Sync,
     Select,
     Escape,
+    /// Move the keyboard among the sidebar's tiles and rows (`j`, `k`, the
+    /// arrows, `g`, `G`), while it is in the sidebar.
+    Reach(Reach),
+    /// Esc in the sidebar: back to the task column.
+    ToColumn,
     NewList,
     Shortcuts,
     Preferences,
@@ -315,7 +346,19 @@ pub enum Nav0 {
     Inbox,
     Today,
     Scheduled,
+    /// The Nth shown tile (Alt+N), counting from 0.
+    Tile(usize),
+    /// The Nth shown list (Ctrl+N), counting from 0.
     List(usize),
+}
+
+/// What a step key goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    Tiles,
+    Lists,
+    /// The tiles, then the lists.
+    Both,
 }
 
 pub struct Loaded {
@@ -347,6 +390,11 @@ pub enum Cmd {
     LoginDone(bool, String),
     LoginUrl(client::Result<String>),
     Settings(client::Result<Settings>),
+    /// The daemon's settings for Preferences, which opens with them.
+    Preferences(client::Result<Settings>),
+    /// The daemon refused a change to its settings: why, and the settings
+    /// it has.
+    Refused(String, Option<Settings>),
     Toast(client::Result<String>),
     /// A list was deleted on the server: its href, and what to say.
     ListDeleted(String, client::Result<String>),
@@ -355,8 +403,9 @@ pub enum Cmd {
     Added(bool, client::Result<Added>),
     Opened(client::Result<TaskView>),
     /// The icon a list just made is to have, and the list.
-    /// A task the snooze chooser is for, as the daemon has it.
-    SnoozeAsk(String, client::Result<TaskView>),
+    /// A task the snooze chooser is for, as the daemon has it, and the
+    /// lengths of the Snooze buttons it has now.
+    SnoozeAsk(String, client::Result<TaskView>, Option<Vec<u64>>),
     /// The new list's icon, the list, and what became of its GitHub tie
     /// (a sentence to toast, or why not).
     ListSaved(
@@ -458,8 +507,9 @@ pub struct Window {
     dirty: bool,
     shown: u64,
     pending_d: Option<Instant>,
-    /// The day-plan toast on screen or waiting, which the next one replaces.
-    plan_toast: Option<adw::Toast>,
+    /// The toast for the last change to the window's own state (plan,
+    /// sidebar, archive), on screen or waiting, which the next one replaces.
+    edit_toast: Option<adw::Toast>,
     last_focus_sync: Option<Instant>,
     signing_in: Option<String>,
     sign_in_error: Option<String>,
@@ -480,6 +530,11 @@ pub struct Widgets {
     sidebar: Rc<Sidebar>,
     header_title: gtk::Label,
     stack: gtk::Stack,
+    /// The task column's scroller. Entering a view, and leaving the add
+    /// card, put the keyboard here: on the column but on no button in it,
+    /// as the first focusable child (Day's Carry, say) would take Space
+    /// and Enter.
+    scroller: gtk::ScrolledWindow,
     clamp: adw::Clamp,
     rows: Vec<(String, gtk::Widget)>,
     editor: Rc<Editor>,
@@ -495,6 +550,9 @@ pub struct Widgets {
     more_button: gtk::MenuButton,
     /// Up while running in the background.
     tray: Option<Rc<Tray>>,
+    /// The Preferences dialog last opened, to say in it what the daemon
+    /// refused.
+    preferences: Option<settings::Open>,
     /// Set once what was waiting has been sent, so the window can go.
     quitting: Rc<Cell<bool>>,
 }
@@ -659,7 +717,15 @@ impl Component for Window {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let tx: Tx = sender.input_sender().clone();
-        let prefs = Prefs::load();
+        let mut prefs = Prefs::load();
+        // A migration is saved at once, with the old file kept beside it:
+        // else `schema` is never stored and every launch would do it again.
+        // (`init_root` and quick add load the file too, and never save.)
+        let migrated = prefs.migrated_from.take();
+        if migrated.is_some() {
+            Prefs::back_up_v0();
+            prefs.save();
+        }
 
         // -- sidebar
         let status: Rc<RefCell<Option<StatusView>>> = Rc::default();
@@ -714,7 +780,7 @@ impl Component for Window {
                 .vadjustment()
                 .connect_value_changed(move |a| title_revealer.set_reveal_child(a.value() > 48.0));
         }
-        scroll_while_dragging(&scroller);
+        ui::scroll_while_dragging(&scroller);
         // A click on the column's background closes the open task. Rows,
         // buttons and fields do their own thing (another row opens instead).
         {
@@ -730,6 +796,29 @@ impl Component for Window {
                 }
             });
             scroller.add_controller(click);
+        }
+
+        // Entering a view leaves the keyboard on the scroller, and a scrolled
+        // window answers Tab there by moving on past its column: send it in.
+        {
+            let keys = gtk::EventControllerKey::new();
+            let clamp = clamp.clone();
+            keys.connect_key_pressed(move |c, key, _, state| {
+                let plain = !state.intersects(
+                    gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::ALT_MASK,
+                );
+                if key == gdk::Key::Tab
+                    && plain
+                    && c.widget().is_some_and(|w| w.is_focus())
+                    && clamp.child_focus(gtk::DirectionType::TabForward)
+                {
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            scroller.add_controller(keys);
         }
 
         let error_page = adw::StatusPage::builder()
@@ -1001,7 +1090,7 @@ impl Component for Window {
                 .drop_on_shutdown()
         });
 
-        let nav = Nav::from_key(&prefs.view).unwrap_or(Nav::Today);
+        let nav = Nav::from_key(&prefs.view).unwrap_or(Nav::Inbox);
         let mut model = Window {
             nav,
             lists: Vec::new(),
@@ -1039,7 +1128,7 @@ impl Component for Window {
             dirty: false,
             shown: 0,
             pending_d: None,
-            plan_toast: None,
+            edit_toast: None,
             last_focus_sync: None,
             signing_in: None,
             sign_in_error: None,
@@ -1051,6 +1140,7 @@ impl Component for Window {
             sidebar,
             header_title,
             stack,
+            scroller,
             clamp,
             rows: Vec::new(),
             editor,
@@ -1063,8 +1153,20 @@ impl Component for Window {
             view_button,
             more_button,
             tray,
+            preferences: None,
             quitting,
         };
+        if let Some(old) = migrated {
+            // Said when the window first shows, not at login in the tray,
+            // where ten seconds go by with nobody looking.
+            let old = Cell::new(Some(old));
+            let tx = tx.clone();
+            widgets.window.connect_map(move |_| {
+                if let Some(old) = old.take() {
+                    tx.emit(Msg::SidebarMigrated(old));
+                }
+            });
+        }
         model.reload(&sender);
         sender.oneshot_command(async { Cmd::Settings(client::settings().await) });
         ComponentParts { model, widgets }
@@ -1097,6 +1199,21 @@ impl Component for Window {
                 self.no_date_open = !self.no_date_open;
                 self.shown = 0;
             }
+            Msg::CursorTo(href) => {
+                // Painted here, as a walk with the keys paints it: nothing
+                // rebuilds for a move of the cursor.
+                if self.cursor.as_ref() != Some(&href) && w.rows.iter().any(|(h, _)| *h == href) {
+                    for (h, row) in &w.rows {
+                        if *h == href {
+                            row.add_css_class("cursor");
+                        } else {
+                            row.remove_css_class("cursor");
+                        }
+                    }
+                    self.cursor = Some(href);
+                }
+                return;
+            }
             Msg::Zoom(px, hold) => {
                 self.prefs.day_zoom = model::clamp_px_per_hour(px);
                 self.prefs.save();
@@ -1111,6 +1228,7 @@ impl Component for Window {
                 self.shown = 0;
             }
             Msg::Navigate(nav) => {
+                let nav = model::canonical_nav(nav, &self.lists);
                 if nav != self.nav {
                     self.nav = nav;
                     self.prefs.view = self.nav.key();
@@ -1135,7 +1253,7 @@ impl Component for Window {
                 if w.outer.is_collapsed() {
                     w.outer.set_show_sidebar(false);
                 }
-                w.clamp.grab_focus();
+                w.scroller.grab_focus();
             }
             Msg::ToggleSidebar => w.outer.set_show_sidebar(!w.outer.shows_sidebar()),
             Msg::Refresh => self.reload(&sender),
@@ -1359,9 +1477,9 @@ impl Component for Window {
                     }
                     Nav::Completed => sender.input(Msg::Complete(href)),
                     // Dropped on Day: give it the next free half hour
-                    // on the day the view is showing.
+                    // on the plan's day.
                     Nav::Day => {
-                        let day = self.day_day;
+                        let day = self.plan_day();
                         let start = self
                             .prefs
                             .plan
@@ -1394,7 +1512,7 @@ impl Component for Window {
                 });
             }
             Msg::PlanSet(href, start, duration) => {
-                let day = self.day_day;
+                let day = self.plan_day();
                 let prior = self.plan_slot(&href, day);
                 let Some(t) = self.find(&href).cloned() else {
                     return;
@@ -1434,7 +1552,7 @@ impl Component for Window {
                             tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
-                    self.plan_toast(w, toast);
+                    self.edit_toast(w, toast);
                 }
             }
             Msg::PlanNudge(href, start, duration) => {
@@ -1468,7 +1586,7 @@ impl Component for Window {
                             tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
-                    self.plan_toast(w, toast);
+                    self.edit_toast(w, toast);
                 }
             }
             Msg::PlanCarry => {
@@ -1497,7 +1615,7 @@ impl Component for Window {
                         tx.emit(Msg::PlanUncarry(carried.clone()));
                     });
                 }
-                self.plan_toast(w, toast);
+                self.edit_toast(w, toast);
             }
             Msg::PlanUncarry(carried) => {
                 model::uncarry(&mut self.prefs.plan, &carried);
@@ -1545,7 +1663,7 @@ impl Component for Window {
                 });
             }
             Msg::HideAdd => {
-                w.clamp.grab_focus();
+                w.scroller.grab_focus();
                 let card = w
                     .add_card
                     .root
@@ -1622,7 +1740,7 @@ impl Component for Window {
                     return;
                 };
                 if self.prefs.work_command.trim().is_empty() {
-                    toast(w, "Set what Start work runs in Preferences → GitHub");
+                    toast(w, "Set what Start work runs in Preferences → More options");
                     return;
                 }
                 let home = std::env::var("HOME").unwrap_or_default();
@@ -1631,7 +1749,7 @@ impl Component for Window {
                     toast(
                         w,
                         &format!(
-                            "No checkout of {repo} at {} (Preferences → GitHub)",
+                            "No checkout of {repo} at {} (Preferences → More options)",
                             dir.display()
                         ),
                     );
@@ -1740,7 +1858,7 @@ impl Component for Window {
                     .map(|l| l.name.clone())
                     .unwrap_or_default();
                 if self.nav == Nav::List(href.clone()) {
-                    self.nav = Nav::Today;
+                    self.nav = self.prefs.home();
                 }
                 sender.oneshot_command(async move {
                     let said = client::delete_list(&href)
@@ -1786,7 +1904,26 @@ impl Component for Window {
                 });
             }
             Msg::ReorderLists(order) => {
+                let shown = self.shown_list_hrefs();
+                self.prefs.reorder_lists(&self.lists, &shown, &order);
+                self.prefs.save();
+            }
+            Msg::SortLists => {
+                let (order, by_name) = (self.prefs.list_order.clone(), self.prefs.lists_by_name);
+                let shown = self.prefs.sidebar_lists(&self.lists, &self.nav);
+                self.prefs.sort_lists_by_name(&self.lists, &shown);
+                self.prefs.save();
+                self.undo_toast(
+                    w,
+                    &tx,
+                    "Lists sorted A-Z.",
+                    Msg::SetListOrder(order, by_name),
+                    6,
+                );
+            }
+            Msg::SetListOrder(order, by_name) => {
                 self.prefs.list_order = order;
+                self.prefs.lists_by_name = by_name;
                 self.prefs.save();
             }
             Msg::Archive(href, on) => {
@@ -1798,22 +1935,54 @@ impl Component for Window {
                 else {
                     return;
                 };
-                self.prefs.archived.retain(|h| *h != href);
-                if on {
-                    self.prefs.archived.push(href.clone());
+                if !self.prefs.set_archived(&href, on, &self.lists) {
+                    toast(
+                        w,
+                        &format!("New tasks go to {}, so it can't be archived", quoted(&name)),
+                    );
+                    return;
                 }
                 self.prefs.save();
-                let undo = adw::Toast::builder()
-                    .title(glib::markup_escape_text(&format!(
-                        "{} {}",
-                        if on { "Archived" } else { "Unarchived" },
-                        quoted(&name)
-                    )))
-                    .button_label("Undo")
-                    .timeout(4)
-                    .build();
-                undo.connect_button_clicked(move |_| tx.emit(Msg::Archive(href.clone(), !on)));
-                w.toasts.add_toast(undo);
+                // The card stops offering it, or starts again.
+                w.add_card
+                    .set_lists(&self.lists, &self.prefs.archived, self.prefs.sunday_first);
+                // Said where it went, since the row is gone from the lists.
+                let text = if on {
+                    format!("Archived {}. Find it under Hidden lists.", quoted(&name))
+                } else {
+                    format!("Unarchived {}.", quoted(&name))
+                };
+                self.undo_toast(w, &tx, &text, Msg::Archive(href, !on), UNDO_SECS);
+            }
+            Msg::UseAsInbox(href) => {
+                let Some(name) = self
+                    .lists
+                    .iter()
+                    .find(|l| l.href == href && l.writable && !l.inbox)
+                    .map(|l| l.name.clone())
+                else {
+                    return;
+                };
+                // What the Undo sends: the config's own value, so a default
+                // inbox goes back to being the default.
+                let before = match &self.settings {
+                    Some(s) => s.inbox.clone(),
+                    None => model::inbox(&self.lists).map(|l| l.name.clone()),
+                };
+                let change = |inbox: Option<String>| {
+                    Box::new(SettingsChange {
+                        inbox: Some(inbox),
+                        ..SettingsChange::default()
+                    })
+                };
+                self.undo_toast(
+                    w,
+                    &tx,
+                    &format!("{} is now the Inbox.", quoted(&name)),
+                    Msg::SetSettings(change(before)),
+                    6,
+                );
+                tx.emit(Msg::SetSettings(change(Some(name))));
             }
             Msg::CopyList(href) => {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
@@ -1860,7 +2029,8 @@ impl Component for Window {
             Msg::SnoozePrompt(href) => {
                 sender.oneshot_command(async move {
                     let task = client::get(&href).await;
-                    Cmd::SnoozeAsk(href, task)
+                    let buttons = client::settings().await.ok().map(|s| s.snooze);
+                    Cmd::SnoozeAsk(href, task, buttons)
                 });
             }
             Msg::ThemeChanged => {
@@ -1878,6 +2048,7 @@ impl Component for Window {
                     &self.lists,
                     &self.visible_open(),
                     &self.prefs,
+                    &self.nav,
                     "",
                     tx.clone(),
                 );
@@ -1885,7 +2056,7 @@ impl Component for Window {
             Msg::Reveal(href) => {
                 if let Some(t) = self.find(&href).cloned() {
                     self.close_editor(w, &sender);
-                    self.nav = Nav::List(t.list.clone());
+                    self.nav = model::canonical_nav(Nav::List(t.list.clone()), &self.lists);
                     self.prefs.view = self.nav.key();
                     if self.adding.take().is_some() {
                         let _ = w.add_card.save_draft();
@@ -1901,18 +2072,18 @@ impl Component for Window {
                     sender.oneshot_command(async move { Cmd::Opened(client::get(&href).await) });
                 }
             }
-            Msg::Preferences(page) => {
-                settings::open(
-                    &w.window,
-                    settings::Ctx {
-                        settings: self.settings.clone(),
-                        lists: self.lists.clone(),
-                        status: w.status.clone(),
-                        prefs: self.prefs.clone(),
-                        page,
-                    },
-                    tx.clone(),
-                );
+            Msg::Preferences => {
+                if w.preferences.as_ref().is_some_and(settings::Open::is_up) {
+                    return;
+                }
+                // What the daemon has now, not what this window last heard;
+                // one that is slow to answer must not hold the dialog back.
+                sender.oneshot_command(async {
+                    let fresh = tokio::time::timeout(Duration::from_secs(2), client::settings())
+                        .await
+                        .unwrap_or_else(|_| Err("asstd isn't answering".into()));
+                    Cmd::Preferences(fresh)
+                });
             }
             Msg::Shortcuts => dialogs::shortcuts(&w.window),
             Msg::About => dialogs::about(&w.window),
@@ -1932,27 +2103,61 @@ impl Component for Window {
                 }
             }
             Msg::HideView(nav) => {
-                let before = self.prefs.sidebar_views();
-                let mut views = before.clone();
-                views.retain(|n| *n != nav);
-                self.prefs.set_sidebar_views(&views);
+                let Some(at) = self.prefs.hide_view(&nav) else {
+                    return;
+                };
                 self.prefs.save();
-                let undo = adw::Toast::builder()
-                    .title(format!("Took {} out of the sidebar", nav.title(&[])))
-                    .button_label("Undo")
-                    .timeout(4)
-                    .build();
-                let tx = tx.clone();
-                undo.connect_button_clicked(move |_| tx.emit(Msg::SetSidebar(before.clone())));
-                w.toasts.add_toast(undo);
+                // Its Undo puts back this view alone, at the place it had.
+                self.undo_toast(
+                    w,
+                    &tx,
+                    &format!(
+                        "{} hidden. Right-click a tile to add it back.",
+                        nav.title(&[])
+                    ),
+                    Msg::ShowView(nav, Some(at)),
+                    UNDO_SECS,
+                );
             }
-            Msg::SetSidebar(views) => {
-                self.prefs.set_sidebar_views(&views);
+            Msg::ShowView(nav, at) => {
+                self.prefs.show_view(nav, at);
                 self.prefs.save();
+            }
+            Msg::MoveView(nav, by) => {
+                self.prefs.move_view(&nav, by);
+                self.prefs.save();
+            }
+            Msg::ResetSidebar => {
+                let old = self.prefs.reset_sidebar();
+                self.prefs.save();
+                self.undo_toast(
+                    w,
+                    &tx,
+                    "Sidebar reset to Inbox and Day.",
+                    Msg::RestoreSidebar(old),
+                    UNDO_SECS,
+                );
+            }
+            Msg::RestoreSidebar(keys) => {
+                self.prefs.sidebar = keys;
+                self.prefs.save();
+            }
+            Msg::SidebarMigrated(old) => {
+                self.undo_toast(
+                    w,
+                    &tx,
+                    "Sidebar now shows Inbox and Day.",
+                    Msg::RestoreSidebar(Some(old)),
+                    10,
+                );
             }
             Msg::SetSettings(change) => {
                 sender.oneshot_command(async move {
-                    Cmd::Settings(client::set_settings(&change).await)
+                    match client::set_settings(&change).await {
+                        Ok(s) => Cmd::Settings(Ok(s)),
+                        // What it has now, for the controls to go back to.
+                        Err(e) => Cmd::Refused(e, client::settings().await.ok()),
+                    }
                 });
             }
             Msg::SignIn(server) => {
@@ -2036,11 +2241,17 @@ impl Component for Window {
                         self.status = Some(l.status);
                         self.links = l.links;
                         self.settle();
-                        w.add_card.set_lists(&self.lists, self.prefs.sunday_first);
+                        w.add_card.set_lists(
+                            &self.lists,
+                            &self.prefs.archived,
+                            self.prefs.sunday_first,
+                        );
+                        // The view saved on quitting may be the inbox list.
+                        self.nav = model::canonical_nav(self.nav.clone(), &self.lists);
                         if let Nav::List(href) = &self.nav
                             && !self.lists.iter().any(|x| &x.href == href)
                         {
-                            self.nav = Nav::Today;
+                            self.nav = self.prefs.home();
                         }
                     }
                     Err(e) => self.error = Some(e),
@@ -2108,15 +2319,50 @@ impl Component for Window {
                 }
             },
             Cmd::Settings(result) => match result {
-                Ok(s) => {
-                    self.settings = Some(s);
-                }
+                Ok(s) => self.take_settings(s, &sender),
                 Err(e) => {
                     if self.settings.is_some() {
                         toast(w, &e);
                     }
                 }
             },
+            Cmd::Preferences(result) => {
+                // Asked twice before the first answer: one dialog.
+                if w.preferences.as_ref().is_some_and(settings::Open::is_up) {
+                    return;
+                }
+                // Unanswered, the dialog opens on the last copy.
+                if let Ok(s) = result {
+                    self.take_settings(s, &sender);
+                }
+                w.preferences = Some(settings::open(
+                    &w.window,
+                    settings::Ctx {
+                        settings: self.settings.clone(),
+                        status: w.status.clone(),
+                        prefs: self.prefs.clone(),
+                        linked: !self.links.is_empty(),
+                    },
+                    tx.clone(),
+                ));
+            }
+            Cmd::Refused(why, daemon) => {
+                if let Some(s) = daemon {
+                    self.take_settings(s, &sender);
+                }
+                let said = w
+                    .preferences
+                    .as_ref()
+                    .is_some_and(|p| p.refused(&why, self.settings.as_ref()));
+                if !said {
+                    // The change it answers may have a toast saying it
+                    // happened.
+                    if let Some(last) = self.edit_toast.take() {
+                        last.dismiss();
+                    }
+                    toast(w, &why);
+                }
+            }
             Cmd::Toast(result) => match result {
                 Ok(text) if !text.is_empty() => toast(w, &text),
                 Ok(_) => {}
@@ -2239,7 +2485,7 @@ impl Component for Window {
                     }
                     if !self.in_view(&href) {
                         self.close_editor(w, &sender);
-                        self.nav = Nav::List(t.list.clone());
+                        self.nav = model::canonical_nav(Nav::List(t.list.clone()), &self.lists);
                         self.prefs.view = self.nav.key();
                         if !t.task.is_open() {
                             let mut opts = self.prefs.view_opts(&self.nav);
@@ -2272,10 +2518,14 @@ impl Component for Window {
                     Err(e) => toast(w, &e),
                 }
             }
-            Cmd::SnoozeAsk(href, result) => match result {
+            Cmd::SnoozeAsk(href, result, buttons) => match result {
                 Ok(t) if t.task.is_open() => {
+                    let buttons = buttons
+                        .or_else(|| self.settings.as_ref().map(|s| s.snooze.clone()))
+                        .unwrap_or_else(|| asst_core::config::DEFAULT_SNOOZE.to_vec());
                     crate::snooze::present(
                         &t.task.summary,
+                        &buttons,
                         Box::new(move |at, done| {
                             let href = href.clone();
                             client::call(async move { client::snooze(&href, at).await }, done);
@@ -2361,16 +2611,11 @@ impl Window {
     /// first and archived ones after, and tasks not deleted a moment ago
     /// nor in an archived list, unless it is the list on view.
     fn view_data(&self) -> (Vec<ListView>, Vec<TaskView>, Option<Vec<TaskView>>) {
-        let mut lists = self.prefs.arrange(&self.lists);
-        lists.extend(
-            self.lists
-                .iter()
-                .filter(|l| self.prefs.is_archived(&l.href))
-                .cloned(),
-        );
+        let lists = self.ordered_lists();
         let kept = |t: &&TaskView| {
             !self.hidden.contains(&t.href)
-                && (!self.prefs.is_archived(&t.list) || self.nav == Nav::List(t.list.clone()))
+                && (!self.prefs.is_archived(&t.list, &self.lists)
+                    || self.nav == Nav::List(t.list.clone()))
         };
         let open = self.open.iter().filter(kept).cloned().collect();
         let completed = self
@@ -2378,6 +2623,28 @@ impl Window {
             .as_ref()
             .map(|c| c.iter().filter(kept).cloned().collect());
         (lists, open, completed)
+    }
+
+    /// The sidebar's lists in its order, the archived ones after.
+    fn ordered_lists(&self) -> Vec<ListView> {
+        let mut lists = self.prefs.arrange(&self.lists);
+        lists.extend(
+            self.lists
+                .iter()
+                .filter(|l| self.prefs.is_archived(&l.href, &self.lists))
+                .cloned(),
+        );
+        lists
+    }
+
+    /// `ordered_lists` less the archived ones, but for the list on view: a
+    /// task there can stay in it, and its menu and title need it.
+    fn view_pickable(&self) -> Vec<ListView> {
+        let on_view = match &self.nav {
+            Nav::List(href) => Some(href.as_str()),
+            _ => None,
+        };
+        model::pickable_lists(&self.ordered_lists(), &self.prefs.archived, on_view)
     }
 
     /// Open tasks, but for those deleted a moment ago.
@@ -2416,6 +2683,21 @@ impl Window {
 
     fn needs_completed(&self) -> bool {
         self.nav == Nav::Completed || self.prefs.view_opts(&self.nav).show_completed
+    }
+
+    /// The daemon's settings as it has them now.
+    fn take_settings(&mut self, s: Settings, sender: &ComponentSender<Self>) {
+        // Another list is the inbox: the Inbox view, its tile's list and
+        // the add card's chip are all of the old one until the lists are
+        // read again.
+        let moved = self
+            .settings
+            .as_ref()
+            .is_some_and(|old| old.inbox != s.inbox);
+        self.settings = Some(s);
+        if moved {
+            self.reload(sender);
+        }
     }
 
     fn reload(&mut self, sender: &ComponentSender<Self>) {
@@ -2598,7 +2880,8 @@ impl Window {
             gtk::prelude::GtkWindowExt::set_focus(&w.window, None::<&gtk::Widget>);
         }
         w.editor.fold();
-        w.editor.show(&t, &self.lists, self.prefs.sunday_first);
+        w.editor
+            .show(&t, &self.pickable(Some(&t.list)), self.prefs.sunday_first);
         self.editing = Some(href);
         self.expand = true;
         self.refocus = Refocus::Editor;
@@ -2850,7 +3133,7 @@ impl Window {
 
     /// The view is a list that was archived.
     fn nav_archived(&self) -> bool {
-        matches!(&self.nav, Nav::List(h) if self.prefs.is_archived(h))
+        matches!(&self.nav, Nav::List(h) if self.prefs.is_archived(h, &self.lists))
     }
 
     /// The list a view shows, for a list or the inbox.
@@ -2867,6 +3150,17 @@ impl Window {
         self.find(href).cloned()
     }
 
+    /// The day a task is put on the plan for: the day the Day view is
+    /// stepped to while it is on screen, else today. `day_day` is kept when
+    /// Day is left, so elsewhere it is a day nobody is looking at.
+    fn plan_day(&self) -> NaiveDate {
+        if self.nav == Nav::Day {
+            self.day_day
+        } else {
+            self.now().date_naive()
+        }
+    }
+
     /// Today's planned slot for `href`, for an undo toast to hold.
     fn plan_slot(&self, href: &str, date: NaiveDate) -> Option<(u32, u32)> {
         let t = self.find(href)?;
@@ -2877,25 +3171,55 @@ impl Window {
             .map(|s| (s.start, s.duration))
     }
 
-    /// Shows a day-plan toast in place of the last one, so a run of drags
-    /// leaves one Undo on screen, not a queue of them to wait out. Only the
-    /// plan's own: dismissing the others would send a held delete early.
-    fn plan_toast(&mut self, w: &Widgets, toast: adw::Toast) {
-        if let Some(last) = self.plan_toast.replace(toast.clone()) {
+    /// Shows the toast for a change to the window's own state (the day plan,
+    /// the sidebar, an archive) in place of the last such toast, so a run of
+    /// drags or hides leaves one Undo on screen, not a queue of them to wait
+    /// out. Only these: dismissing the others would send a held delete early.
+    fn edit_toast(&mut self, w: &Widgets, toast: adw::Toast) {
+        if let Some(last) = self.edit_toast.replace(toast.clone()) {
             last.dismiss();
         }
         w.toasts.add_toast(toast);
     }
 
+    /// An `edit_toast` whose Undo sends `undo`, which puts back that change
+    /// and no other.
+    fn undo_toast(&mut self, w: &Widgets, tx: &Tx, text: &str, undo: Msg, secs: u32) {
+        let toast = adw::Toast::builder()
+            .title(glib::markup_escape_text(text))
+            .button_label("Undo")
+            .timeout(secs)
+            .build();
+        let (tx, undo) = (tx.clone(), Cell::new(Some(undo)));
+        toast.connect_button_clicked(move |_| {
+            if let Some(undo) = undo.take() {
+                tx.emit(undo);
+            }
+        });
+        self.edit_toast(w, toast);
+    }
+
+    /// The lists a task can go to: not the archived ones, but for the list
+    /// that holds the task (see `model::pickable_lists`).
+    fn pickable(&self, holding: Option<&str>) -> Vec<ListView> {
+        model::pickable_lists(&self.lists, &self.prefs.archived, holding)
+    }
+
+    /// The lists with a row in the sidebar, top to bottom.
+    fn shown_list_hrefs(&self) -> Vec<String> {
+        self.prefs
+            .sidebar_lists(&self.lists, &self.nav)
+            .into_iter()
+            .map(|l| l.href)
+            .collect()
+    }
+
     fn nav_order(&self) -> Vec<Nav> {
-        let mut navs = self.prefs.sidebar_views();
-        navs.extend(
-            self.prefs
-                .arrange(&self.lists)
-                .into_iter()
-                .map(|l| Nav::List(l.href)),
-        );
-        navs
+        model::cycle_order(
+            &self.prefs.sidebar_views(),
+            &self.prefs.sidebar_lists(&self.lists, &self.nav),
+            &self.lists,
+        )
     }
 
     fn key(&mut self, w: &mut Widgets, key: Key, sender: &ComponentSender<Self>) {
@@ -2936,7 +3260,7 @@ impl Window {
             Key::Sync => sender.input(Msg::SyncNow),
             Key::NewList => sender.input(Msg::NewList),
             Key::Shortcuts => sender.input(Msg::Shortcuts),
-            Key::Preferences => sender.input(Msg::Preferences(None)),
+            Key::Preferences => sender.input(Msg::Preferences),
             Key::Sidebar => sender.input(Msg::ToggleSidebar),
             Key::Close => sender.input(Msg::CloseWindow),
             Key::Quit => sender.input(Msg::Quit),
@@ -2951,24 +3275,38 @@ impl Window {
                     w.add_card.leave();
                 }
             }
-            Key::PrevView | Key::NextView => {
-                let order = self.nav_order();
-                if order.is_empty() {
-                    return;
+            Key::Reach(to) => w.sidebar.reach(to),
+            Key::ToColumn => {
+                // An overlaid sidebar would otherwise stay over the column.
+                if w.outer.is_collapsed() {
+                    w.outer.set_show_sidebar(false);
                 }
-                let at = order.iter().position(|n| *n == self.nav).unwrap_or(0) as i32;
-                let step = if matches!(key, Key::NextView) { 1 } else { -1 };
-                let next = (at + step).rem_euclid(order.len() as i32) as usize;
-                sender.input(Msg::Navigate(order[next].clone()));
+                w.scroller.grab_focus();
+            }
+            Key::Step(walk, step) => {
+                let next = match walk {
+                    Walk::Tiles => model::tile_cycle(&self.prefs.sidebar_views(), &self.nav, step),
+                    Walk::Lists => model::list_cycle(
+                        &self.prefs.sidebar_lists(&self.lists, &self.nav),
+                        &self.lists,
+                        &self.nav,
+                        step,
+                    ),
+                    Walk::Both => model::cycle_from(&self.nav_order(), &self.nav, step),
+                };
+                if let Some(nav) = next {
+                    sender.input(Msg::Navigate(nav));
+                }
             }
             Key::Go(target) => {
                 let nav = match target {
                     Nav0::Inbox => Some(Nav::Inbox),
                     Nav0::Today => Some(Nav::Today),
                     Nav0::Scheduled => Some(Nav::Scheduled),
+                    Nav0::Tile(i) => self.prefs.sidebar_views().get(i).cloned(),
                     Nav0::List(i) => self
                         .prefs
-                        .arrange(&self.lists)
+                        .sidebar_lists(&self.lists, &self.nav)
                         .get(i)
                         .map(|l| Nav::List(l.href.clone())),
                 };
@@ -3036,14 +3374,14 @@ impl Window {
                 }
             }
             Key::PlanPlace => {
-                // The task under the cursor goes on the plan of the day the
-                // Day view is on (today, unless stepped): at its own time,
-                // else the first free slot. Any view will do, so a task can
-                // be planned from the Inbox without a trip to Day.
+                // The task under the cursor goes on the plan of the day on
+                // view (today, away from Day): at its own time, else the
+                // first free slot. Any view will do, so a task can be
+                // planned from the Inbox without a trip to Day.
                 let Some(t) = self.cursor_task().filter(|t| t.task.is_open()) else {
                     return;
                 };
-                let day = self.day_day;
+                let day = self.plan_day();
                 if let Some((start, _)) = self.plan_slot(&t.href, day) {
                     let said = format!(
                         "{} is already planned at {}",
@@ -3054,7 +3392,7 @@ impl Window {
                         .title(glib::markup_escape_text(&said))
                         .timeout(3)
                         .build();
-                    self.plan_toast(w, toast);
+                    self.edit_toast(w, toast);
                     return;
                 }
                 let start = model::place_start(&t.task, &self.prefs.plan, day, self.now());
@@ -3141,9 +3479,13 @@ impl Window {
                 today: counts.today - counts.overdue,
             });
         }
+        let split = self.prefs.split_lists(&self.lists, &self.nav);
         w.sidebar.update(&sidebar::State {
             nav: &self.nav,
-            lists: &self.prefs.arrange(&self.lists),
+            lists: &split.shown,
+            hidden: &split.hidden,
+            finished: self.prefs.finished_count(&self.lists, &self.nav),
+            inbox: model::inbox(&self.lists).map(|l| l.href.as_str()),
             counts: &counts,
             status: self.status.as_ref(),
             prefs: &self.prefs,
@@ -3181,8 +3523,16 @@ impl Window {
 
         let opts = self.prefs.view_opts(&self.nav);
         CURRENT_VIEW.with(|c| *c.borrow_mut() = Some((self.nav.clone(), opts.clone())));
-        CURRENT_LISTS.with(|c| *c.borrow_mut() = lists.clone());
-        CURRENT_ARCHIVED.with(|c| *c.borrow_mut() = self.prefs.archived.clone());
+        let pickable = self.view_pickable();
+        CURRENT_LISTS.with(|c| *c.borrow_mut() = pickable.clone());
+        CURRENT_ARCHIVED.with(|c| {
+            *c.borrow_mut() = self
+                .lists
+                .iter()
+                .filter(|l| self.prefs.is_archived(&l.href, &self.lists))
+                .map(|l| l.href.clone())
+                .collect();
+        });
         let sections = model::plan(&self.nav, &data, &opts, now);
         let typing = self.editing.is_some() && w.editor.typing();
 
@@ -3190,7 +3540,8 @@ impl Window {
         // view (done elsewhere, moved, filtered out, deleted).
         if let Some(href) = self.editing.clone() {
             if let Some(t) = self.find(&href).cloned() {
-                w.editor.show(&t, &self.lists, self.prefs.sunday_first);
+                w.editor
+                    .show(&t, &self.pickable(Some(&t.list)), self.prefs.sunday_first);
             }
             let here = sections
                 .iter()
@@ -3230,7 +3581,15 @@ impl Window {
             comp.sort();
             comp.hash(&mut h);
             for l in &self.lists {
-                (&l.href, &l.name, &l.color).hash(&mut h);
+                (&l.href, &l.name, &l.color, l.inbox).hash(&mut h);
+            }
+            // An empty list says whether anything was ever done in it.
+            if let Nav::List(href) = &self.nav {
+                self.lists
+                    .iter()
+                    .find(|l| &l.href == href)
+                    .map(|l| (l.open == 0, l.done > 0))
+                    .hash(&mut h);
             }
             // Day's chips come from `blocks` and the window's slots, not
             // from task sections.
@@ -3328,7 +3687,7 @@ impl Window {
                 &sections,
                 &Opts {
                     nav: &self.nav,
-                    lists: &self.lists,
+                    lists: &pickable,
                     blocks: &self.blocks,
                     plan: &day,
                     no_date_open: self.no_date_open,
@@ -3349,6 +3708,14 @@ impl Window {
                 &w.add_card.root,
                 &tx,
             );
+            // The cursor follows the keyboard: the row that takes the focus
+            // (Tab, a click) is the task Space and the task letters act on.
+            for (href, row) in &built.rows {
+                let follow = gtk::EventControllerFocus::new();
+                let (tx, href) = (tx.clone(), href.clone());
+                follow.connect_enter(move |_| tx.emit(Msg::CursorTo(href.clone())));
+                row.add_controller(follow);
+            }
             // The pin is for this rebuild only.
             self.zoom_hold = None;
             w.clamp.set_child(Some(&built.root));
@@ -3454,6 +3821,10 @@ impl Window {
             crate::devel::visible_toast(w.toasts.upcast_ref()).as_deref(),
             self.cursor.as_deref(),
             self.no_date_open,
+            crate::devel::DumpCounts::new(
+                &Counts::new(&data, &self.prefs.plan, now),
+                &self.prefs.sidebar_views(),
+            ),
         );
         let json = crate::devel::dump_json(&state);
         if path.is_empty() {
@@ -3467,15 +3838,20 @@ impl Window {
     /// `menu <words>`, `popup date|list|link|priority|reminders|menu|view|more`,
     /// `popdown`, `search <text>` and `searchfocus` (the open popover's search field),
     /// `title <text>`, `notes <text>`, `add`, `type <text>`,
-    /// `submit`, `select <words>`, `prefs [sidebar]`, `hide <view>`, `find [text]`,
+    /// `submit`, `select <words>`, `prefs`, `hide <view>`, `show <view>`,
+    /// `tile-menu <view>`, `lists-menu` (the sidebar's `...`), `sort-lists`,
+    /// `hidden-lists` (the Hidden lists row),
+    /// `undo` (the toast's button), `find [text]`,
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
     /// `clear [list]` (asks), `clear! [list]`, `archive <list>`, `unarchive <list>`,
+    /// `inbox <list>` (Use as Inbox), `list-menu <list>` (its sidebar row's),
     /// `delete-list <list>` (asks), `delete-list! <list>`,
     /// `order <list>,<list>`, `opts sort=name|desc=true|due=week|hide=<list>|reset`,
     /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
     /// `plan <words> at HH:MM [minutes]`, `planoff <words>`,
     /// `planghost <words> at HH:MM [minutes]`, `planghostoff`,
+    /// `dropview <words> on <view>` (a task dropped on a sidebar tile),
     /// `daystep ±N` (the view's day cursor), `daytoday`, `nodate` (the tray's
     /// No date section, open or shut).
     fn drive(&mut self, w: &mut Widgets, sender: &ComponentSender<Self>, command: &str) {
@@ -3508,6 +3884,16 @@ impl Window {
                     sender.input(Msg::Archive(h, verb == "archive"));
                 }
             }
+            "inbox" => {
+                if let Some(h) = list(arg) {
+                    sender.input(Msg::UseAsInbox(h));
+                }
+            }
+            // A list row's menu, as its right-click opens it.
+            "list-menu" => match list(arg) {
+                Some(h) => w.sidebar.open_list_menu(&h),
+                None => eprintln!("drive: no list {arg:?}"),
+            },
             "delete-list" | "delete-list!" => {
                 if let Some(h) = list(arg) {
                     if verb == "delete-list" {
@@ -3517,10 +3903,18 @@ impl Window {
                     }
                 }
             }
+            // The named lists first, the rest of those on show after them.
             "order" => {
-                let order: Vec<String> = arg.split(',').filter_map(list).collect();
+                let mut order: Vec<String> = arg.split(',').filter_map(list).collect();
+                let rest: Vec<String> = self
+                    .shown_list_hrefs()
+                    .into_iter()
+                    .filter(|h| !order.contains(h))
+                    .collect();
+                order.extend(rest);
                 sender.input(Msg::ReorderLists(order));
             }
+            "sort-lists" => sender.input(Msg::SortLists),
             "opts" => {
                 let mut opts = self.prefs.view_opts(&self.nav);
                 match arg.split_once('=') {
@@ -3607,6 +4001,15 @@ impl Window {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(model::PLAN_DEFAULT_DURATION);
                 sender.input(Msg::PlanSet(h, start, duration));
+            }
+            // A task dropped on a view's tile in the sidebar.
+            "dropview" => {
+                if let Some((words, view)) = arg.split_once(" on ")
+                    && let Some(h) = task(words)
+                    && let Some(nav) = Nav::from_key(view.trim())
+                {
+                    sender.input(Msg::DropTask(h, nav));
+                }
             }
             // The Day view's Carry button.
             "carry" => sender.input(Msg::PlanCarry),
@@ -3721,7 +4124,7 @@ impl Window {
                 let tx: Tx = sender.input_sender().clone();
                 let menu = crate::row::task_menu(
                     &t,
-                    &self.lists,
+                    &self.view_pickable(),
                     self.now(),
                     self.prefs.sunday_first,
                     row.upcast_ref(),
@@ -3838,10 +4241,31 @@ impl Window {
             "title" => w.editor.type_title(arg),
             "notes" => w.editor.type_notes(arg),
             "close" => sender.input(Msg::CloseEditor),
-            "prefs" => sender.input(Msg::Preferences((arg == "sidebar").then_some("sidebar"))),
+            "prefs" => sender.input(Msg::Preferences),
             "hide" => {
                 if let Some(n) = Nav::from_key(arg) {
                     sender.input(Msg::HideView(n));
+                }
+            }
+            "show" => {
+                if let Some(n) = Nav::from_key(arg) {
+                    sender.input(Msg::ShowView(n, None));
+                }
+            }
+            // The `...` menu by the Lists heading; `pick` then chooses a row.
+            "lists-menu" => w.sidebar.open_lists_menu(),
+            // A click on the Hidden lists row.
+            "hidden-lists" => w.sidebar.toggle_hidden(),
+            // A tile's menu, as its right-click opens it; `pick` then
+            // chooses a row.
+            "tile-menu" => match Nav::from_key(arg) {
+                Some(n) => w.sidebar.open_tile_menu(&n),
+                None => eprintln!("drive: no view {arg:?}"),
+            },
+            // The Undo of the toast on screen.
+            "undo" => {
+                if !crate::devel::press_toast_button(w.toasts.upcast_ref()) {
+                    eprintln!("drive: no toast with a button");
                 }
             }
             "unfocus" => gtk::prelude::GtkWindowExt::set_focus(&w.window, None::<&gtk::Widget>),
@@ -3866,6 +4290,16 @@ impl Window {
                 }
                 if let Some(s) = arg.parse::<usize>().ok().and_then(|n| switches.get(n)) {
                     s.set_active(!s.is_active());
+                }
+            }
+            // Unfold the dialog's More options (its rows are not mapped
+            // until then, so `texts` does not list them).
+            "expand" => {
+                match dialog_widget(w, |x| x.is::<adw::ExpanderRow>())
+                    .and_downcast::<adw::ExpanderRow>()
+                {
+                    Some(row) => row.set_expanded(true),
+                    None => eprintln!("drive: no expander in the dialog"),
                 }
             }
             // What the compositor's close does.
@@ -3915,15 +4349,22 @@ impl Window {
             // What has the keyboard, to window.log.
             "focus" => {
                 let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
+                let inside =
+                    |root: &gtk::Widget| focus.as_ref().is_some_and(|f| f.is_ancestor(root));
+                // The row the focus is on or in, by its task's href.
+                let row = focus.as_ref().and_then(|f| {
+                    w.rows
+                        .iter()
+                        .find(|(_, r)| f == r || f.is_ancestor(r))
+                        .map(|(h, _)| h.rsplit('/').next().unwrap_or(h).to_string())
+                });
                 eprintln!(
-                    "focus: {:?} in editor: {} in add card: {}",
+                    "focus: {:?} in editor: {} in add card: {} in column: {} row: {row:?} sidebar: {:?}",
                     focus.as_ref().map(|f| f.type_().name()),
-                    focus
-                        .as_ref()
-                        .is_some_and(|f| f.is_ancestor(&w.editor.root)),
-                    focus
-                        .as_ref()
-                        .is_some_and(|f| f.is_ancestor(&w.add_card.root)),
+                    inside(w.editor.root.upcast_ref()),
+                    inside(w.add_card.root.upcast_ref()),
+                    inside(w.scroller.upcast_ref()),
+                    w.sidebar.focused(),
                 );
             }
             // A click on the column's background at a point in the window.
@@ -3943,6 +4384,7 @@ impl Window {
                 &self.lists,
                 &self.visible_open(),
                 &self.prefs,
+                &self.nav,
                 arg,
                 sender.input_sender().clone(),
             ),
@@ -4305,45 +4747,6 @@ fn more_menu(tx: Tx) -> gtk::Popover {
     sidebar::list_menu(list, archived, &tx, true)
 }
 
-/// Scroll the view while something dragged over it nears its top or bottom
-/// edge, faster the nearer, so a task can be dragged past what's on screen.
-fn scroll_while_dragging(scroller: &gtk::ScrolledWindow) {
-    const EDGE: f64 = 56.0;
-    let speed = Rc::new(Cell::new(0.0));
-    let ticking: Rc<Cell<bool>> = Rc::default();
-    let motion = gtk::DropControllerMotion::new();
-    {
-        let (speed, ticking, scroller) = (speed.clone(), ticking.clone(), scroller.clone());
-        motion.connect_motion(move |_, _, y| {
-            let height = f64::from(scroller.height());
-            speed.set(if y < EDGE {
-                -(EDGE - y) / 3.0
-            } else if y > height - EDGE {
-                (y - (height - EDGE)) / 3.0
-            } else {
-                0.0
-            });
-            // A frame clock only while scrolling, not for the whole drag.
-            if speed.get() != 0.0 && !ticking.replace(true) {
-                let (speed, ticking) = (speed.clone(), ticking.clone());
-                scroller.add_tick_callback(move |s, _| {
-                    let step = speed.get();
-                    let adj = s.vadjustment();
-                    let before = adj.value();
-                    adj.set_value(before + step);
-                    if step == 0.0 || adj.value() == before {
-                        ticking.set(false);
-                        return glib::ControlFlow::Break;
-                    }
-                    glib::ControlFlow::Continue
-                });
-            }
-        });
-    }
-    motion.connect_leave(move |_| speed.set(0.0));
-    scroller.add_controller(motion);
-}
-
 /// Where the add card puts a task in `nav` when the text says nothing else.
 /// Day adds to the day on view, to the inbox like any dated task.
 fn add_target(nav: &Nav, inbox: Option<&str>, today: NaiveDate, viewed: NaiveDate) -> Target {
@@ -4429,13 +4832,28 @@ fn vim_key(key: gdk::Key) -> Option<Key> {
         gdk::Key::t => Key::Today,
         gdk::Key::m => Key::Tomorrow,
         gdk::Key::w => Key::NextWeek,
-        gdk::Key::bracketleft | gdk::Key::H => Key::PrevView,
-        gdk::Key::bracketright | gdk::Key::L => Key::NextView,
+        gdk::Key::bracketleft | gdk::Key::H => Key::Step(Walk::Tiles, -1),
+        gdk::Key::bracketright | gdk::Key::L => Key::Step(Walk::Tiles, 1),
+        gdk::Key::braceleft => Key::Step(Walk::Lists, -1),
+        gdk::Key::braceright => Key::Step(Walk::Lists, 1),
         gdk::Key::s => Key::Sync,
         gdk::Key::v => Key::Select,
         gdk::Key::p => Key::NewList,
         gdk::Key::question | gdk::Key::F1 => Key::Shortcuts,
         gdk::Key::Escape => Key::Escape,
+        _ => return None,
+    })
+}
+
+/// What a key does with the keyboard in the sidebar, instead of what it
+/// does in the task column. Left and Right stay the tiles' own.
+fn sidebar_key(key: gdk::Key) -> Option<Key> {
+    Some(match key {
+        gdk::Key::j | gdk::Key::Down => Key::Reach(Reach::Next),
+        gdk::Key::k | gdk::Key::Up => Key::Reach(Reach::Prev),
+        gdk::Key::g | gdk::Key::Home => Key::Reach(Reach::First),
+        gdk::Key::G | gdk::Key::End => Key::Reach(Reach::Last),
+        gdk::Key::Escape => Key::ToColumn,
         _ => return None,
     })
 }
@@ -4465,11 +4883,12 @@ fn acts_on_task(key: Key) -> bool {
         | Key::Find
         | Key::ZoomIn
         | Key::ZoomOut
-        | Key::PrevView
-        | Key::NextView
+        | Key::Step(..)
         | Key::Sync
         | Key::Select
         | Key::Escape
+        | Key::Reach(_)
+        | Key::ToColumn
         | Key::NewList
         | Key::Shortcuts
         | Key::Preferences
@@ -4493,6 +4912,42 @@ fn routes_to_tasks(scope: Scope, key: gdk::Key) -> bool {
     }
 }
 
+/// The place a digit key stands for, counting from 0: `1` is the first,
+/// `9` the ninth.
+fn digit_index(key: gdk::Key) -> Option<usize> {
+    key.to_unicode()
+        .and_then(|c| c.to_digit(10))
+        .filter(|d| (1..=9).contains(d))
+        .map(|d| d as usize - 1)
+}
+
+/// The chords that act wherever the keyboard is, in a field too: Ctrl keys,
+/// and Alt+N for the Nth tile. Hyprland only binds Super+Alt+digit, so the
+/// window gets the Alt ones.
+fn chord(key: gdk::Key, state: gdk::ModifierType) -> Option<Key> {
+    if state.contains(gdk::ModifierType::CONTROL_MASK) {
+        return match key {
+            gdk::Key::f => Some(Key::Find),
+            gdk::Key::i => Some(Key::Go(Nav0::Inbox)),
+            gdk::Key::t => Some(Key::Go(Nav0::Today)),
+            gdk::Key::u => Some(Key::Go(Nav0::Scheduled)),
+            gdk::Key::comma => Some(Key::Preferences),
+            gdk::Key::b => Some(Key::Sidebar),
+            gdk::Key::w => Some(Key::Close),
+            gdk::Key::q => Some(Key::Quit),
+            gdk::Key::Page_Up => Some(Key::Step(Walk::Both, -1)),
+            gdk::Key::Page_Down => Some(Key::Step(Walk::Both, 1)),
+            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(Key::ZoomIn),
+            gdk::Key::minus | gdk::Key::KP_Subtract => Some(Key::ZoomOut),
+            k => digit_index(k).map(|i| Key::Go(Nav0::List(i))),
+        };
+    }
+    if state.contains(gdk::ModifierType::ALT_MASK) {
+        return digit_index(key).map(|i| Key::Go(Nav0::Tile(i)));
+    }
+    None
+}
+
 /// Vim keys and shortcuts; typing in a field is left alone.
 fn key_action(
     window: &adw::ApplicationWindow,
@@ -4505,31 +4960,7 @@ fn key_action(
     if inside(adw::Dialog::static_type()) || inside(gtk::Popover::static_type()) {
         return glib::Propagation::Proceed;
     }
-    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-    let action = if ctrl {
-        match key {
-            gdk::Key::f => Some(Key::Find),
-            gdk::Key::i => Some(Key::Go(Nav0::Inbox)),
-            gdk::Key::t => Some(Key::Go(Nav0::Today)),
-            gdk::Key::u => Some(Key::Go(Nav0::Scheduled)),
-            gdk::Key::comma => Some(Key::Preferences),
-            gdk::Key::b => Some(Key::Sidebar),
-            gdk::Key::w => Some(Key::Close),
-            gdk::Key::q => Some(Key::Quit),
-            gdk::Key::Page_Up => Some(Key::PrevView),
-            gdk::Key::Page_Down => Some(Key::NextView),
-            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(Key::ZoomIn),
-            gdk::Key::minus | gdk::Key::KP_Subtract => Some(Key::ZoomOut),
-            k => k
-                .to_unicode()
-                .and_then(|c| c.to_digit(10))
-                .filter(|d| (1..=9).contains(d))
-                .map(|d| Key::Go(Nav0::List(d as usize - 1))),
-        }
-    } else {
-        None
-    };
-    if let Some(a) = action {
+    if let Some(a) = chord(key, state) {
         tx.emit(Msg::Key(a));
         return glib::Propagation::Stop;
     }
@@ -4545,12 +4976,19 @@ fn key_action(
         return glib::Propagation::Proceed;
     }
     // Outside a field, what is pasted becomes a task.
+    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
     if ctrl && matches!(key, gdk::Key::v | gdk::Key::V) {
         tx.emit(Msg::Key(Key::Paste));
         return glib::Propagation::Stop;
     }
     if ctrl || state.contains(gdk::ModifierType::ALT_MASK) {
         return glib::Propagation::Proceed;
+    }
+    if scope == Scope::Sidebar
+        && let Some(action) = sidebar_key(key)
+    {
+        tx.emit(Msg::Key(action));
+        return glib::Propagation::Stop;
     }
     if !routes_to_tasks(scope, key) {
         return glib::Propagation::Proceed;
@@ -4604,6 +5042,8 @@ mod tests {
             K::question,
             K::bracketleft,
             K::bracketright,
+            K::braceleft,
+            K::braceright,
             K::Escape,
         ];
         for scope in [Scope::Sidebar, Scope::Native] {
@@ -4618,6 +5058,97 @@ mod tests {
             assert!(routes_to_tasks(Scope::Content, key), "{key:?}");
             assert!(!routes_to_tasks(Scope::Typing, key), "{key:?}");
         }
+    }
+
+    #[test]
+    fn the_sidebar_walks_with_j_k_the_arrows_and_escape_leaves_it() {
+        use gdk::Key as K;
+        let reach = |key| match sidebar_key(key) {
+            Some(Key::Reach(to)) => Some(to),
+            _ => None,
+        };
+        // Up and Down are `j` and `k` here: the lists' own arrows stop at
+        // the ends of the list, and the tiles are a grid.
+        assert_eq!(reach(K::j), Some(Reach::Next));
+        assert_eq!(reach(K::Down), Some(Reach::Next));
+        assert_eq!(reach(K::k), Some(Reach::Prev));
+        assert_eq!(reach(K::Up), Some(Reach::Prev));
+        assert_eq!(reach(K::g), Some(Reach::First));
+        assert_eq!(reach(K::Home), Some(Reach::First));
+        assert_eq!(reach(K::G), Some(Reach::Last));
+        assert_eq!(reach(K::End), Some(Reach::Last));
+        assert!(matches!(sidebar_key(K::Escape), Some(Key::ToColumn)));
+        // The rest is the focused widget's (Space, Return, Left, Right,
+        // Delete) or the same as anywhere (the global letters).
+        for key in [
+            K::space,
+            K::Return,
+            K::Left,
+            K::Right,
+            K::Delete,
+            K::x,
+            K::s,
+            K::p,
+        ] {
+            assert!(sidebar_key(key).is_none(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn alt_digits_map_to_tile_index() {
+        use gdk::Key as K;
+        let (alt, ctrl) = (gdk::ModifierType::ALT_MASK, gdk::ModifierType::CONTROL_MASK);
+        let digits = [
+            K::_1,
+            K::_2,
+            K::_3,
+            K::_4,
+            K::_5,
+            K::_6,
+            K::_7,
+            K::_8,
+            K::_9,
+        ];
+        // Alt+N is the Nth tile and Ctrl+N the Nth list, counting from 0.
+        for (i, key) in digits.into_iter().enumerate() {
+            assert!(matches!(chord(key, alt), Some(Key::Go(Nav0::Tile(n))) if n == i));
+            assert!(matches!(chord(key, ctrl), Some(Key::Go(Nav0::List(n))) if n == i));
+            assert!(chord(key, gdk::ModifierType::empty()).is_none());
+        }
+        // Zero is no place; and a lock key held makes no difference.
+        assert!(chord(K::_0, alt).is_none());
+        assert!(matches!(
+            chord(K::_2, alt | gdk::ModifierType::LOCK_MASK),
+            Some(Key::Go(Nav0::Tile(1)))
+        ));
+        // Alt with a letter, or an arrow (it moves a focused tile), is the
+        // focused widget's.
+        for key in [K::i, K::Left, K::Right, K::bracketright] {
+            assert!(chord(key, alt).is_none(), "{key:?}");
+        }
+        // Ctrl+PgUp/PgDn walk the tiles then the lists; `[ ]` only the tiles
+        // and `{ }` only the lists.
+        assert!(matches!(
+            chord(K::Page_Down, ctrl),
+            Some(Key::Step(Walk::Both, 1))
+        ));
+        assert!(matches!(
+            chord(K::Page_Up, ctrl),
+            Some(Key::Step(Walk::Both, -1))
+        ));
+        assert!(matches!(
+            vim_key(K::bracketright),
+            Some(Key::Step(Walk::Tiles, 1))
+        ));
+        assert!(matches!(vim_key(K::H), Some(Key::Step(Walk::Tiles, -1))));
+        assert!(matches!(
+            vim_key(K::braceleft),
+            Some(Key::Step(Walk::Lists, -1))
+        ));
+        assert!(matches!(
+            vim_key(K::braceright),
+            Some(Key::Step(Walk::Lists, 1))
+        ));
     }
 
     #[test]

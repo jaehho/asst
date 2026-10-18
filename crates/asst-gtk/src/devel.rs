@@ -22,7 +22,7 @@ use relm4::adw::prelude::*;
 use relm4::gtk::{self, gio, glib, graphene};
 use serde::Serialize;
 
-use crate::model::{DayPlan, Kind, Nav, Section};
+use crate::model::{Counts, DayPlan, Kind, Nav, Section};
 use crate::window::{Msg, Tx};
 
 pub fn enabled() -> bool {
@@ -110,7 +110,8 @@ pub struct Shown {
     /// `window`, `dialog`, `popover` or `toplevel` (a window of its own):
     /// which root it was found under.
     pub root: &'static str,
-    /// `label`, `entry`, `text`, `button` or `icon`.
+    /// `label`, `entry`, `text`, `button`, `icon` or `tile` (a view's tile
+    /// in the sidebar, named by its title).
     pub kind: &'static str,
     /// The words (a button's own label, an entry's text, a label's text).
     pub text: String,
@@ -126,8 +127,9 @@ pub struct Shown {
     pub bounds: Option<[f32; 4]>,
 }
 
-/// Every mapped label, entry, text view, labelled or icon button and icon
-/// under `roots`, in tree order.
+/// Every mapped label, entry, text view, labelled or icon button (and a
+/// menu item that has a tooltip), icon, sidebar tile that has a tooltip and
+/// overdue dot (named by its tile) under `roots`, in tree order.
 pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
     let mut out = Vec::new();
     for (root, widget) in roots {
@@ -151,8 +153,14 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
             if let Some(l) = w.downcast_ref::<gtk::Label>() {
                 out.push(item("label", l.text().to_string(), None));
             } else if let Some(b) = w.downcast_ref::<gtk::Button>() {
-                let text = b.label().map(|t| t.to_string()).unwrap_or_default();
+                let mut text = b.label().map(|t| t.to_string()).unwrap_or_default();
                 let icon = b.icon_name().map(|i| i.to_string());
+                // A menu item is a button around a box: it has no label of
+                // its own, but a tooltip (why it is disabled) is worth
+                // seeing, so it is named by its first label.
+                if text.is_empty() && icon.is_none() && w.tooltip_text().is_some() {
+                    text = first_label(&w).unwrap_or_default();
+                }
                 if !text.is_empty() || icon.is_some() {
                     out.push(item("button", text, icon));
                 }
@@ -168,6 +176,14 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
                 let b = t.buffer();
                 let text = b.text(&b.start_iter(), &b.end_iter(), false);
                 out.push(item("text", text.to_string(), None));
+            } else if w.has_css_class("overdue-dot") {
+                // Named by the tile it sits on.
+                let tile = w.parent().and_then(|p| first_label(&p));
+                out.push(item("dot", tile.unwrap_or_default(), None));
+            } else if w.is::<gtk::FlowBoxChild>() && w.tooltip_text().is_some() {
+                // The keys a tile's tooltip names are worth asserting on.
+                let title = label_with_class(&w, "tile-title").unwrap_or_default();
+                out.push(item("tile", title, None));
             }
             // Last child first, so the stack pops them in tree order.
             let mut child = w.last_child();
@@ -178,6 +194,38 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
         }
     }
     out
+}
+
+/// The text of the first label under `w` that has the CSS class `class`.
+fn label_with_class(w: &gtk::Widget, class: &str) -> Option<String> {
+    if let Some(l) = w.downcast_ref::<gtk::Label>()
+        && l.has_css_class(class)
+    {
+        return Some(l.text().to_string());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(text) = label_with_class(&c, class) {
+            return Some(text);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// The text of the first label under `w`, in tree order.
+fn first_label(w: &gtk::Widget) -> Option<String> {
+    if let Some(l) = w.downcast_ref::<gtk::Label>() {
+        return Some(l.text().to_string());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(text) = first_label(&c) {
+            return Some(text);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 /// The JSON `texts` writes.
@@ -236,6 +284,31 @@ pub struct Dump {
     pub toast: Option<String>,
     /// The keyboard cursor's task.
     pub cursor: Option<String>,
+    pub counts: DumpCounts,
+}
+
+/// The sidebar's badges, before `show_counts` hides the numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DumpCounts {
+    pub inbox: usize,
+    pub today: usize,
+    pub overdue: usize,
+    /// Planned blocks plus the tray, for today (not for `day`).
+    pub day: usize,
+    /// The tile carrying the overdue dot, as a `Nav::key`.
+    pub dot: Option<String>,
+}
+
+impl DumpCounts {
+    pub fn new(counts: &Counts, shown: &[Nav]) -> DumpCounts {
+        DumpCounts {
+            inbox: counts.inbox,
+            today: counts.today,
+            overdue: counts.overdue,
+            day: counts.day,
+            dot: counts.dot_on(shown).map(|nav| nav.key()),
+        }
+    }
 }
 
 /// Section kind as a stable string for the dump.
@@ -266,6 +339,7 @@ pub fn build_dump(
     toast: Option<&str>,
     cursor: Option<&str>,
     no_date_open: bool,
+    counts: DumpCounts,
 ) -> Dump {
     let tray_row = |kind: &'static str| {
         move |t: &asst_core::api::TaskView| DumpRow {
@@ -327,6 +401,7 @@ pub fn build_dump(
         editor: editor.map(str::to_string),
         toast: toast.map(str::to_string),
         cursor: cursor.map(str::to_string),
+        counts,
     }
 }
 
@@ -360,15 +435,16 @@ pub(crate) fn visible_toast(overlay: &gtk::Widget) -> Option<String> {
     let mut stack = vec![overlay.clone()];
     while let Some(w) = stack.pop() {
         if w.type_().name() == "AdwToastWidget" {
-            let mut labels = vec![w.clone()];
-            while let Some(l) = labels.pop() {
+            // In tree order, so the title comes before the Undo button's.
+            let mut labels = std::collections::VecDeque::from([w.clone()]);
+            while let Some(l) = labels.pop_front() {
                 if let Some(text) = l.downcast_ref::<gtk::Label>() {
                     return Some(text.text().to_string());
                 }
                 let mut c = l.first_child();
                 while let Some(child) = c {
                     c = child.next_sibling();
-                    labels.push(child);
+                    labels.push_back(child);
                 }
             }
         }
@@ -379,6 +455,36 @@ pub(crate) fn visible_toast(overlay: &gtk::Widget) -> Option<String> {
         }
     }
     None
+}
+
+/// Press the button of the toast the overlay is showing (its Undo).
+/// Whether there was one.
+pub(crate) fn press_toast_button(overlay: &gtk::Widget) -> bool {
+    let mut stack = vec![overlay.clone()];
+    while let Some(w) = stack.pop() {
+        if w.type_().name() == "AdwToastWidget" {
+            let mut inside = vec![w.clone()];
+            while let Some(b) = inside.pop() {
+                if let Some(button) = b.downcast_ref::<gtk::Button>()
+                    && button.label().is_some_and(|l| !l.is_empty())
+                {
+                    button.emit_clicked();
+                    return true;
+                }
+                let mut c = b.first_child();
+                while let Some(child) = c {
+                    c = child.next_sibling();
+                    inside.push(child);
+                }
+            }
+        }
+        let mut c = w.first_child();
+        while let Some(child) = c {
+            c = child.next_sibling();
+            stack.push(child);
+        }
+    }
+    false
 }
 
 /// The part of `outer` that `inner` covers: the window's own background
@@ -516,8 +622,18 @@ mod tests {
             Some("Copied to the clipboard"),
             Some("/l/aa11.ics"),
             false,
+            DumpCounts::new(
+                &Counts {
+                    overdue: 1,
+                    day: 2,
+                    ..Counts::default()
+                },
+                &[Nav::Inbox, Nav::Day],
+            ),
         );
         let v: serde_json::Value = serde_json::from_str(&dump_json(&d)).unwrap();
+        assert_eq!(v["counts"]["day"], 2);
+        assert_eq!(v["counts"]["dot"], "day");
         assert_eq!(v["nav"], "today");
         assert_eq!(v["sidebar"], "today");
         assert_eq!(v["day"], "2026-10-09");
@@ -566,6 +682,7 @@ mod tests {
             None,
             None,
             false,
+            DumpCounts::default(),
         );
         let kinds: Vec<&str> = d.rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["plan", "tray"]);
@@ -584,6 +701,7 @@ mod tests {
             None,
             None,
             true,
+            DumpCounts::default(),
         );
         let kinds: Vec<&str> = d.rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["plan", "tray", "no-date"]);
@@ -613,6 +731,7 @@ mod tests {
             None,
             None,
             false,
+            DumpCounts::default(),
         );
         let v: serde_json::Value = serde_json::from_str(&dump_json(&d)).unwrap();
         assert!(v["editor"].is_null());

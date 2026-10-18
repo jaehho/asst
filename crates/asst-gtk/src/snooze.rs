@@ -1,10 +1,12 @@
 //! The snooze chooser (#20): when to ring a reminder again, for the times
 //! a notification's own Snooze buttons (10, 30, 60 min by default) don't
 //! cover. A reminder's `Snooze…` button asks the window for it
-//! (`snooze-task`). It is a small popup like quick add's: a layer surface
-//! over everything, so the window need not be showing, with a few presets
-//! and a field that reads `2h`, `45m`, `5pm` or `tomorrow 8am`.
+//! (`snooze-task`), after asstd has snoozed the first length, so closing
+//! the chooser keeps that. It is a small popup like quick add's: a layer
+//! surface over everything, so the window need not be showing, with a few
+//! presets and a field that reads `2h`, `45m`, `5pm` or `tomorrow 8am`.
 
+use asst_core::config::first_snooze;
 use asst_core::fmt;
 use asst_core::quickadd;
 use asst_core::time::{When, resolve};
@@ -31,9 +33,18 @@ pub struct Choice {
     pub at: DateTime<Utc>,
 }
 
+/// The waits offered as presets, in minutes.
+const WAITS: [(&str, u64); 3] = [
+    ("In 15 minutes", 15),
+    ("In 1 hour", 60),
+    ("In 3 hours", 180),
+];
+
 /// The presets from `now`, earliest first: soon, later today, then the next
-/// morning and the next Monday. Each one is a different moment.
-pub fn choices(now: DateTime<Tz>) -> Vec<Choice> {
+/// morning and the next Monday. Each one is a different moment, and none
+/// repeats a Snooze button (`buttons`, in minutes), which is one click
+/// from the notification.
+pub fn choices(now: DateTime<Tz>, buttons: &[u64]) -> Vec<Choice> {
     let zone = now.timezone();
     let today = now.date_naive();
     let at = |date: NaiveDate, hour: u32| {
@@ -42,15 +53,14 @@ pub fn choices(now: DateTime<Tz>) -> Vec<Choice> {
             date.and_time(NaiveTime::from_hms_opt(hour, 0, 0).expect("an hour")),
         )
     };
-    let from_now = |label: &str, d: Duration| Choice {
-        label: label.into(),
-        at: now.with_timezone(&Utc) + d,
-    };
-    let mut out = vec![
-        from_now("In 15 minutes", Duration::minutes(15)),
-        from_now("In 1 hour", Duration::hours(1)),
-        from_now("In 3 hours", Duration::hours(3)),
-    ];
+    let mut out: Vec<Choice> = WAITS
+        .iter()
+        .filter(|(_, m)| !buttons.contains(m))
+        .map(|(label, m)| Choice {
+            label: (*label).into(),
+            at: now.with_timezone(&Utc) + Duration::minutes(*m as i64),
+        })
+        .collect();
     // "This evening" only where it is not just another few hours.
     let evening = at(today, EVENING);
     if evening - now.with_timezone(&Utc) > Duration::hours(3) {
@@ -160,8 +170,19 @@ pub fn when_label(at: DateTime<Utc>, now: DateTime<Tz>) -> String {
 /// What choosing a time does: ask the daemon, and say how it went.
 pub type Pick = Box<dyn Fn(DateTime<Utc>, Box<dyn FnOnce(client::Result<()>)>)>;
 
-/// Open the chooser for the task named `title`.
-pub fn present(title: &str, pick: Pick) -> gtk::Window {
+/// What the chooser says under its title: the reminder is not lost, and
+/// Esc keeps the snooze `Snooze…` made before asking.
+fn hint(buttons: &[u64]) -> String {
+    format!(
+        "Snoozed {} already. Pick a time to change it, or press Esc to keep it.",
+        fmt::minutes(first_snooze(buttons))
+    )
+}
+
+/// Open the chooser for the task named `title`. `buttons` are the lengths
+/// (minutes) of the Snooze buttons its notification had: the presets leave
+/// them out, and the first is what asstd has snoozed the task for.
+pub fn present(title: &str, buttons: &[u64], pick: Pick) -> gtk::Window {
     crate::load_icons();
     let window = gtk::Window::builder()
         .title("Snooze")
@@ -194,6 +215,15 @@ pub fn present(title: &str, pick: Pick) -> gtk::Window {
         .build();
     heading.add_css_class("heading");
     card.append(&heading);
+    let hint = gtk::Label::builder()
+        .label(hint(buttons))
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(48)
+        .build();
+    hint.add_css_class("caption");
+    hint.add_css_class("dim-label");
+    card.append(&hint);
 
     let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
     status.add_css_class("caption");
@@ -225,8 +255,11 @@ pub fn present(title: &str, pick: Pick) -> gtk::Window {
         })
     };
 
+    let presets = choices(now, buttons);
+    // Enter on an empty field is the first preset, the soonest.
+    let soonest = presets.first().map(|c| c.at);
     let mut first: Option<gtk::Button> = None;
-    for choice in choices(now) {
+    for choice in presets {
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let label = gtk::Label::builder()
             .label(&choice.label)
@@ -274,7 +307,13 @@ pub fn present(title: &str, pick: Pick) -> gtk::Window {
     {
         let go = go.clone();
         entry.connect_activate(move |e| {
-            if let Some(at) = parse(&e.text(), pickers::now()) {
+            let text = e.text();
+            let at = if text.trim().is_empty() {
+                soonest
+            } else {
+                parse(&text, pickers::now())
+            };
+            if let Some(at) = at {
                 go(at);
             }
         });
@@ -322,7 +361,7 @@ mod tests {
     #[test]
     fn presets_are_different_moments_in_order() {
         let labels = |now| {
-            choices(now)
+            choices(now, &[])
                 .into_iter()
                 .map(|c| c.label)
                 .collect::<Vec<_>>()
@@ -339,7 +378,7 @@ mod tests {
                 "Next Monday"
             ]
         );
-        let noon = choices(at(12, 0));
+        let noon = choices(at(12, 0), &[]);
         assert_eq!(local(noon[0].at), "Wed 12:15");
         assert_eq!(local(noon[3].at), "Wed 18:00");
         assert_eq!(local(noon[4].at), "Thu 09:00");
@@ -348,7 +387,7 @@ mod tests {
         assert!(!labels(at(15, 30)).contains(&"This evening".to_string()));
         assert!(!labels(at(21, 0)).contains(&"This evening".to_string()));
         // Before dawn the morning is this one.
-        let night = choices(at(1, 30));
+        let night = choices(at(1, 30), &[]);
         let labels: Vec<_> = night.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -365,15 +404,45 @@ mod tests {
     }
 
     #[test]
+    fn choices_drop_a_preset_equal_to_a_button() {
+        let labels = |buttons: &[u64]| {
+            choices(at(12, 0), buttons)
+                .into_iter()
+                .map(|c| c.label)
+                .collect::<Vec<_>>()
+        };
+        // The default buttons are 10 min, 30 min and 1 h: the hour is one.
+        assert_eq!(
+            labels(&asst_core::config::DEFAULT_SNOOZE),
+            [
+                "In 15 minutes",
+                "In 3 hours",
+                "This evening",
+                "Tomorrow morning",
+                "Next Monday"
+            ]
+        );
+        assert_eq!(labels(&[15, 180])[0], "In 1 hour");
+        assert_eq!(labels(&[15, 180]).len(), 4);
+        // Only an equal wait goes: 1 day is not tomorrow morning, and 20
+        // min is not any of them.
+        assert_eq!(labels(&[20, 1440]), labels(&[]));
+        // The ones that stay are the moments they were.
+        let kept = choices(at(12, 0), &[60]);
+        assert_eq!(local(kept[0].at), "Wed 12:15");
+        assert_eq!(local(kept[1].at), "Wed 15:00");
+    }
+
+    #[test]
     fn next_monday_is_not_listed_twice() {
         // Sunday night: tomorrow morning is Monday already.
         let sunday = zone().with_ymd_and_hms(2026, 10, 18, 21, 0, 0).unwrap();
-        let labels: Vec<_> = choices(sunday).into_iter().map(|c| c.label).collect();
+        let labels: Vec<_> = choices(sunday, &[]).into_iter().map(|c| c.label).collect();
         assert_eq!(labels.last().map(String::as_str), Some("Tomorrow morning"));
         assert!(!labels.contains(&"Next Monday".to_string()));
         // Monday itself: the next one is a week off.
         let monday = zone().with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap();
-        let next = choices(monday).pop().unwrap();
+        let next = choices(monday, &[]).pop().unwrap();
         assert_eq!(local(next.at), "Mon 09:00");
         assert_eq!(next.at.with_timezone(&zone()).day(), 26);
     }

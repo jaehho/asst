@@ -96,8 +96,9 @@ window.dark {
 
 /* -- sidebar ------------------------------------------------------------- */
 
+/* The tiles and the Lists heading, which stay put. */
 .sidebar-content {
-  margin: 6px 12px 12px 12px;
+  margin: 6px 12px 0 12px;
 }
 
 .filter-tiles {
@@ -160,6 +161,7 @@ flowboxchild.filter-tile:drop(active) {
 
 list.sidebar-lists {
   background: transparent;
+  margin: 0 12px 12px 12px;
 }
 
 list.sidebar-lists > row.list-row {
@@ -192,6 +194,20 @@ list.sidebar-lists > row.list-row.drop-below:drop(active) {
 
 .list-line {
   padding: 6px 9px;
+}
+
+/* The row that opens the lists put away, under the lists. */
+button.hidden-lists {
+  margin: 0 12px 6px 12px;
+  padding: 0;
+  border-radius: 9px;
+  min-height: 0;
+  font-weight: normal;
+}
+
+/* Those lists, dimmed: a way to reach them, not a place to work. */
+list.sidebar-lists > row.list-row.hidden-list .list-line {
+  opacity: 0.7;
 }
 
 .sync-button.spinning image {
@@ -478,10 +494,6 @@ textview.add-notes {
   font-style: italic;
 }
 
-.snooze-lengths {
-  margin-top: 3px;
-}
-
 .view-empty {
   margin-top: 36px;
 }
@@ -639,16 +651,6 @@ button.editor-clear {
 
 .menu-info {
   margin: 3px 9px 6px 9px;
-}
-
-/* -- preferences --------------------------------------------------------- */
-
-list.sidebar-views > row.drop-above {
-  box-shadow: inset 0 2px 0 0 var(--accent-color);
-}
-
-list.sidebar-views > row.drop-below {
-  box-shadow: inset 0 -2px 0 0 var(--accent-color);
 }
 
 /* -- menus and pickers --------------------------------------------------- */

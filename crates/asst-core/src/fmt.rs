@@ -67,6 +67,12 @@ pub fn minutes(m: u64) -> String {
     }
 }
 
+/// `Snooze 10 min`: a reminder's button for a snooze length. asstd labels
+/// the button with it and Preferences quotes it, so the two cannot differ.
+pub fn snooze_button(m: u64) -> String {
+    format!("Snooze {}", minutes(m))
+}
+
 /// `in 25 min`, `in 3 h`, for a notification body. Rounded, since an
 /// alarm 30 minutes before a time rings a moment after the half hour, and
 /// that is still "in 30 min".
@@ -303,6 +309,20 @@ mod tests {
         assert_eq!(until_label(now + Duration::hours(12), now), None);
         let words: Vec<String> = [10, 60, 90, 1440, 2880].map(minutes).into();
         assert_eq!(words, ["10 min", "1 h", "1 h 30 min", "1 day", "2 days"]);
+    }
+
+    #[test]
+    fn snooze_button_label() {
+        let labels: Vec<String> = [10, 30, 60, 1440].map(snooze_button).into();
+        assert_eq!(
+            labels,
+            [
+                "Snooze 10 min",
+                "Snooze 30 min",
+                "Snooze 1 h",
+                "Snooze 1 day"
+            ]
+        );
     }
 
     #[test]

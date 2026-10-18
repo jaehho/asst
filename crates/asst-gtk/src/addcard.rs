@@ -7,7 +7,8 @@
 //! the card is left (Esc, another view, the window closing); the cancel
 //! button is what throws it away. Text with nothing left once the date, list
 //! and priority are read out is no task: Add stays off and says so, and
-//! nothing is sent, so what was typed is still there to finish.
+//! nothing is sent, so what was typed stays in the card, to finish the next
+//! time it opens.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -81,6 +82,8 @@ pub struct AddCard {
     chosen: RefCell<Chosen>,
     target: RefCell<Target>,
     lists: RefCell<Vec<ListView>>,
+    /// Hrefs of the archived lists: known by name, but not offered.
+    archived: RefCell<Vec<String>>,
     sunday_first: Cell<bool>,
     /// 1 to 4: what a task gets when neither the text nor a button says.
     default_priority: Cell<u8>,
@@ -252,6 +255,7 @@ impl AddCard {
             chosen: RefCell::default(),
             target: RefCell::new(Target::Anywhere),
             lists: RefCell::default(),
+            archived: RefCell::default(),
             sunday_first: Cell::new(false),
             default_priority: Cell::new(4),
             read_dates: Cell::new(true),
@@ -307,8 +311,13 @@ impl AddCard {
             });
         }
         {
-            let on_cancel = card.on_cancel.clone();
-            cancel.connect_clicked(move |_| on_cancel());
+            let weak = Rc::downgrade(&card);
+            cancel.connect_clicked(move |_| {
+                if let Some(c) = weak.upgrade() {
+                    c.discard();
+                    (c.on_cancel)();
+                }
+            });
         }
         {
             // The list suggestions take arrows, Enter, Tab and Esc while up.
@@ -459,7 +468,7 @@ impl AddCard {
             list_button.set_create_popup_func(move |mb| {
                 let Some(c) = weak.upgrade() else { return };
                 let current = c.list_href();
-                let lists = c.lists.borrow().clone();
+                let lists = c.pickable();
                 let weak = Rc::downgrade(&c);
                 let create = c.on_create.borrow().is_some().then(|| {
                     let weak = Rc::downgrade(&c);
@@ -499,8 +508,11 @@ impl AddCard {
         self.notes.buffer().set_text(rest.trim());
     }
 
-    pub fn set_lists(&self, lists: &[ListView], sunday_first: bool) {
+    /// `archived` lists stay known, so a `#name` typed out in full still
+    /// finds one, but are not suggested or offered in the picker.
+    pub fn set_lists(&self, lists: &[ListView], archived: &[String], sunday_first: bool) {
         *self.lists.borrow_mut() = lists.to_vec();
+        *self.archived.borrow_mut() = archived.to_vec();
         self.sunday_first.set(sunday_first);
         // A `#word` may name a list now, and then it is not the title.
         self.parse();
@@ -526,12 +538,33 @@ impl AddCard {
     }
 
     /// Show it for a new place: what was chosen for the last one goes.
+    /// Unfinished typing (no title, so leaving the card sent nothing) stays,
+    /// with the choices made for it.
     pub fn open(&self, target: Target) {
         *self.target.borrow_mut() = target;
+        if !self.holds_draft() {
+            self.discard();
+        }
+        self.refresh();
+    }
+
+    /// Throw away what is typed and chosen.
+    fn discard(&self) {
         *self.chosen.borrow_mut() = Chosen::default();
         self.entry.set_text("");
         self.notes.buffer().set_text("");
-        self.refresh();
+    }
+
+    /// Something is typed that is no task yet.
+    fn holds_draft(&self) -> bool {
+        !self.entry.text().trim().is_empty() || !self.notes_text().trim().is_empty()
+    }
+
+    fn notes_text(&self) -> String {
+        let buffer = self.notes.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string()
     }
 
     /// Where tasks go when nothing else says, keeping what was typed.
@@ -542,6 +575,9 @@ impl AddCard {
 
     pub fn focus(&self) {
         self.entry.grab_focus();
+        // Plain grab_focus selects the text, and a draft kept from the
+        // last time would be typed over.
+        self.entry.set_position(-1);
     }
 
     /// Lets pickers offer to make a list nothing is named for; `make`
@@ -604,6 +640,16 @@ impl AddCard {
     /// The list suggestions are up, and take Enter and Esc.
     pub fn suggesting(&self) -> bool {
         self.suggest.is_visible()
+    }
+
+    /// The lists to offer: not the archived ones, but for the one the task is
+    /// going to.
+    fn pickable(&self) -> Vec<ListView> {
+        model::pickable_lists(
+            &self.lists.borrow(),
+            &self.archived.borrow(),
+            self.list_href().as_deref(),
+        )
     }
 
     fn list_href(&self) -> Option<String> {
@@ -733,9 +779,10 @@ impl AddCard {
         };
         let word = self.hash_word().map(|(_, _, w)| w);
         let lower = word.as_deref().map(str::to_lowercase);
+        let offered = self.pickable();
         let lists = self.lists.borrow();
         let matches: Vec<ListView> = match &lower {
-            Some(word) => lists
+            Some(word) => offered
                 .iter()
                 .filter(|l| l.writable && squash(&l.name).contains(word))
                 .filter(|l| squash(&l.name) != *word)
@@ -898,11 +945,7 @@ impl AddCard {
         self.suggest.popdown();
         let text = self.entry.text().trim().to_string();
         let chosen = self.chosen.borrow();
-        let buffer = self.notes.buffer();
-        let notes = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .trim_end()
-            .to_string();
+        let notes = self.notes_text().trim_end().to_string();
         let mut spec = AddSpec {
             text,
             parse: true,
@@ -936,7 +979,7 @@ impl AddCard {
         drop(chosen);
         (self.on_add)(spec, self.leaving.get());
         self.entry.set_text("");
-        buffer.set_text("");
+        self.notes.buffer().set_text("");
         {
             let mut chosen = self.chosen.borrow_mut();
             chosen.schedule = None;

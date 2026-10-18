@@ -245,7 +245,9 @@ impl Component for QuickAdd {
             Cmd::Lists(Ok(lists)) => {
                 self.colors = lists.iter().filter_map(|l| l.color.clone()).collect();
                 let prefs = Prefs::load();
-                widgets.card.set_lists(&lists, prefs.sunday_first);
+                widgets
+                    .card
+                    .set_lists(&lists, &prefs.archived, prefs.sunday_first);
                 let last = std::fs::read_to_string(last_list_path()).unwrap_or_default();
                 if prefs.remember_list && lists.iter().any(|l| l.href == last.trim() && l.writable)
                 {

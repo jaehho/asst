@@ -1,6 +1,6 @@
 //! Alarms become desktop notifications with Complete and Snooze buttons,
-//! and a Snooze… that opens the window's chooser for any other time; a
-//! click on one opens its task in the window.
+//! and a Snooze… that snoozes the first length, then opens the window's
+//! chooser for any other time; a click on one opens its task in the window.
 //!
 //! Timers sleep at most a minute and re-read the wall clock, so an alarm
 //! that came due while the laptop was suspended fires on wake (monotonic
@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use asst_core::config::first_snooze;
 use asst_core::fmt;
 use asst_core::store::Row;
 use asst_core::task::{Task, priority_level};
@@ -331,10 +332,7 @@ fn actions_for(uid: &str, snooze: &[u64]) -> Vec<(String, String)> {
         (format!("done:{uid}"), "Complete".to_string()),
     ];
     for m in snooze {
-        actions.push((
-            format!("snooze:{m}:{uid}"),
-            format!("Snooze {}", fmt::minutes(*m)),
-        ));
+        actions.push((format!("snooze:{m}:{uid}"), fmt::snooze_button(*m)));
     }
     actions.push((format!("snooze-more:{uid}"), "Snooze…".to_string()));
     actions
@@ -347,7 +345,8 @@ enum Step {
     Open,
     Complete,
     Snooze(u64),
-    /// The window's chooser for when to ring it again.
+    /// The window's chooser for when to ring it again. Closing it leaves
+    /// the snooze before it, so the reminder is never lost.
     Chooser,
 }
 
@@ -363,7 +362,12 @@ struct Plan<'a> {
 /// The plan for an action key, or `None` for a key that is not ours:
 /// another app's, or one made without a UID by an asstd from before this,
 /// which no running asstd could map to a task anyway.
-fn plan_action(key: &str) -> Option<Plan<'_>> {
+///
+/// `Snooze…` snoozes the first of the `snooze` lengths before it asks. It
+/// closes the notification like any button, so a chooser that is closed
+/// with Esc, or never gets to show, would otherwise leave a reminder that
+/// never rings again.
+fn plan_action<'a>(key: &'a str, snooze: &[u64]) -> Option<Plan<'a>> {
     if key == "default" {
         return Some(Plan {
             uid: None,
@@ -372,18 +376,21 @@ fn plan_action(key: &str) -> Option<Plan<'_>> {
     }
     // The UID is the rest of the key, colons and all.
     let (verb, rest) = key.split_once(':')?;
-    let (step, uid) = match verb {
-        "done" => (Step::Complete, rest),
-        "snooze-more" => (Step::Chooser, rest),
+    let (steps, uid) = match verb {
+        "done" => (vec![Step::Complete], rest),
+        "snooze-more" => (
+            vec![Step::Snooze(first_snooze(snooze)), Step::Chooser],
+            rest,
+        ),
         "snooze" => {
             let (minutes, uid) = rest.split_once(':')?;
-            (Step::Snooze(minutes.parse().ok()?), uid)
+            (vec![Step::Snooze(minutes.parse().ok()?)], uid)
         }
         _ => return None,
     };
-    (!uid.is_empty()).then(|| Plan {
+    (!uid.is_empty()).then_some(Plan {
         uid: Some(uid),
-        steps: vec![step],
+        steps,
     })
 }
 
@@ -414,7 +421,7 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
             }
             Some(signal) = actions.next() => {
                 let Ok(args) = signal.args() else { continue };
-                let Some(plan) = plan_action(args.action_key) else { continue };
+                let Some(plan) = plan_action(args.action_key, &daemon.config().snooze) else { continue };
                 let href = match plan.uid {
                     Some(uid) => href_of(&daemon, uid),
                     None => shown.lock().unwrap_or_else(|p| p.into_inner()).get(&args.id).cloned(),
@@ -698,6 +705,9 @@ mod tests {
         }
     }
 
+    /// The default Snooze buttons, as a notification has them.
+    const BUTTONS: [u64; 3] = asst_core::config::DEFAULT_SNOOZE;
+
     #[test]
     fn a_key_names_its_task_and_what_to_do() {
         let uid = "5E9C0D4A-7B2F-4F6E-9C1A-0A3B4C5D6E7F";
@@ -710,7 +720,13 @@ mod tests {
             (&done, Some(plan(Some(uid), Step::Complete))),
             (&snooze, Some(plan(Some(uid), Step::Snooze(10)))),
             (&day, Some(plan(Some(uid), Step::Snooze(1440)))),
-            (&more, Some(plan(Some(uid), Step::Chooser))),
+            (
+                &more,
+                Some(Plan {
+                    uid: Some(uid),
+                    steps: vec![Step::Snooze(10), Step::Chooser],
+                }),
+            ),
             // A UID from another client can hold colons.
             ("done:a:b:c", Some(plan(Some("a:b:c"), Step::Complete))),
             ("snooze:5:a:b", Some(plan(Some("a:b"), Step::Snooze(5)))),
@@ -729,14 +745,46 @@ mod tests {
             ("reply:abc", None),
             ("", None),
         ] {
-            assert_eq!(plan_action(key), want, "{key:?}");
+            assert_eq!(plan_action(key, &BUTTONS), want, "{key:?}");
         }
+    }
+
+    #[test]
+    fn snooze_more_snoozes_the_first_length_then_opens_the_chooser() {
+        let key = "snooze-more:task-1";
+        for (buttons, first) in [(vec![10, 30, 60], 10), (vec![15, 60], 15), (vec![60], 60)] {
+            assert_eq!(
+                plan_action(key, &buttons),
+                Some(Plan {
+                    uid: Some("task-1"),
+                    steps: vec![Step::Snooze(first), Step::Chooser],
+                }),
+                "{buttons:?}"
+            );
+        }
+        // The other buttons are one step, whatever the config says.
+        assert_eq!(
+            plan_action("snooze:30:task-1", &[15]),
+            Some(plan(Some("task-1"), Step::Snooze(30)))
+        );
+    }
+
+    #[test]
+    fn snooze_more_with_no_config_uses_ten() {
+        // `snooze = []` leaves a notification with only Snooze….
+        assert_eq!(
+            plan_action("snooze-more:task-1", &[]),
+            Some(Plan {
+                uid: Some("task-1"),
+                steps: vec![Step::Snooze(10), Step::Chooser],
+            })
+        );
     }
 
     #[test]
     fn the_buttons_keep_their_order_and_every_key_reads_back() {
         let uid = "task-1";
-        let actions = actions_for(uid, &[10, 30, 60]);
+        let actions = actions_for(uid, &BUTTONS);
         let labels: Vec<_> = actions.iter().map(|(_, l)| l.as_str()).collect();
         assert_eq!(
             labels,
@@ -751,7 +799,7 @@ mod tests {
         );
         let plans: Vec<_> = actions
             .iter()
-            .map(|(key, _)| plan_action(key).expect(key))
+            .map(|(key, _)| plan_action(key, &BUTTONS).expect(key))
             .collect();
         assert_eq!(
             plans,
@@ -761,7 +809,10 @@ mod tests {
                 plan(Some(uid), Step::Snooze(10)),
                 plan(Some(uid), Step::Snooze(30)),
                 plan(Some(uid), Step::Snooze(60)),
-                plan(Some(uid), Step::Chooser),
+                Plan {
+                    uid: Some(uid),
+                    steps: vec![Step::Snooze(10), Step::Chooser],
+                },
             ]
         );
         // A server fires "default" for the click on the notification and

@@ -23,6 +23,13 @@ pub const DEFAULT_SNOOZE: [u64; 3] = [10, 30, 60];
 /// As many Snooze buttons as a notification has room for, beside Complete.
 pub const MAX_SNOOZE: usize = 3;
 
+/// How long `Snooze…` snoozes before its chooser opens: the first Snooze
+/// button's length, or the default's when there are no buttons. asstd
+/// does it and the chooser says it, so both read it here.
+pub fn first_snooze(lengths: &[u64]) -> u64 {
+    lengths.first().copied().unwrap_or(DEFAULT_SNOOZE[0])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {

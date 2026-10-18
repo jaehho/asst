@@ -1,7 +1,6 @@
 //! A task as a row: a checkbox in its priority's
 //! color, the due date in a colored chip, the title, small icons for notes,
-//! reminders, a link and linked notes, and the list's name in views that
-//! span lists.
+//! reminders and a repeat, and the list's name in views that span lists.
 //! Right-click for the task menu; drag it onto a list or a view.
 
 use std::cell::RefCell;
@@ -352,12 +351,18 @@ pub fn show_at(p: &gtk::Popover, parent: &impl IsA<gtk::Widget>, at: gdk::Rectan
     p.set_parent(parent);
     p.set_pointing_to(Some(&at));
     p.set_position(gtk::PositionType::Bottom);
-    p.connect_closed(|p| {
-        let p = p.clone();
+    // Kept until the popover is let go of: a click on a menu item may
+    // rebuild what the menu hangs from before the idle below runs, and GTK
+    // would finalize it with the popover still a child, whose `parent()` is
+    // then freed memory.
+    let parent: gtk::Widget = parent.clone().upcast();
+    p.connect_closed(move |p| {
+        let (p, parent) = (p.clone(), parent.clone());
         glib::idle_add_local_once(move || {
             if p.parent().is_some() {
                 p.unparent();
             }
+            drop(parent);
         });
     });
     p.popup();

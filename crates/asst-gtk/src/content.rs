@@ -19,6 +19,7 @@ use crate::{motion, ui};
 
 pub struct Opts<'a> {
     pub nav: &'a Nav,
+    /// The lists a task can move to, and the one on view, archived or not.
     pub lists: &'a [ListView],
     /// Tracked blocks for the Day view's time lane.
     pub blocks: &'a [asst_core::api::BlockView],
@@ -470,33 +471,60 @@ fn add_button(target: Target, tx: &Tx) -> gtk::Button {
     b
 }
 
+/// What an archived list's view says when it has nothing open.
+const ARCHIVED_NOTE: &str = "Archived. It still syncs and its reminders still ring.";
+
 fn empty(o: &Opts, tx: &Tx) -> adw::StatusPage {
+    let list = match o.nav {
+        Nav::List(href) => o.lists.iter().find(|l| &l.href == href),
+        _ => None,
+    };
+    // Tasks were done here and none are left: said as an end, not a start.
+    let finished = list.filter(|l| l.done > 0);
     let (icon, title, text) = match o.nav {
         Nav::Today => (
             "star-outline-thick-symbolic",
             "All clear",
-            "Nothing is due today. Press a to add a task.",
+            "Nothing is due today. Press a to add a task.".to_string(),
+        ),
+        Nav::Inbox => (
+            "mailbox-symbolic",
+            "Inbox zero",
+            "Everything is sorted.".to_string(),
         ),
         Nav::Completed => (
             "check-round-outline-symbolic",
             "Nothing completed yet",
-            "Completed tasks show up here.",
+            "Completed tasks show up here.".to_string(),
         ),
         Nav::Tomorrow => (
             "today-calendar-symbolic",
             "Nothing tomorrow",
-            "Press a to add a task for tomorrow.",
+            "Press a to add a task for tomorrow.".to_string(),
         ),
         Nav::Repeating => (
             "arrow-circular-top-right-symbolic",
             "No repeating tasks",
-            "Give a task a repeat, like every monday.",
+            "Give a task a repeat, like every monday.".to_string(),
         ),
-        _ => (
-            "check-round-outline-whole-symbolic",
-            "Add some tasks",
-            "Press a to add a task.",
-        ),
+        _ => match finished {
+            Some(l) if l.writable || o.archived => (
+                "check-round-outline-whole-symbolic",
+                "All done",
+                format!("Nothing left in {}.", l.name),
+            ),
+            _ => (
+                "check-round-outline-whole-symbolic",
+                "Add some tasks",
+                "Press a to add a task.".to_string(),
+            ),
+        },
+    };
+    // An archived list says so, and offers the way back instead.
+    let text = if o.archived {
+        ARCHIVED_NOTE.to_string()
+    } else {
+        text
     };
     let page = adw::StatusPage::builder()
         .icon_name(icon)
@@ -505,14 +533,46 @@ fn empty(o: &Opts, tx: &Tx) -> adw::StatusPage {
         .build();
     page.add_css_class("compact");
     page.add_css_class("view-empty");
-    if !matches!(o.nav, Nav::Completed) {
-        let add = gtk::Button::with_label("Add Task");
-        add.add_css_class("pill");
-        add.add_css_class("suggested-action");
-        add.set_halign(gtk::Align::Center);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    buttons.set_halign(gtk::Align::Center);
+    let pill = |label: &str, suggested: bool, msg: Box<dyn Fn() -> Msg>| {
+        let b = gtk::Button::with_label(label);
+        b.add_css_class("pill");
+        if suggested {
+            b.add_css_class("suggested-action");
+        }
         let tx = tx.clone();
-        add.connect_clicked(move |_| tx.emit(Msg::ShowAdd(None)));
-        page.set_child(Some(&add));
+        b.connect_clicked(move |_| tx.emit(msg()));
+        b
+    };
+    let add = || Box::new(|| Msg::ShowAdd(None)) as Box<dyn Fn() -> Msg>;
+    match (o.nav, list) {
+        (Nav::Completed, _) => {}
+        (Nav::List(href), Some(_)) if o.archived => {
+            let href = href.clone();
+            buttons.append(&pill(
+                "Unarchive",
+                true,
+                Box::new(move || Msg::Archive(href.clone(), false)),
+            ));
+        }
+        (Nav::List(href), Some(l))
+            if finished.is_some()
+                && l.writable
+                && !crate::model::inbox(o.lists).is_some_and(|i| i.href == l.href) =>
+        {
+            let href = href.clone();
+            buttons.append(&pill("Add Task", true, add()));
+            buttons.append(&pill(
+                "Archive List",
+                false,
+                Box::new(move || Msg::Archive(href.clone(), true)),
+            ));
+        }
+        _ => buttons.append(&pill("Add Task", true, add())),
+    }
+    if buttons.first_child().is_some() {
+        page.set_child(Some(&buttons));
     }
     page
 }

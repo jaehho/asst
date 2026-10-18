@@ -91,23 +91,6 @@ impl Nav {
         matches!(self, Nav::Inbox | Nav::List(_) | Nav::All | Nav::Repeating)
     }
 
-    /// What a smart view holds, in a few words.
-    pub fn about(&self) -> &'static str {
-        match self {
-            Nav::Inbox => "The inbox list",
-            Nav::Today => "Due today, and overdue",
-            Nav::Day => "Tracked time and the plan, side by side",
-            Nav::Matrix => "Important and urgent, in four boxes",
-            Nav::Scheduled => "Everything with a date, by day",
-            Nav::Completed => "Done, by the day",
-            Nav::Tomorrow => "Due tomorrow",
-            Nav::Anytime => "Tasks with no date",
-            Nav::Repeating => "Tasks that repeat",
-            Nav::All => "Every open task, by list",
-            Nav::List(_) => "A list",
-        }
-    }
-
     pub fn icon(&self) -> &'static str {
         match self {
             Nav::Inbox => "mailbox-symbolic",
@@ -157,6 +140,16 @@ impl Nav {
             return Some(Nav::List(href.to_string()));
         }
         Nav::filters().into_iter().find(|n| n.key() == key)
+    }
+
+    /// The Ctrl chord that opens this view, shown or not (three have one).
+    pub fn chord(&self) -> Option<&'static str> {
+        match self {
+            Nav::Inbox => Some("Ctrl+I"),
+            Nav::Today => Some("Ctrl+T"),
+            Nav::Scheduled => Some("Ctrl+U"),
+            _ => None,
+        }
     }
 
     /// Where a task added here goes: a list, a date, or neither.
@@ -467,6 +460,96 @@ pub fn inbox(lists: &[ListView]) -> Option<&ListView> {
         .iter()
         .find(|l| l.inbox)
         .or_else(|| lists.iter().find(|l| l.writable))
+}
+
+/// The view as the window keeps it: the inbox list is the Inbox view,
+/// however it was reached (a list row, Quick Find, a task revealed in it),
+/// so one of the two is highlighted, never a tile and a row, or neither.
+pub fn canonical_nav(nav: Nav, lists: &[ListView]) -> Nav {
+    match nav {
+        Nav::List(href) if inbox(lists).is_some_and(|l| l.href == href) => Nav::Inbox,
+        nav => nav,
+    }
+}
+
+/// The lists a task can be put in, in the order given. An archived list is
+/// out of reach as it is out of sight, but for the one already holding the
+/// task (its ring and name show, and a checkmark in the picker) and the
+/// inbox list, which is never archived whatever `archived` holds.
+pub fn pickable_lists(
+    lists: &[ListView],
+    archived: &[String],
+    holding: Option<&str>,
+) -> Vec<ListView> {
+    let home = inbox(lists).map(|l| l.href.as_str());
+    lists
+        .iter()
+        .filter(|l| {
+            let href = Some(l.href.as_str());
+            !archived.contains(&l.href) || href == holding || href == home
+        })
+        .cloned()
+        .collect()
+}
+
+/// The views Ctrl+PgUp and Ctrl+PgDn step through: the tiles, then the rows
+/// of the lists (`all` tells which of them is the inbox). Each view once.
+pub fn cycle_order(tiles: &[Nav], rows: &[ListView], all: &[ListView]) -> Vec<Nav> {
+    let mut order: Vec<Nav> = Vec::new();
+    let lists = rows
+        .iter()
+        .map(|l| canonical_nav(Nav::List(l.href.clone()), all));
+    for nav in tiles.iter().cloned().chain(lists) {
+        if !order.contains(&nav) {
+            order.push(nav);
+        }
+    }
+    order
+}
+
+/// The view `step` places (1 or -1) from `current` in `order`, wrapping at
+/// the ends. From a view that is not in `order` (a list while walking the
+/// tiles, a view with no tile) a step on goes to the first, a step back to
+/// the last. `None` for an empty walk.
+pub fn cycle_from(order: &[Nav], current: &Nav, step: i32) -> Option<Nav> {
+    let len = order.len() as i32;
+    let at = match order.iter().position(|n| n == current) {
+        Some(at) => (at as i32 + step).rem_euclid(len),
+        None if step > 0 => 0,
+        None => len - 1,
+    };
+    order.get(usize::try_from(at).ok()?).cloned()
+}
+
+/// `]` and `[`: the next or previous tile, the first or the last from
+/// anywhere else.
+pub fn tile_cycle(tiles: &[Nav], current: &Nav, step: i32) -> Option<Nav> {
+    cycle_from(tiles, current, step)
+}
+
+/// `}` and `{`: the same through the lists that have a row (`all` tells
+/// which of them is the inbox, which is the Inbox view once it has a row).
+pub fn list_cycle(rows: &[ListView], all: &[ListView], current: &Nav, step: i32) -> Option<Nav> {
+    let navs: Vec<Nav> = rows
+        .iter()
+        .map(|l| canonical_nav(Nav::List(l.href.clone()), all))
+        .collect();
+    cycle_from(&navs, current, step)
+}
+
+/// The Alt chord for the tile at `index`: `Alt+1` to `Alt+9`.
+pub fn alt_chord(index: usize) -> Option<String> {
+    (index < 9).then(|| format!("Alt+{}", index + 1))
+}
+
+/// What a tile's tooltip says opens it: its Alt chord by place, and its Ctrl
+/// chord if the view has one (empty for neither).
+pub fn tile_keys(nav: &Nav, index: usize) -> String {
+    let keys: Vec<String> = alt_chord(index)
+        .into_iter()
+        .chain(nav.chord().map(String::from))
+        .collect();
+    keys.join(" or ")
 }
 
 /// What a view shows, top to bottom.
@@ -1391,7 +1474,9 @@ pub struct Counts {
     pub anytime: usize,
     pub repeating: usize,
     pub all: usize,
-    /// Open tasks with a planned slot today.
+    /// What Day has for today: the planned blocks and the tray (what is
+    /// due by today and not placed). The No date section is left out: it
+    /// is every undated task, a backlog and not the day's work.
     pub day: usize,
     pub lists: HashMap<String, usize>,
 }
@@ -1432,18 +1517,32 @@ impl Counts {
                 }
             }
         }
-        c.day = day_plan(data.open, slots, now, today).blocks.len();
+        let plan = day_plan(data.open, slots, now, today);
+        c.day = plan.blocks.len() + plan.tray.len();
         c
     }
 
-    /// What a sidebar entry shows; nothing for Completed.
+    /// The tile that carries the overdue dot: the first of Today, Day and
+    /// Inbox that is in the sidebar, so hiding Today does not take the
+    /// signal away. None when nothing is overdue or none of them is shown.
+    pub fn dot_on(&self, shown: &[Nav]) -> Option<Nav> {
+        if self.overdue == 0 {
+            return None;
+        }
+        [Nav::Today, Nav::Day, Nav::Inbox]
+            .into_iter()
+            .find(|nav| shown.contains(nav))
+    }
+
+    /// What a sidebar entry shows; nothing for Completed or Matrix.
     pub fn of(&self, nav: &Nav) -> Option<usize> {
         match nav {
             Nav::Inbox => Some(self.inbox),
             Nav::Today => Some(self.today),
             Nav::Day => Some(self.day),
-            // Every open task sits in some box.
-            Nav::Matrix => Some(self.all),
+            // Every open task sits in some box, so a count would only
+            // repeat All Tasks.
+            Nav::Matrix => None,
             Nav::Scheduled => Some(self.scheduled),
             Nav::Completed => None,
             Nav::Tomorrow => Some(self.tomorrow),
@@ -1485,19 +1584,23 @@ pub fn issue_repo(url: &str) -> Option<String> {
     (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
-/// Where a repo is checked out: its name under the projects folder
-/// (`~` in it is the home folder).
-pub fn checkout_dir(projects: &str, repo: &str, home: &str) -> std::path::PathBuf {
+/// The projects folder as a path: `~` in it is the home folder, and none
+/// typed is `~/projects`.
+pub fn projects_dir(projects: &str, home: &str) -> std::path::PathBuf {
     let projects = match projects.trim() {
         "" => "~/projects",
         p => p,
     };
-    let projects = match projects.strip_prefix('~') {
-        Some(rest) => format!("{home}{rest}"),
-        None => projects.to_string(),
-    };
+    match projects.strip_prefix('~') {
+        Some(rest) => format!("{home}{rest}").into(),
+        None => projects.into(),
+    }
+}
+
+/// Where a repo is checked out: its name under the projects folder.
+pub fn checkout_dir(projects: &str, repo: &str, home: &str) -> std::path::PathBuf {
     let name = repo.rsplit('/').next().unwrap_or(repo);
-    std::path::Path::new(&projects).join(name)
+    projects_dir(projects, home).join(name)
 }
 
 /// The command to run for "start work": `template` with `{dir}`, `{repo}`,
@@ -1878,6 +1981,43 @@ pub fn priority_name(level: u8) -> &'static str {
     }
 }
 
+/// The sets of Snooze buttons Preferences offers, as minutes.
+const SNOOZE_PRESETS: [&[u64]; 4] = [
+    &asst_core::config::DEFAULT_SNOOZE,
+    &[15, 60],
+    &[10, 60, 1440],
+    &[10],
+];
+
+/// The sets of Snooze buttons to choose from: the presets, then `current`
+/// as it is written when it is none of them (set by `asst settings`).
+pub fn snooze_presets(current: &[u64]) -> Vec<Vec<u64>> {
+    let mut all: Vec<Vec<u64>> = SNOOZE_PRESETS.iter().map(|p| p.to_vec()).collect();
+    if !all.iter().any(|p| p == current) {
+        all.push(current.to_vec());
+    }
+    all
+}
+
+/// `10 min, 30 min, 1 h`: a set of Snooze buttons, as its entry names it.
+pub fn snooze_label(lengths: &[u64]) -> String {
+    if lengths.is_empty() {
+        return "None".into();
+    }
+    let words: Vec<String> = lengths.iter().map(|m| fmt::minutes(*m)).collect();
+    words.join(", ")
+}
+
+/// The buttons a reminder gets from this set, worded as the notification
+/// words them, and what Snooze… is for.
+pub fn snooze_hint(lengths: &[u64]) -> String {
+    if lengths.is_empty() {
+        return "Snooze… picks any time.".into();
+    }
+    let buttons: Vec<String> = lengths.iter().map(|m| fmt::snooze_button(*m)).collect();
+    format!("{}. Snooze… picks any other time.", buttons.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use asst_core::task::Status;
@@ -1940,6 +2080,152 @@ mod tests {
                 done: 0,
             })
             .collect()
+    }
+
+    #[test]
+    fn canonical_nav_folds_the_inbox_list_into_inbox() {
+        let lists = lists();
+        // "/b/" is the inbox list.
+        assert_eq!(canonical_nav(Nav::List("/b/".into()), &lists), Nav::Inbox);
+        assert_eq!(
+            canonical_nav(Nav::List("/a/".into()), &lists),
+            Nav::List("/a/".into())
+        );
+        for nav in Nav::filters() {
+            assert_eq!(canonical_nav(nav.clone(), &lists), nav);
+        }
+        // Before the lists are loaded nothing is known to be the inbox.
+        assert_eq!(
+            canonical_nav(Nav::List("/b/".into()), &[]),
+            Nav::List("/b/".into())
+        );
+    }
+
+    #[test]
+    fn pickable_lists_drop_archived_but_keep_the_tasks_own() {
+        let lists = lists();
+        let all = |archived: &[&str], holding: Option<&str>| -> Vec<String> {
+            let archived: Vec<String> = archived.iter().map(|h| (*h).to_string()).collect();
+            pickable_lists(&lists, &archived, holding)
+                .into_iter()
+                .map(|l| l.href)
+                .collect()
+        };
+        assert_eq!(all(&[], None), ["/a/", "/b/"]);
+        // Out of reach...
+        assert_eq!(all(&["/a/"], None), ["/b/"]);
+        // ...unless it holds the task, whose list has to show.
+        assert_eq!(all(&["/a/"], Some("/a/")), ["/a/", "/b/"]);
+        assert_eq!(all(&["/a/"], Some("/b/")), ["/b/"]);
+        // The inbox is never archived, whatever the entry says.
+        assert_eq!(all(&["/a/", "/b/"], None), ["/b/"]);
+        // Nothing known yet, nothing offered.
+        assert!(pickable_lists(&[], &["/a/".into()], Some("/a/")).is_empty());
+    }
+
+    #[test]
+    fn cycle_order_has_no_duplicates() {
+        let lists = lists();
+        let tiles = [Nav::Inbox, Nav::Day];
+        let rows = |names: &[&str]| -> Vec<ListView> {
+            lists
+                .iter()
+                .filter(|l| names.contains(&l.href.as_str()))
+                .cloned()
+                .collect()
+        };
+        // The inbox row is not built while its tile shows.
+        assert_eq!(
+            cycle_order(&tiles, &rows(&["/a/"]), &lists),
+            [Nav::Inbox, Nav::Day, Nav::List("/a/".into())]
+        );
+        // With the tile hidden the row stands for it, and is the Inbox
+        // view, so the walk lands on the view the window is on.
+        assert_eq!(
+            cycle_order(&[Nav::Day], &rows(&["/a/", "/b/"]), &lists),
+            [Nav::Day, Nav::List("/a/".into()), Nav::Inbox]
+        );
+        // Both at once, should a caller allow it, still visits it once.
+        assert_eq!(
+            cycle_order(&tiles, &rows(&["/a/", "/b/"]), &lists),
+            [Nav::Inbox, Nav::Day, Nav::List("/a/".into())]
+        );
+    }
+
+    #[test]
+    fn tiles_cycle_and_a_list_steps_into_them() {
+        let tiles = [Nav::Inbox, Nav::Day, Nav::Today];
+        let at = |nav: &Nav, step| tile_cycle(&tiles, nav, step);
+        // Wrapping, both ways.
+        assert_eq!(at(&Nav::Inbox, 1), Some(Nav::Day));
+        assert_eq!(at(&Nav::Today, 1), Some(Nav::Inbox));
+        assert_eq!(at(&Nav::Inbox, -1), Some(Nav::Today));
+        // A list, or a view with no tile, is stepped into from outside:
+        // `]` is the first tile, `[` the last.
+        let list = Nav::List("/a/".into());
+        for outside in [&list, &Nav::Matrix] {
+            assert_eq!(at(outside, 1), Some(Nav::Inbox));
+            assert_eq!(at(outside, -1), Some(Nav::Today));
+        }
+        // The default sidebar: `]` toggles Inbox and Day, `[` the same.
+        let two = [Nav::Inbox, Nav::Day];
+        assert_eq!(tile_cycle(&two, &Nav::Inbox, 1), Some(Nav::Day));
+        assert_eq!(tile_cycle(&two, &Nav::Day, 1), Some(Nav::Inbox));
+        assert_eq!(tile_cycle(&two, &Nav::Day, -1), Some(Nav::Inbox));
+        // One tile steps to itself; none, nowhere.
+        assert_eq!(tile_cycle(&[Nav::Day], &Nav::Day, 1), Some(Nav::Day));
+        assert_eq!(tile_cycle(&[], &Nav::Day, 1), None);
+        assert_eq!(tile_cycle(&[], &Nav::Day, -1), None);
+    }
+
+    #[test]
+    fn lists_cycle_through_their_rows_and_a_tile_steps_into_them() {
+        let lists = lists();
+        let rows = |hrefs: &[&str]| -> Vec<ListView> {
+            hrefs
+                .iter()
+                .filter_map(|h| lists.iter().find(|l| l.href == *h).cloned())
+                .collect()
+        };
+        let a = Nav::List("/a/".into());
+        // "/b/" is the inbox list: with its tile shown it has no row.
+        let step = |hrefs: &[&str], from: &Nav, by| list_cycle(&rows(hrefs), &lists, from, by);
+        assert_eq!(step(&["/a/"], &a, 1), Some(a.clone()));
+        assert_eq!(step(&["/a/"], &Nav::Day, 1), Some(a.clone()));
+        assert_eq!(step(&["/a/"], &Nav::Day, -1), Some(a.clone()));
+        assert_eq!(step(&[], &Nav::Day, 1), None);
+        // With the tile hidden the row is the Inbox view, so the walk
+        // finds the view the window is on.
+        assert_eq!(step(&["/a/", "/b/"], &a, 1), Some(Nav::Inbox));
+        assert_eq!(step(&["/a/", "/b/"], &Nav::Inbox, 1), Some(a.clone()));
+        assert_eq!(step(&["/a/", "/b/"], &a, -1), Some(Nav::Inbox));
+        // From a tile, `}` is the first row and `{` the last.
+        assert_eq!(step(&["/a/", "/b/"], &Nav::Today, 1), Some(a));
+        assert_eq!(step(&["/a/", "/b/"], &Nav::Today, -1), Some(Nav::Inbox));
+    }
+
+    #[test]
+    fn tile_keys_match_position() {
+        assert_eq!(alt_chord(0).as_deref(), Some("Alt+1"));
+        assert_eq!(alt_chord(8).as_deref(), Some("Alt+9"));
+        assert_eq!(alt_chord(9), None);
+        // The Alt chord is the place, so a tile moved changes its key; the
+        // Ctrl chord belongs to the view.
+        assert_eq!(tile_keys(&Nav::Inbox, 0), "Alt+1 or Ctrl+I");
+        assert_eq!(tile_keys(&Nav::Inbox, 1), "Alt+2 or Ctrl+I");
+        assert_eq!(tile_keys(&Nav::Day, 1), "Alt+2");
+        assert_eq!(tile_keys(&Nav::Today, 2), "Alt+3 or Ctrl+T");
+        // Past nine tiles only the Ctrl chord is left, and some have none.
+        assert_eq!(tile_keys(&Nav::Scheduled, 9), "Ctrl+U");
+        assert_eq!(tile_keys(&Nav::All, 9), "");
+        // Every view's tooltip, shown first to last, names its own place.
+        for (at, nav) in Nav::filters().iter().enumerate() {
+            let keys = tile_keys(nav, at);
+            assert_eq!(keys.starts_with("Alt+"), at < 9, "{nav:?} {keys}");
+            if at < 9 {
+                assert!(keys.starts_with(&format!("Alt+{}", at + 1)), "{keys}");
+            }
+        }
     }
 
     fn on(d: NaiveDate) -> Option<When> {
@@ -2021,6 +2307,77 @@ mod tests {
         let c = Counts::new(&data, &[], now());
         assert_eq!((c.today, c.overdue, c.scheduled, c.tomorrow), (2, 1, 1, 1));
         assert_eq!((c.anytime, c.all, c.inbox), (1, 4, 2));
+    }
+
+    #[test]
+    fn the_overdue_dot_goes_to_the_first_of_today_day_inbox_that_is_shown() {
+        let late = Counts {
+            overdue: 2,
+            ..Counts::default()
+        };
+        // Today wins wherever it sits among the tiles.
+        let all = [Nav::Day, Nav::Inbox, Nav::Today];
+        assert_eq!(late.dot_on(&all), Some(Nav::Today));
+        // Hide Today and the signal moves to Day, then to Inbox.
+        assert_eq!(late.dot_on(&[Nav::Inbox, Nav::Day]), Some(Nav::Day));
+        assert_eq!(late.dot_on(&[Nav::Matrix, Nav::Inbox]), Some(Nav::Inbox));
+        // Views that cannot show overdue work carry nothing.
+        assert_eq!(late.dot_on(&[Nav::Matrix, Nav::Scheduled]), None);
+        assert_eq!(late.dot_on(&[]), None);
+        // Nothing overdue, no dot.
+        assert_eq!(Counts::default().dot_on(&all), None);
+    }
+
+    #[test]
+    fn day_count_is_blocks_plus_tray() {
+        let lists = lists();
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("now", "/a/", on(date(9, 14))),
+            task("soon", "/b/", on(date(9, 15))),
+            task("someday", "/b/", None),
+            task("planned", "/b/", None),
+        ];
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: None,
+            sunday_first: false,
+        };
+        let day = |slots: &[PlanSlot]| Counts::new(&data, slots, now()).day;
+        // Nothing placed: the tray holds late and now. Tomorrow's task waits
+        // for its day, and the undated one sits in No date, which is a
+        // backlog and does not count.
+        assert_eq!(day(&[]), 2);
+        // A block counts and an undated task can be one.
+        assert_eq!(day(&[slot("planned", 9 * 60, 30)]), 3);
+        // Placing a task from the tray moves it, not adds it.
+        let both = [slot("planned", 9 * 60, 30), slot("late", 11 * 60, 30)];
+        assert_eq!(day(&both), 3);
+        // A slot on another day is not today's.
+        let other = PlanSlot {
+            date: date(9, 15),
+            ..slot("planned", 9 * 60, 30)
+        };
+        assert_eq!(day(&[other]), 2);
+    }
+
+    #[test]
+    fn matrix_has_no_count() {
+        let lists = lists();
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("someday", "/b/", None),
+        ];
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: None,
+            sunday_first: false,
+        };
+        let c = Counts::new(&data, &[], now());
+        // Every open task is in a box, so it would only repeat All Tasks.
+        assert_eq!((c.of(&Nav::Matrix), c.of(&Nav::All)), (None, Some(2)));
     }
 
     #[test]
@@ -2262,6 +2619,12 @@ mod tests {
         assert_eq!(
             checkout_dir("/srv/src", "jaehho/asst", "/home/jaeho"),
             std::path::PathBuf::from("/srv/src/asst")
+        );
+        // Preferences checks the folder the same way Start work reads it,
+        // so an empty field is the default one.
+        assert_eq!(
+            projects_dir(" ", "/home/jaeho"),
+            std::path::PathBuf::from("/home/jaeho/projects")
         );
         assert_eq!(
             work_command(
@@ -2619,7 +2982,8 @@ mod tests {
         assert_eq!(undated, ["someday"]);
         // 10:00 on Sep 14 2026.
         assert_eq!(p.now_min, Some(10 * 60));
-        // A slot for a task the open set no longer holds does not count.
+        // The badge is the block and the tray, and a slot for a task the open
+        // set no longer holds is not a block.
         let c = Counts::new(
             &Data {
                 lists: &lists(),
@@ -2630,7 +2994,8 @@ mod tests {
             &slots,
             now(),
         );
-        assert_eq!(c.day, 1);
+        assert_eq!(c.day, p.blocks.len() + p.tray.len());
+        assert_eq!(c.day, 3);
     }
 
     #[test]
@@ -3167,5 +3532,49 @@ mod tests {
         // Durations clamp the same way a real drop would.
         let g = ghost_block(&p.blocks, &t, 23 * 60 + 50, 30);
         assert_eq!((g.start, g.duration), (23 * 60 + 50, 10));
+    }
+
+    #[test]
+    fn snooze_presets_keep_the_current_value() {
+        use asst_core::config::DEFAULT_SNOOZE;
+        let presets = snooze_presets(&DEFAULT_SNOOZE);
+        assert_eq!(presets.len(), 4, "the default is a preset, not a fifth");
+        assert_eq!(presets[0], DEFAULT_SNOOZE);
+        let labels: Vec<String> = presets.iter().map(|p| snooze_label(p)).collect();
+        assert_eq!(
+            labels,
+            [
+                "10 min, 30 min, 1 h",
+                "15 min, 1 h",
+                "10 min, 1 h, 1 day",
+                "10 min"
+            ]
+        );
+        // Any preset, not just the first, is found as it is.
+        assert_eq!(snooze_presets(&[15, 60]), presets);
+        // A value set by `asst settings --snooze 20,45` follows the four,
+        // as written, and is what the row opens on.
+        let other = snooze_presets(&[20, 45]);
+        assert_eq!(other[..4], presets[..]);
+        assert_eq!(other.len(), 5);
+        assert_eq!(snooze_label(&other[4]), "20 min, 45 min");
+        // Same minutes in another order are not the same buttons.
+        assert_eq!(snooze_presets(&[60, 10, 30]).len(), 5);
+        // No buttons at all (a hand-edited config) is still shown.
+        assert_eq!(snooze_presets(&[])[4], Vec::<u64>::new());
+        assert_eq!(snooze_label(&[]), "None");
+    }
+
+    #[test]
+    fn the_snooze_hint_words_the_buttons_as_the_notification_does() {
+        assert_eq!(
+            snooze_hint(&[10, 30, 60]),
+            "Snooze 10 min, Snooze 30 min, Snooze 1 h. Snooze… picks any other time."
+        );
+        assert_eq!(
+            snooze_hint(&[10, 1440]),
+            "Snooze 10 min, Snooze 1 day. Snooze… picks any other time."
+        );
+        assert_eq!(snooze_hint(&[]), "Snooze… picks any time.");
     }
 }

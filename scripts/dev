@@ -11,24 +11,27 @@
 #   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
-#   scripts/dev keys [MOD+]KEY...  real key presses to the window, unfocused (Hyprland send_shortcut):
-#                                  `keys Tab h i SHIFT+Return CTRL+Return`. Goes to the main
-#                                  surface, so not into an open popover (those don't take focus here),
-#                                  unless `drive searchfocus` put the keyboard in its search field
+#   scripts/dev keys [MOD+]KEY...  real key presses to this instance's window, unfocused (Hyprland
+#                                  send_shortcut, aimed by the window's pid): `keys Tab h i
+#                                  SHIFT+Return CTRL+Return`. Goes to the main surface, so not
+#                                  into an open popover (those don't take focus here), unless
+#                                  `drive searchfocus` put the keyboard in its search field
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev texts [FILE]       what the window, an open dialog and popover show, as JSON:
 #                                  labels, entries, buttons, icons, tooltips, and whether each takes input
 #                                  (default $DEV/texts.json)
-#   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
+#   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>), a finished
+#                                  list (Shipped) and an archived one (Parked)
 #   scripts/dev reset              wipe this instance's state, then up and seed
-#   scripts/dev down [--all]       stop the window, the tray, asstd and the bus;
-#                                  --all also Radicale and stray target/debug bins.
+#   scripts/dev down [--all]       stop this instance's window, tray, asstd and bus, found on its
+#                                  bus, so other instances keep running. --all is the broom for
+#                                  every instance: all debug asst-gtk and asstd, and Radicale.
 #                                  The devel hyprctl window rule cannot be
 #                                  dropped and stays until a config reload.
 #
 # ASST_DEV (default ~/.cache/asst-dev/<name>, name from ASST_DEV_NAME or
-# "gui") holds the bus address, config, cache and notes folder; the name is also the
+# "gui") holds the bus address, config and cache; the name is also the
 # Radicale user, so instances don't share lists. The bus has a stand-in
 # notification server (scripts/notify-host.py, printing to notify.log), and
 # starts the dev window when a notification opens a task in it.
@@ -51,11 +54,13 @@ build() {
 }
 
 # Fixture tasks for `seed`: key, title, due, priority, repeat, optional
-# plan placement as "HH:MM minutes" on today, optional source stamp.
+# plan placement as "HH:MM minutes" on today, optional source stamp,
+# optional list (by name; else the inbox) and `done` to complete it.
 # Empty fields are skipped. The source defaults to `dev:<key>`, which keeps
 # a re-run from duplicating; the same keys own their plan slots. A
 # `steno:` or `gh:` stamp gives the row an origin caption (the rest get
-# none).
+# none). Shipped ends with only done tasks (a finished list); Parked is
+# archived by `archive_lists` and keeps one open task out of the views.
 seed_list() {
   local past next_mon
   past="$(date -d '2 days ago' +%F)"
@@ -70,6 +75,9 @@ someday-gym|Gym||||
 week-meeting|Team meeting|$next_mon||every monday|
 steno-notes|Send the meeting notes|||||steno:dev/notes
 gh-issue|Fix the sync bug|||||gh:dev/1
+shipped-first|Ship the first release||||||Shipped|done
+shipped-docs|Write the release notes||||||Shipped|done
+parked-idea|Think about a plugin API||||||Parked|
 SEED
 }
 
@@ -90,26 +98,49 @@ path.write_text(tomli_w.dumps(data))
 ' "$toml"
 }
 
+# Put lists (by name) in window.toml's `archived`, as Archive in the window
+# does. Like place_slots, for before the window runs: it rewrites the file
+# whole from what it read, and a running window would write its own over it.
+archive_lists() {
+  local toml="$DEV/config/asst/window.toml"
+  mkdir -p "$(dirname "$toml")"
+  "$BIN/asst" --json lists | uv run --no-project --with tomli-w python -c '
+import json, sys, tomllib, tomli_w
+from pathlib import Path
+path = Path(sys.argv[1])
+want = {name.lower() for name in sys.argv[2:]}
+hrefs = [l["href"] for l in json.load(sys.stdin) if l["name"].lower() in want]
+data = tomllib.loads(path.read_text()) if path.exists() else {}
+data["archived"] = sorted(set(data.get("archived", [])) | set(hrefs))
+path.write_text(tomli_w.dumps(data))
+' "$toml" "$@"
+}
+
 # Lists the fixtures go to, created on first seed.
 seed_lists() {
   local have
   have="$("$BIN/asst" --json lists | python3 -c 'import json,sys; print("\n".join(l["name"].lower() for l in json.load(sys.stdin)))')"
-  for name in Inbox Work Errands; do
+  for name in Inbox Work Errands Shipped Parked; do
     grep -qx "$(echo "$name" | tr '[:upper:]' '[:lower:]')" <<<"$have" || "$BIN/asst" list new "$name"
   done
 }
 
 seed_tasks() {
-  local slots="[]" key title due prio repeat plan uid json
+  local slots="[]" key title due prio repeat plan source list done uid json
   local -a args
-  while IFS='|' read -r key title due prio repeat plan source; do
+  while IFS='|' read -r key title due prio repeat plan source list done; do
     [ -n "$key" ] || continue
     args=(--json add --source "${source:-dev:$key}" --literal)
+    if [ -n "$list" ]; then args+=(--list "$list"); fi
     if [ -n "$due" ]; then args+=(--due "$due"); fi
     if [ -n "$prio" ]; then args+=(--priority "$prio"); fi
     if [ -n "$repeat" ]; then args+=(--repeat "$repeat"); fi
     json="$("$BIN/asst" "${args[@]}" "$title")"
     uid="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["uid"])' <<<"$json")"
+    # Only an open task: a re-run finds it done already.
+    if [ -n "$done" ] && python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["status"] == "needs-action" else 1)' <<<"$json"; then
+      "$BIN/asst" --json done "$uid" > /dev/null
+    fi
     if [ -n "$plan" ]; then
       slots="$(python3 -c '
 import json, sys
@@ -126,9 +157,9 @@ print(json.dumps(slots))
 }
 
 # Files older harness versions left in the instance dir. The live set is
-# the bus file, the logs and session.conf, plus config/ state/ data/ notes/.
+# the bus file, the logs and session.conf, plus config/ state/ data/.
 clear_stale() {
-  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|config|state|data|notes)$'
+  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|config|state|data)$'
   local f base
   for f in "$DEV"/* "$DEV"/.*; do
     [ -e "$f" ] || continue
@@ -153,6 +184,28 @@ action() {
   on_bus
   gdbus call --session --dest dev.jaeho.Asst.Devel --object-path /dev/jaeho/Asst/Devel \
     --method org.gtk.Actions.Activate "$1" "[<'${2//\'/\\\'}'>]" "{}" > /dev/null
+}
+
+# The pid behind a name on this instance's bus, or nothing. This is how the
+# instance's own window, asstd and stand-ins are told from the other
+# instances': a window class or a pattern on a command line matches them all.
+bus_pid() {
+  [ -f "$DEV/bus" ] || return 0
+  # The reply reads `(uint32 12345,)`.
+  DBUS_SESSION_BUS_ADDRESS="$(cat "$DEV/bus")" gdbus call --session \
+    --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.GetConnectionUnixProcessID "$1" 2> /dev/null \
+    | sed -n 's/^(uint32 \([0-9][0-9]*\),)$/\1/p' || true
+}
+
+# Ends the process owning NAME on this instance's bus, if it is a COMM, and
+# waits for it to go so the next `up` does not meet a bus still closing.
+stop_on_bus() {
+  local pid _
+  pid="$(bus_pid "$1")"
+  [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid")" = "$2" ] || return 0
+  kill "$pid" 2> /dev/null || return 0
+  for _ in $(seq 40); do kill -0 "$pid" 2> /dev/null || return 0; sleep 0.1; done
 }
 
 radicale_up() {
@@ -236,14 +289,11 @@ case "${1:-}" in
     build
     if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then exit 0; fi
     radicale_up
-    mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data" "$DEV/notes"
-    # Never the default, which is the real ~/Nextcloud/Notes.
+    mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data"
     if [ "${2:-}" = "--signed-out" ]; then
-      echo "notes = \"$DEV/notes\"" > "$DEV/config/asst/config.toml"
+      : > "$DEV/config/asst/config.toml"
     else
       cat > "$DEV/config/asst/config.toml" <<CONF
-notes = "$DEV/notes"
-
 [account]
 server = "http://127.0.0.1:5232"
 dav_url = "http://127.0.0.1:5232/"
@@ -295,7 +345,8 @@ CONF
     shift
     build
     on_bus
-    pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
+    # Only this instance's old window: a pattern would take the others'.
+    stop_on_bus dev.jaeho.Asst.Devel asst-gtk
     hide_window
     # Popovers stay open without keyboard focus (ASST_NO_AUTOHIDE).
     (env ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals \
@@ -321,10 +372,14 @@ CONF
   keys)
     shift
     live_hyprland || exit 1
+    # Every instance's window has the devel class, so the class would send
+    # the keys to all of them: aim at this instance's window by its pid.
+    pid="$(bus_pid dev.jaeho.Asst.Devel)"
+    [ -n "$pid" ] || { echo "no window on this instance's bus; run scripts/dev window" >&2; exit 1; }
     for k in "$@"; do
       mods="" key="$k"
       case "$k" in *+*) mods="${k%+*}"; key="${k##*+}"; mods="${mods//+/ }" ;; esac
-      hyprctl eval "hl.dispatch(hl.dsp.send_shortcut({mods=\"${mods}\", key=\"${key}\", window=\"class:^dev.jaeho.Asst.Devel\$\"}))" > /dev/null
+      hyprctl eval "hl.dispatch(hl.dsp.send_shortcut({mods=\"${mods}\", key=\"${key}\", window=\"pid:${pid}\"}))" > /dev/null
       sleep 0.05
     done
     ;;
@@ -353,12 +408,12 @@ CONF
     on_bus
     seed_lists
     seed_tasks
+    archive_lists Parked
     ;;
   reset)
-    "$0" down --all
+    # Not `down --all`: Radicale and the other instances stay as they are.
+    "$0" down
     rm -f "$DEV/config/asst/window.toml" "$DEV"/state/asst/asst.db*
-    rm -rf "$DEV/notes"
-    mkdir -p "$DEV/notes"
     # This instance's CalDAV collection only; other instances share Radicale.
     rm -rf "$RADICALE/data/collection-root/$(basename "$DEV")"
     clear_stale
@@ -366,28 +421,27 @@ CONF
     "$0" seed
     ;;
   down)
-    pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
-    pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
+    # Only what this instance runs, found by the names it owns on its bus.
+    # A pattern on the command line matches every instance's, and every
+    # worktree's, copy of the same binary. Asstd goes last: it and the
+    # notification stand-in are what keep the bus up.
+    stop_on_bus dev.jaeho.Asst.Devel asst-gtk
+    stop_on_bus org.kde.StatusNotifierWatcher python3
+    stop_on_bus org.freedesktop.Notifications python3
+    stop_on_bus dev.jaeho.Asst.Daemon asstd
     if [ "${2:-}" = "--all" ]; then
-      # Stray debug binaries and this instance's Radicale. The window rule
-      # from hide_window cannot be dropped (see its comment); it only
-      # matches the devel app id and dies with a Hyprland config reload.
+      # Every instance's stray debug binaries, and Radicale, which they
+      # share. The window rule from hide_window cannot be dropped (see its
+      # comment); it only matches the devel app id and dies with a
+      # Hyprland config reload.
       pkill -f "$BIN/asst-gtk" 2>/dev/null || true
       pkill -f "$BIN/asstd" 2>/dev/null || true
       pkill -f "target/debug/asst-gtk" 2>/dev/null || true
       pkill -f "target/debug/asstd" 2>/dev/null || true
+      pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
       pkill -f "$RADICALE/config" 2>/dev/null || true
     fi
-    if [ -f "$DEV/bus" ]; then
-      # The reply reads `(uint32 12345,)`.
-      pid="$( (on_bus && gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
-        --method org.freedesktop.DBus.GetConnectionUnixProcessID dev.jaeho.Asst.Daemon) 2>/dev/null \
-        | sed -n 's/^(uint32 \([0-9][0-9]*\),)$/\1/p')" || true
-      if [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid")" = asstd ]; then
-        kill "$pid"
-      fi
-      rm -f "$DEV/bus"
-    fi
+    rm -f "$DEV/bus"
     ;;
-  *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
