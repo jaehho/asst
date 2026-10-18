@@ -3546,4 +3546,30 @@ mod tests {
         }
         assert!(rig.log().iter().all(|r| r.kind != "list-renaming"));
     }
+
+    #[tokio::test]
+    async fn an_organisation_renamed_moves_every_link_and_asks_the_server_nothing() {
+        let repos = ["old/a", "old/b", "old/c", "old/d"];
+        let mut rig = Rig::new(&repos).await;
+        for (i, repo) in repos.iter().enumerate() {
+            rig.publish(10 + i as u64, repo, false);
+        }
+        rig.go().await;
+        let lists = rig.daemon.lists().unwrap();
+        for (i, repo) in repos.iter().enumerate() {
+            let new = repo.replace("old/", "new/");
+            rig.rename_on_github(10 + i as u64, repo, &new, "[]");
+        }
+
+        assert_eq!(rig.go().await, Round::Done);
+
+        for name in ["new/a", "new/b", "new/c", "new/d"] {
+            let row = rig.row(name);
+            assert_eq!((&row.follow_from, row.follow_at), (&None, None), "{name}");
+        }
+        assert!(rig.lists.calls().is_empty(), "{:?}", rig.lists.calls());
+        assert_eq!(rig.daemon.lists().unwrap(), lists);
+        assert_eq!(rig.log().len(), 4, "the four renames, and nothing else");
+        assert!(rig.notices().is_empty());
+    }
 }

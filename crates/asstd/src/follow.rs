@@ -232,6 +232,14 @@ async fn try_follow(
         if setting == FollowRename::Off {
             return keep(daemon, &link, old, None, &Keep::Why(KeepWhy::Off, ""), now);
         }
+        // Only the owner changed (an organisation was renamed, a repo handed
+        // over): the list is named for the repo's own name, which is the
+        // same. Nothing to follow and nothing to say, and no reason to read
+        // the server for each of however many repos moved at once.
+        if github::short(old).eq_ignore_ascii_case(github::short(&link.repo)) {
+            daemon.store().gh_clear_follow(&link.repo)?;
+            return Ok(());
+        }
     }
 
     // The lists as they are now, not as the cache last had them
