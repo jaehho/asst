@@ -45,6 +45,17 @@ thread_local! {
     static LIST_ICONS: RefCell<std::collections::BTreeMap<String, String>> = RefCell::default();
     /// Colors that have a `.tint-xxxxxx` rule by now.
     static TINTS: RefCell<std::collections::HashSet<String>> = RefCell::default();
+    /// Why location reminders cannot ring on this machine, as the daemon's
+    /// status says (#12): the reminder picker is built far from it.
+    static LOCATION_NOTE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub fn set_location_note(note: Option<&str>) {
+    LOCATION_NOTE.with(|n| *n.borrow_mut() = note.map(str::to_string));
+}
+
+pub fn location_note() -> Option<String> {
+    LOCATION_NOTE.with(|n| n.borrow().clone())
 }
 
 pub fn set_list_icons(icons: &std::collections::BTreeMap<String, String>) {

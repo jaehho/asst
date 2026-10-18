@@ -110,6 +110,7 @@ impl Daemon {
             last_sync: None,
             pending: store.pending().map(|p| p.len()).unwrap_or(0),
             zone: zone.name().to_string(),
+            location: None,
         };
         let daemon = Daemon {
             store: Mutex::new(store),
@@ -192,6 +193,16 @@ impl Daemon {
             &before.server,
         ) != (s.state, &s.message, s.pending, &s.server)
         {
+            self.emit(Event::Status(s.clone()));
+        }
+    }
+
+    /// Location reminders cannot ring here, and why; none when they can,
+    /// or when there are none to ring. Clients hear of a change.
+    pub fn set_location_problem(&self, problem: Option<String>) {
+        let mut s = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if s.location != problem {
+            s.location = problem;
             self.emit(Event::Status(s.clone()));
         }
     }

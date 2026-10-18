@@ -1968,6 +1968,7 @@ impl Component for Window {
                         self.lists = l.lists;
                         self.open = l.open;
                         if let Some(Settings { .. }) = &self.settings {}
+                        ui::set_location_note(l.status.location.as_deref());
                         self.status = Some(l.status);
                         self.links = l.links;
                         self.settle();
@@ -2014,6 +2015,7 @@ impl Component for Window {
                 if was_signed_out && s.state != SyncState::NoAccount {
                     self.reload(&sender);
                 }
+                ui::set_location_note(s.location.as_deref());
                 self.status = Some(s);
             }
             Cmd::LoginDone(ok, message) => {

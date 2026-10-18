@@ -2,8 +2,11 @@
 //! the way the phone does for an iPhone-made one. Each alarm rings once per
 //! arrival: it re-arms when the position leaves its radius. GeoClue missing
 //! (or refusing us) is logged once and retried on the next wake. With no
-//! location alarm on any open task asstd does not talk to GeoClue at all,
-//! and a GeoClue that never reports a position is said so once (#12).
+//! location alarm on any open task asstd does not talk to GeoClue at all.
+//! A GeoClue that cannot be reached, or reports no position for two
+//! minutes, is no silent failure (#12): the status carries why (the window
+//! and `asst status` show it), and one notification names the reminders
+//! that cannot ring here, once for each reminder, ever.
 //!
 //! # IP or timezone fallback: not done on purpose. An alarm's radius is
 //! about 100 m; an IP guess is off by kilometres, so it would ring at the
@@ -100,6 +103,8 @@ pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
                 }
                 Ok(()) => warned = false,
             }
+        } else {
+            daemon.set_location_problem(None);
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(10 * 60)) => {}
@@ -119,6 +124,124 @@ fn has_alarms(daemon: &Daemon) -> bool {
 /// How long a started client may stay silent before we say so.
 const NO_FIX_AFTER: Duration = Duration::from_secs(120);
 
+/// What the status says when GeoClue is there but never answers.
+const NO_POSITION: &str = "This computer has no way to tell where it is (GeoClue \
+    reports no position: no GPS, and no working wifi source), so location \
+    reminders can't ring here.";
+
+/// What the status says when GeoClue cannot be talked to at all.
+fn geoclue_down(error: &str) -> String {
+    format!(
+        "GeoClue is not working on this computer ({error}), so location reminders can't ring here."
+    )
+}
+
+/// A location reminder, for saying which cannot ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Alarmed {
+    /// Task href and alarm, to know it again.
+    key: String,
+    task: String,
+    place: String,
+}
+
+fn alarmed(daemon: &Daemon) -> Vec<Alarmed> {
+    let mut out = Vec::new();
+    for row in daemon.store().with_location_alarms().unwrap_or_default() {
+        for a in &row.task.location_alarms {
+            out.push(Alarmed {
+                key: format!("{}#{}", row.href, alarm_key(a)),
+                task: row.task.summary.clone(),
+                place: a.title.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Location reminders cannot ring here, for `why`: say so in the status,
+/// and in one notification for the reminders not yet told about.
+async fn unavailable(daemon: &Daemon, session: &zbus::Connection, why: String) {
+    daemon.set_location_problem(Some(why.clone()));
+    let all = alarmed(daemon);
+    let path = told_path();
+    let told = read_told(&path);
+    let fresh = untold(&all, &told);
+    if fresh.is_empty() {
+        return;
+    }
+    let (summary, body) = notice(&fresh, &why);
+    match tell(session, &summary, &body).await {
+        // What is known now is all that was told; a reminder taken away
+        // and made again is told about again.
+        Ok(()) => write_told(&path, &all),
+        Err(e) => log::warn!("telling that location reminders cannot ring: {e}"),
+    }
+}
+
+/// The reminders in `all` nobody has been told about.
+fn untold<'a>(all: &'a [Alarmed], told: &HashSet<String>) -> Vec<&'a Alarmed> {
+    all.iter().filter(|a| !told.contains(&a.key)).collect()
+}
+
+/// The notification: the reason, and which reminders (the first, and how
+/// many more) the phone will ring instead.
+fn notice(fresh: &[&Alarmed], why: &str) -> (String, String) {
+    let first = fresh.first().expect("something to tell");
+    let more = match fresh.len() - 1 {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    (
+        "Location reminders can't ring on this computer".to_string(),
+        format!(
+            "{why}\n“{}” (at {}){more}: your phone still rings them.",
+            first.task, first.place
+        ),
+    )
+}
+
+fn told_path() -> std::path::PathBuf {
+    asst_core::config::state_dir().join("location-told")
+}
+
+fn read_told(path: &std::path::Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn write_told(path: &std::path::Path, all: &[Alarmed]) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text: String = all.iter().map(|a| format!("{}\n", a.key)).collect();
+    if let Err(e) = std::fs::write(path, text) {
+        log::warn!("remembering which location reminders were told about: {e}");
+    }
+}
+
+async fn tell(session: &zbus::Connection, summary: &str, body: &str) -> zbus::Result<()> {
+    let proxy = NotificationsProxy::new(session).await?;
+    let mut hints = HashMap::new();
+    hints.insert("desktop-entry", Value::from(asst_core::config::APP_ID));
+    proxy
+        .notify(
+            "asst",
+            0,
+            asst_core::config::APP_ID,
+            summary,
+            body,
+            &[],
+            hints,
+            -1,
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Subscribe and follow the position until woken; an error means GeoClue is
 /// not there (or says no). Returns when the subscription ends.
 async fn one_round(
@@ -127,34 +250,45 @@ async fn one_round(
     inside: &Inside,
 ) -> Result<(), String> {
     // GeoClue sits on the system bus; the session one carries notifications.
-    let conn = zbus::Connection::system()
-        .await
-        .map_err(|e| e.to_string())?;
-    let manager = ManagerProxy::new(&conn).await.map_err(|e| e.to_string())?;
-    let path = manager.get_client().await.map_err(|e| e.to_string())?;
-    let client = ClientProxy::builder(&conn)
-        .path(path)
-        .map_err(|e| e.to_string())?
-        .build()
-        .await
-        .map_err(|e| e.to_string())?;
-    client
-        .set_desktop_id("asst".into())
-        .await
-        .map_err(|e| e.to_string())?;
-    client
-        .set_requested_accuracy_level(4)
-        .await
-        .map_err(|e| e.to_string())?;
-    client
-        .set_distance_threshold(25)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut updates = client
-        .receive_location_updated()
-        .await
-        .map_err(|e| e.to_string())?;
-    client.start().await.map_err(|e| e.to_string())?;
+    let setup = async {
+        let conn = zbus::Connection::system()
+            .await
+            .map_err(|e| e.to_string())?;
+        let manager = ManagerProxy::new(&conn).await.map_err(|e| e.to_string())?;
+        let path = manager.get_client().await.map_err(|e| e.to_string())?;
+        let client = ClientProxy::builder(&conn)
+            .path(path)
+            .map_err(|e| e.to_string())?
+            .build()
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .set_desktop_id("asst".into())
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .set_requested_accuracy_level(4)
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .set_distance_threshold(25)
+            .await
+            .map_err(|e| e.to_string())?;
+        let updates = client
+            .receive_location_updated()
+            .await
+            .map_err(|e| e.to_string())?;
+        client.start().await.map_err(|e| e.to_string())?;
+        Ok::<_, String>((conn, updates))
+    };
+    let (conn, mut updates) = match setup.await {
+        Ok(started) => started,
+        Err(e) => {
+            let said = e.replace("org.freedesktop.DBus.Error.", "");
+            unavailable(daemon, session, geoclue_down(&said)).await;
+            return Err(e);
+        }
+    };
     let mut fixed = false;
     let silence = tokio::time::sleep(NO_FIX_AFTER);
     tokio::pin!(silence);
@@ -170,6 +304,7 @@ async fn one_round(
                      until it has one",
                     NO_FIX_AFTER.as_secs()
                 );
+                unavailable(daemon, session, NO_POSITION.to_string()).await;
                 continue;
             }
             signal = updates.next() => {
@@ -200,6 +335,7 @@ async fn one_round(
             }
         }
         let (lat, lon) = position;
+        daemon.set_location_problem(None);
         check(daemon, session, inside, lat, lon);
     }
 }
@@ -306,5 +442,56 @@ mod tests {
         assert!(metres(40.7, -74.0, 40.7, -74.0) < f64::EPSILON);
         // A tenth of a degree of latitude is 11.1 km.
         assert!(metres(40.7, -74.0, 40.8, -74.0) > 11_000.0);
+    }
+
+    fn alarm(href: &str, task: &str, place: &str) -> Alarmed {
+        Alarmed {
+            key: format!("{href}#{place}"),
+            task: task.into(),
+            place: place.into(),
+        }
+    }
+
+    #[test]
+    fn each_reminder_is_told_about_once_and_again_if_made_anew() {
+        let dir = std::env::temp_dir().join(format!("asst-told-{}", std::process::id()));
+        let path = dir.join("location-told");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(read_told(&path).is_empty(), "no file, nothing told");
+
+        let gym = alarm("/l/a.ics", "Gym", "The gym");
+        let shop = alarm("/l/b.ics", "Milk", "The shop");
+        let all = vec![gym.clone(), shop.clone()];
+        assert_eq!(untold(&all, &read_told(&path)), [&gym, &shop]);
+
+        write_told(&path, &all);
+        assert!(untold(&all, &read_told(&path)).is_empty());
+        // One more reminder: only it is news.
+        let bank = alarm("/l/c.ics", "Cash", "The bank");
+        let more = vec![gym.clone(), shop, bank.clone()];
+        assert_eq!(untold(&more, &read_told(&path)), [&bank]);
+        // The gym one is taken away, and written again later: told again.
+        write_told(&path, std::slice::from_ref(&bank));
+        assert_eq!(untold(&all, &read_told(&path)), [&gym, &all[1]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_notice_names_the_reason_and_the_reminders() {
+        let one = alarm("/l/a.ics", "Gym", "The gym");
+        let two = alarm("/l/b.ics", "Milk", "The shop");
+        let (summary, body) = notice(&[&one], NO_POSITION);
+        assert_eq!(summary, "Location reminders can't ring on this computer");
+        assert!(body.starts_with(NO_POSITION));
+        assert!(body.ends_with("“Gym” (at The gym): your phone still rings them."));
+        let (_, body) = notice(
+            &[&one, &two, &two],
+            &geoclue_down("NoReply: Remote peer disconnected"),
+        );
+        assert!(body.starts_with(
+            "GeoClue is not working on this computer (NoReply: Remote peer disconnected), so \
+             location reminders can't ring here."
+        ));
+        assert!(body.contains("“Gym” (at The gym) and 2 more:"));
     }
 }
