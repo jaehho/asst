@@ -1194,4 +1194,27 @@ mod tests {
             })
         ));
     }
+
+    /// `asst projects` reads and proposes. It reaches the database only
+    /// through `Store::label_totals` (read-only, migrating nothing), writes
+    /// no file, and names nothing that deletes or links.
+    #[test]
+    fn the_report_names_nothing_that_changes_anything() {
+        let text = include_str!("projects.rs");
+        let code = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+        assert!(code.len() > 1000, "the code was found");
+        for word in [
+            "delete_list",
+            "gh_unlink",
+            "remove_list",
+            "DELETE FROM",
+            "Store::open",
+            "fs::write",
+            "File::create",
+            ".link(",
+            ".unlink(",
+        ] {
+            assert!(!code.contains(word), "projects.rs names {word}");
+        }
+    }
 }

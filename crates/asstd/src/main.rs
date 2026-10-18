@@ -65,3 +65,34 @@ async fn main() -> anyhow::Result<()> {
     daemon.flush().await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// `window.toml` is the window's: it writes the file whole and keeps
+    /// the archive, the order and the icons in it. The daemon names neither
+    /// the file nor the helpers that read it, so what it learns about a
+    /// repo (archived, renamed) is reported and never written there.
+    #[test]
+    fn the_daemon_never_names_the_windows_file() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let code = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+            seen += 1;
+            for word in [
+                "window.toml",
+                "window_path",
+                "archived_in_window",
+                "archived_lists",
+            ] {
+                assert!(!code.contains(word), "{} names {word}", path.display());
+            }
+        }
+        assert!(seen >= 8, "the sources were found");
+    }
+}
