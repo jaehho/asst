@@ -218,7 +218,9 @@ async fn identify(
     now: DateTime<Utc>,
 ) -> Result<Gate> {
     let repo = row.repo.as_str();
-    if memory.waits.get(repo).is_some_and(|until| now < *until) {
+    // A wait is never longer than LONGEST_WAIT: one that seems to be is from
+    // before the clock was set back, and is over
+    if (memory.waits.get(repo)).is_some_and(|until| now < *until && *until - now <= LONGEST_WAIT) {
         return Ok(Gate::Stop);
     }
     memory.waits.remove(repo);
@@ -318,10 +320,11 @@ async fn look(
         ),
         (Observed::Moved { id }, None) => Some(gh.repo(Target::Id(*id), None).await?),
         (Observed::Missing, Some(_)) => {
+            // (a lookup from the clock's future is from before it was set back)
             if memory
                 .lookups
                 .get(repo)
-                .is_some_and(|at| now - *at < NAME_LOOKUP_EVERY)
+                .is_some_and(|at| now >= *at && now - *at < NAME_LOOKUP_EVERY)
             {
                 return Ok(None);
             }
@@ -3604,5 +3607,50 @@ mod tests {
         assert_eq!(rig.daemon.lists().unwrap(), lists);
         assert_eq!(rig.log().len(), 4, "the four renames, and nothing else");
         assert!(rig.notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_clock_set_back_does_not_stretch_a_wait_or_the_hour_between_lookups() {
+        let mut rig = Rig::new(&["jaehho/x"]).await;
+        rig.publish(5, "jaehho/x", false);
+        rig.go().await;
+
+        // A refusal asks for half an hour; then the clock goes back three
+        rig.fake.reply(
+            "GET",
+            "/repositories/5",
+            Reply::json(429, "{}").header("retry-after", "1800"),
+        );
+        rig.go().await;
+        let asked = rig.fake.count("/repositories/5");
+        rig.later(10);
+        rig.go().await;
+        assert_eq!(rig.fake.count("/repositories/5"), asked, "waiting");
+        rig.later(-180);
+        rig.publish(5, "jaehho/x", false);
+        rig.go().await;
+        assert_eq!(
+            rig.fake.count("/repositories/5"),
+            asked + 1,
+            "a wait that is more than the longest one is not one"
+        );
+        assert_eq!(rig.link("jaehho/x").error, None);
+
+        // The name asked for once, and the clock goes back two hours
+        rig.fake.reply("GET", "/repositories/5", Reply::status(404));
+        rig.fake.reply("GET", "/repos/jaehho/x", Reply::status(404));
+        rig.later(5);
+        rig.go().await;
+        let named = rig.fake.count("/repos/jaehho/x");
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.fake.count("/repos/jaehho/x"), named, "once an hour");
+        rig.later(-120);
+        rig.go().await;
+        assert_eq!(rig.fake.count("/repos/jaehho/x"), named + 1);
+        assert_eq!(
+            rig.link("jaehho/x").state,
+            Some(asst_core::api::LinkState::Unreachable)
+        );
     }
 }
