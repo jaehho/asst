@@ -1,5 +1,19 @@
 //! asst: tasks from the terminal. Everything goes through asstd.
 
+// std's `println!` and `print!` panic when stdout is a pipe that has
+// closed (`asst today | head`). These end the program quietly, as a shell
+// tool ends, wherever they are used below.
+macro_rules! println {
+    () => { $crate::out::write_stdout(format_args!("\n")) };
+    ($($arg:tt)*) => {
+        $crate::out::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => { $crate::out::write_stdout(format_args!($($arg)*)) };
+}
+
 mod bar;
 mod out;
 mod projects;

@@ -12,6 +12,21 @@ use chrono_tz::Tz;
 
 use crate::projects::{Pending, ProjectLink, Report};
 
+/// Write to stdout for the `println!` and `print!` in main.rs. The reader
+/// of a pipe that has gone (`asst today | head`) ends the program, as
+/// bar.rs does for waybar; any other failure (a full disk) says so.
+pub fn write_stdout(args: std::fmt::Arguments) {
+    use std::io::{ErrorKind, Write};
+    let Err(e) = std::io::stdout().lock().write_fmt(args) else {
+        return;
+    };
+    if e.kind() == ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("asst: writing to stdout: {e}");
+    std::process::exit(1);
+}
+
 pub struct Style {
     color: bool,
 }
@@ -60,7 +75,7 @@ impl Style {
     }
 }
 
-/// `a1b2  !! Call the bank  tomorrow 5pm ↻  #Errands`
+/// `a1b2  !! Call the bank  tomorrow 5pm ↻ ⏰  #Errands`
 pub fn task_line(s: &Style, t: &TaskView, now: DateTime<Tz>, show_list: bool) -> String {
     let marker = match priority_level(t.task.priority) {
         1 => s.red("!!!"),
@@ -90,6 +105,9 @@ pub fn task_line(s: &Style, t: &TaskView, now: DateTime<Tz>, show_list: bool) ->
     }
     if t.task.rrule.is_some() {
         line.push_str(&s.dim(" ↻"));
+    }
+    if t.task.is_open() && (!t.task.alarms.is_empty() || !t.task.location_alarms.is_empty()) {
+        line.push_str(&s.dim(" ⏰"));
     }
     if show_list {
         line.push_str(&s.dim(&format!("  #{}", t.list_name.replace(' ', ""))));
@@ -977,5 +995,54 @@ Labels
             log_text(&plain(), &[], ny(), Some("jaehho/lab")),
             "nothing logged for jaehho/lab"
         );
+    }
+}
+
+#[cfg(test)]
+mod task_line_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    fn view(status: &str, alarms: serde_json::Value, places: serde_json::Value) -> TaskView {
+        serde_json::from_value(serde_json::json!({
+            "id": "a1b2",
+            "href": "/cal/work/a1b2.ics",
+            "list": "/cal/work/",
+            "list_name": "Work",
+            "pending": false,
+            "origin": "asst",
+            "uid": "a1b2",
+            "summary": "Call the bank",
+            "status": status,
+            "priority": 0,
+            "alarms": alarms,
+            "location_alarms": places,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_line_marks_a_task_that_will_ring() {
+        let now = "America/New_York"
+            .parse::<Tz>()
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 18, 9, 0, 0)
+            .unwrap();
+        let line = |t: &TaskView| task_line(&Style { color: false }, t, now, false);
+        let at =
+            serde_json::json!([{"trigger": {"kind": "absolute", "at": "2026-10-19T13:00:00Z"}}]);
+        let place = serde_json::json!([{
+            "uid": "p1", "title": "Bank", "address": "Bank",
+            "lat": 40.7, "lon": -74.0, "radius": 100,
+        }]);
+        let none = serde_json::json!([]);
+        let marked = |status, alarms, places| line(&view(status, alarms, places)).contains('⏰');
+
+        assert!(!marked("needs-action", none.clone(), none.clone()));
+        assert!(marked("needs-action", at.clone(), none.clone()));
+        assert!(marked("needs-action", none.clone(), place));
+        // Nothing rings for a task that is done.
+        assert!(!marked("completed", at, none));
     }
 }
