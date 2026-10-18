@@ -12,6 +12,9 @@ use crate::model::{Nav, PlanSlot, ViewOpts};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
+    /// Which one-time rewrites of this file have run (see `migrate`). 0
+    /// for a file from before the key.
+    pub schema: u32,
     /// `Nav::key` of the view shown last.
     pub view: String,
     pub width: i32,
@@ -53,6 +56,10 @@ pub struct Prefs {
     /// Completed, which always were. Read once, then written as `sidebar`.
     #[serde(skip_serializing)]
     filters: Vec<String>,
+    /// The `sidebar` that `migrate` replaced on this load, for the window
+    /// to offer back. Not saved.
+    #[serde(skip)]
+    pub migrated_from: Option<Vec<String>>,
     /// Day-plan slots, window-local: the iPhone has no planned slot, so
     /// nothing of this goes near the VTODO. Keyed by task UID + date, with
     /// the start (minutes from midnight) and the duration in minutes.
@@ -67,7 +74,8 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Prefs {
         Prefs {
-            view: Nav::Today.key(),
+            schema: 0,
+            view: Nav::Inbox.key(),
             width: 1080,
             height: 720,
             maximized: false,
@@ -86,6 +94,7 @@ impl Default for Prefs {
             work_command: "kitty --directory {dir} gh-co {number}".into(),
             sidebar: None,
             filters: Vec::new(),
+            migrated_from: None,
             plan: Vec::new(),
             day_zoom: crate::model::PLAN_PX_PER_HOUR,
             views: BTreeMap::new(),
@@ -93,8 +102,13 @@ impl Default for Prefs {
     }
 }
 
-/// The views a new sidebar has.
-const DEFAULT_SIDEBAR: [Nav; 6] = [
+/// The views a new sidebar has. The rest are one menu away.
+const DEFAULT_SIDEBAR: [Nav; 2] = [Nav::Inbox, Nav::Day];
+
+/// What the sidebar showed before it was two views, and so what a sidebar
+/// untouched since then still holds. Only the upgrade of an old file reads
+/// it (`migrate`).
+const LEGACY_STOCK: [Nav; 6] = [
     Nav::Inbox,
     Nav::Today,
     Nav::Day,
@@ -103,13 +117,95 @@ const DEFAULT_SIDEBAR: [Nav; 6] = [
     Nav::Completed,
 ];
 
+/// The `schema` this build writes. 1: the sidebar starts with Inbox and Day.
+const SCHEMA: u32 = 1;
+
 fn path() -> PathBuf {
     asst_core::config::window_path()
+}
+
+/// Rewrite a file from before `schema`, once. The older upgrades of the
+/// sidebar run here too, so they stand down for a sidebar chosen since:
+/// exactly the old four, five or six views would otherwise grow back on
+/// every load.
+///
+/// A sidebar showing all ten views or exactly the old six was never
+/// arranged, so it becomes Inbox and Day, and `migrated_from` keeps the old
+/// keys for the window to offer back. Anything else (a subset, an empty
+/// `sidebar = []`) stays as the user left it.
+fn migrate(p: &mut Prefs) {
+    if p.schema >= SCHEMA {
+        return;
+    }
+    upgrade_sidebar(p);
+    let stock: Vec<String> = LEGACY_STOCK.iter().map(Nav::key).collect();
+    let unarranged = p.sidebar.as_ref().is_some_and(|keys| {
+        *keys == stock || Nav::filters().iter().all(|n| keys.contains(&n.key()))
+    });
+    if unarranged {
+        p.migrated_from = p.sidebar.take();
+        p.sidebar = Some(DEFAULT_SIDEBAR.iter().map(Nav::key).collect());
+    }
+    p.schema = SCHEMA;
+}
+
+/// The sidebar of an older file, brought up to the stock six it would have
+/// had: each new view is put in once, without touching a sidebar the user
+/// arranged.
+fn upgrade_sidebar(p: &mut Prefs) {
+    if p.sidebar.is_none() && !p.filters.is_empty() {
+        let mut keys: Vec<String> = LEGACY_STOCK.iter().map(Nav::key).collect();
+        keys.extend(std::mem::take(&mut p.filters));
+        p.sidebar = Some(keys);
+    }
+    // The stock sidebar as it was before Matrix.
+    const BEFORE_MATRIX: [&str; 4] = ["inbox", "today", "scheduled", "completed"];
+    if let Some(keys) = &p.sidebar
+        && keys.iter().map(String::as_str).eq(BEFORE_MATRIX)
+    {
+        p.sidebar = Some(LEGACY_STOCK.iter().map(Nav::key).collect());
+    }
+    // Same for Time after the stock five: insert it before Completed.
+    if let Some(keys) = &mut p.sidebar {
+        let has_time = keys.iter().any(|k| k == "time");
+        let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
+        const BEFORE_TIME: [&str; 5] = ["inbox", "today", "matrix", "scheduled", "completed"];
+        if !has_time && stock == BEFORE_TIME {
+            *keys = LEGACY_STOCK.iter().map(Nav::key).collect();
+        }
+    }
+    // Same for Plan after the stock six: insert it after Today.
+    if let Some(keys) = &mut p.sidebar {
+        let has_plan = keys.iter().any(|k| k == "plan");
+        let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
+        const BEFORE_PLAN: [&str; 6] =
+            ["inbox", "today", "matrix", "scheduled", "time", "completed"];
+        if !has_plan && stock == BEFORE_PLAN {
+            *keys = LEGACY_STOCK.iter().map(Nav::key).collect();
+        }
+    }
+    // Time and Plan are one Day view now: keep one `day` where either
+    // was, so a sidebar the user arranged does not grow a second tile.
+    if let Some(keys) = &mut p.sidebar {
+        let first = keys
+            .iter()
+            .position(|k| k == "time" || k == "plan" || k == "day");
+        if let Some(at) = first {
+            keys.retain(|k| k != "time" && k != "plan" && k != "day");
+            keys.insert(at, "day".into());
+        }
+    }
 }
 
 impl Prefs {
     pub fn load() -> Prefs {
         Prefs::load_from(&path())
+    }
+
+    /// A file's worth of defaults, as a new install writes them: already at
+    /// the current `schema`, so no migration looks at it later.
+    fn fresh() -> Prefs {
+        Prefs::parse("").unwrap_or_default()
     }
 
     /// The prefs in `file`; the defaults when there is no file. A file that
@@ -120,7 +216,7 @@ impl Prefs {
     fn load_from(file: &Path) -> Prefs {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Prefs::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Prefs::fresh(),
             Err(e) => return Prefs::set_aside(file, &e.to_string()),
         };
         Prefs::parse(&text).unwrap_or_else(|e| {
@@ -151,56 +247,35 @@ impl Prefs {
                 bad.display()
             ),
         }
-        Prefs::default()
+        Prefs::fresh()
     }
 
     fn parse(text: &str) -> Result<Prefs, toml::de::Error> {
         let mut p: Prefs = toml::from_str(text)?;
         p.day_zoom = crate::model::clamp_px_per_hour(p.day_zoom);
-        if p.sidebar.is_none() && !p.filters.is_empty() {
-            let mut keys: Vec<String> = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
-            keys.extend(std::mem::take(&mut p.filters));
-            p.sidebar = Some(keys);
-        }
-        // The default sidebar as it was before Matrix: put the new view in,
-        // once, without touching a sidebar the user arranged.
-        const BEFORE_MATRIX: [&str; 4] = ["inbox", "today", "scheduled", "completed"];
-        if let Some(keys) = &p.sidebar
-            && keys.iter().map(String::as_str).eq(BEFORE_MATRIX)
-        {
-            p.sidebar = Some(DEFAULT_SIDEBAR.iter().map(Nav::key).collect());
-        }
-        // Same for Time after the stock five: insert it before Completed.
-        if let Some(keys) = &mut p.sidebar {
-            let has_time = keys.iter().any(|k| k == "time");
-            let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
-            const BEFORE_TIME: [&str; 5] = ["inbox", "today", "matrix", "scheduled", "completed"];
-            if !has_time && stock == BEFORE_TIME {
-                *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
-            }
-        }
-        // Same for Plan after the stock six: insert it after Today.
-        if let Some(keys) = &mut p.sidebar {
-            let has_plan = keys.iter().any(|k| k == "plan");
-            let stock: Vec<&str> = keys.iter().map(String::as_str).collect();
-            const BEFORE_PLAN: [&str; 6] =
-                ["inbox", "today", "matrix", "scheduled", "time", "completed"];
-            if !has_plan && stock == BEFORE_PLAN {
-                *keys = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
-            }
-        }
-        // Time and Plan are one Day view now: keep one `day` where either
-        // was, so a sidebar the user arranged does not grow a second tile.
-        if let Some(keys) = &mut p.sidebar {
-            let first = keys
-                .iter()
-                .position(|k| k == "time" || k == "plan" || k == "day");
-            if let Some(at) = first {
-                keys.retain(|k| k != "time" && k != "plan" && k != "day");
-                keys.insert(at, "day".into());
-            }
-        }
+        migrate(&mut p);
         Ok(p)
+    }
+
+    /// Keep the file as it stands as `<file>.v0` before the first rewrite of
+    /// it by a build that migrates, unless a copy is there already: the
+    /// oldest copy is the one worth having.
+    pub fn back_up_v0() {
+        Prefs::back_up_v0_of(&path());
+    }
+
+    fn back_up_v0_of(file: &Path) {
+        let v0 = file.with_extension("toml.v0");
+        if v0.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::copy(file, &v0) {
+            eprintln!(
+                "asst-gtk: {}: could not keep a copy as {}: {e}",
+                file.display(),
+                v0.display()
+            );
+        }
     }
 
     pub fn save(&self) {
@@ -230,6 +305,16 @@ impl Prefs {
                 .collect(),
             None => DEFAULT_SIDEBAR.to_vec(),
         }
+    }
+
+    /// Where the window starts when the view last shown is unknown, and
+    /// where it goes when the open list is deleted: the first tile, else the
+    /// Inbox, which is always there (Ctrl+I) even with its tile hidden.
+    pub fn home(&self) -> Nav {
+        self.sidebar_views()
+            .into_iter()
+            .next()
+            .unwrap_or(Nav::Inbox)
     }
 
     pub fn set_sidebar_views(&mut self, views: &[Nav]) {
@@ -346,9 +431,30 @@ mod tests {
         Prefs::parse(text).unwrap()
     }
 
+    fn keys(views: &[Nav]) -> Vec<String> {
+        views.iter().map(Nav::key).collect()
+    }
+
+    #[test]
+    fn a_fresh_file_has_inbox_and_day() {
+        let p = parse("");
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Day]);
+        assert_eq!(p.home(), Nav::Inbox);
+        assert_eq!(p.view, "inbox");
+        // Already current, so nothing rewrites it later, and nothing to offer
+        // back.
+        assert_eq!(p.schema, SCHEMA);
+        assert_eq!(p.migrated_from, None);
+        // What a new install saves, read again.
+        let again = parse(&toml::to_string(&p).unwrap());
+        assert_eq!(again, p);
+    }
+
     #[test]
     fn sidebar_starts_with_the_defaults_and_keeps_old_extras() {
         assert_eq!(parse("").sidebar_views(), DEFAULT_SIDEBAR);
+        // Extras from before `sidebar` was a key come after the old six, and
+        // a sidebar that is the six and more was arranged.
         let old = parse("filters = [\"tomorrow\"]\n");
         assert_eq!(
             old.sidebar_views(),
@@ -362,15 +468,19 @@ mod tests {
                 Nav::Tomorrow
             ]
         );
-        // A sidebar arranged before Matrix stays as it was; the stock four
-        // gain Matrix (and then Day).
+        assert_eq!(old.migrated_from, None);
+        // A sidebar arranged before Matrix stays as it was.
         let custom = parse("sidebar = [\"today\", \"inbox\"]\n");
         assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
+        // The stock four, five and six are all the old stock, which gained
+        // Matrix and Day on the way: the shims bring each to the six, and
+        // `migrate` then takes the six to the new default.
         let stock = parse("sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n");
+        assert_eq!(stock.migrated_from, Some(keys(&LEGACY_STOCK)));
         assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
-        // Stock five with Matrix gains Day once.
         let with_matrix =
             parse("sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"completed\"]\n");
+        assert_eq!(with_matrix.migrated_from, Some(keys(&LEGACY_STOCK)));
         assert_eq!(with_matrix.sidebar_views(), DEFAULT_SIDEBAR);
         // Time and Plan become one Day tile at the first of the two.
         let merged = parse(
@@ -396,6 +506,134 @@ mod tests {
         assert!(parse(&text).sidebar_views().is_empty());
     }
 
+    /// `~/.config/asst/window.toml` as it was when the sidebar went to two
+    /// views, copied as it is: stale `/tasks/` in `list_order`, an archived
+    /// list, all ten views in an order of their own.
+    const THE_USERS_FILE: &str = r#"view = "list:/remote.php/dav/calendars/jaeho/champalimaud-21eefd/"
+width = 1080
+height = 720
+maximized = true
+show_counts = true
+complete_later = true
+sunday_first = false
+background = true
+lists_by_name = false
+list_order = ["/remote.php/dav/calendars/jaeho/5f55a575-75e6-4d30-89b8-280d684e437c/", "/remote.php/dav/calendars/jaeho/tasks/"]
+archived = ["/remote.php/dav/calendars/jaeho/mail-digest-d1e268/"]
+remember_list = false
+default_priority = 4
+read_dates = true
+projects_dir = "~/projects"
+work_command = "kitty --directory {dir} gh-co {number}"
+sidebar = ["inbox", "today", "scheduled", "all", "matrix", "day", "completed", "tomorrow", "anytime", "repeating"]
+plan = []
+day_zoom = 52.0
+
+[list_icons]
+
+[views]
+"#;
+
+    #[test]
+    fn the_users_ten_view_sidebar_becomes_inbox_and_day_once() {
+        // The file as serde reads it, before anything is rewritten.
+        let raw: Prefs = toml::from_str(THE_USERS_FILE).unwrap();
+        assert_eq!(raw.schema, 0);
+        assert_eq!(raw.sidebar_views().len(), 10);
+
+        let p = parse(THE_USERS_FILE);
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Day]);
+        assert_eq!(p.schema, 1);
+        assert_eq!(p.migrated_from, raw.sidebar);
+        // Nothing else moved: the archive, the order with its stale entry,
+        // the counts, the open list, the lot.
+        assert_eq!(
+            p,
+            Prefs {
+                schema: 1,
+                sidebar: Some(keys(&DEFAULT_SIDEBAR)),
+                migrated_from: raw.sidebar.clone(),
+                ..raw.clone()
+            }
+        );
+        assert_eq!(
+            p.archived,
+            ["/remote.php/dav/calendars/jaeho/mail-digest-d1e268/"]
+        );
+        assert_eq!(p.list_order.len(), 2);
+        assert!(p.list_order[1].ends_with("/tasks/"));
+
+        // What the window saves straight after, read again: stable, with
+        // nothing left to migrate or offer back.
+        let saved = toml::to_string(&p).unwrap();
+        assert!(saved.contains("schema = 1"));
+        assert!(!saved.contains("migrated_from"));
+        let again = parse(&saved);
+        assert_eq!(again.migrated_from, None);
+        assert_eq!(
+            again,
+            Prefs {
+                migrated_from: None,
+                ..p.clone()
+            }
+        );
+
+        // All ten views back on purpose is the user's own, kept for good.
+        let mut chosen = again;
+        chosen.set_sidebar_views(&Nav::filters());
+        let reread = parse(&toml::to_string(&chosen).unwrap());
+        assert_eq!(reread.sidebar_views(), Nav::filters());
+        assert_eq!(reread.migrated_from, None);
+    }
+
+    #[test]
+    fn the_old_stock_six_becomes_minimal_a_curated_sidebar_does_not() {
+        let stock = keys(&LEGACY_STOCK);
+        let six = parse(&format!("sidebar = {stock:?}\n"));
+        assert_eq!(six.sidebar_views(), DEFAULT_SIDEBAR);
+        assert_eq!(six.migrated_from, Some(stock));
+
+        // Arranged: left as it is, nothing to offer back.
+        for (text, shown) in [
+            (
+                "sidebar = [\"today\", \"inbox\"]\n",
+                vec![Nav::Today, Nav::Inbox],
+            ),
+            ("sidebar = []\n", vec![]),
+            (
+                "sidebar = [\"inbox\", \"day\"]\n",
+                vec![Nav::Inbox, Nav::Day],
+            ),
+            ("sidebar = [\"matrix\"]\n", vec![Nav::Matrix]),
+        ] {
+            let p = parse(text);
+            assert_eq!(p.sidebar_views(), shown, "{text}");
+            assert_eq!(p.migrated_from, None, "{text}");
+            assert_eq!(p.schema, 1, "{text}");
+        }
+
+        // After the migration the upgrade shims stand down: a sidebar of
+        // exactly the old four is somebody's choice now, not a stock one that
+        // lacks Matrix and Day.
+        let four =
+            parse("schema = 1\nsidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n");
+        assert_eq!(
+            four.sidebar_views(),
+            [Nav::Inbox, Nav::Today, Nav::Scheduled, Nav::Completed]
+        );
+        assert_eq!(four.migrated_from, None);
+    }
+
+    #[test]
+    fn home_is_the_first_tile_else_the_inbox() {
+        assert_eq!(Prefs::default().home(), Nav::Inbox);
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::Day, Nav::Inbox]);
+        assert_eq!(p.home(), Nav::Day);
+        p.set_sidebar_views(&[]);
+        assert_eq!(p.home(), Nav::Inbox);
+    }
+
     #[test]
     fn a_file_that_does_not_parse_is_kept_not_overwritten() {
         // One key of the wrong type: the whole file is refused.
@@ -408,8 +646,9 @@ mod tests {
         let file = dir.join("window.toml");
         let kept = file.with_extension("toml.bad");
 
-        // No file: the defaults, and nothing made.
-        assert_eq!(Prefs::load_from(&file), Prefs::default());
+        // No file: the defaults, as a new install has them, and nothing made.
+        assert_eq!(Prefs::load_from(&file), Prefs::fresh());
+        assert_eq!(Prefs::load_from(&file).schema, SCHEMA);
         assert!(!kept.exists());
 
         // A good file loads as it is.
@@ -419,14 +658,34 @@ mod tests {
 
         // A bad one is moved, whole, before the defaults take its place.
         std::fs::write(&file, bad).unwrap();
-        assert_eq!(Prefs::load_from(&file), Prefs::default());
+        assert_eq!(Prefs::load_from(&file), Prefs::fresh());
         assert!(!file.exists());
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), bad);
 
         // A second bad file replaces the first copy rather than failing.
         std::fs::write(&file, "height = true\n").unwrap();
-        assert_eq!(Prefs::load_from(&file), Prefs::default());
+        assert_eq!(Prefs::load_from(&file), Prefs::fresh());
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "height = true\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_v0_copy_is_the_oldest_one() {
+        let dir = std::env::temp_dir().join(format!("asst-prefs-v0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("window.toml");
+        let v0 = file.with_extension("toml.v0");
+
+        std::fs::write(&file, "width = 1\n").unwrap();
+        Prefs::back_up_v0_of(&file);
+        assert_eq!(std::fs::read_to_string(&v0).unwrap(), "width = 1\n");
+
+        // A later migration (a restored file, a second machine's copy) must
+        // not replace the file as it was before any of them.
+        std::fs::write(&file, "width = 2\n").unwrap();
+        Prefs::back_up_v0_of(&file);
+        assert_eq!(std::fs::read_to_string(&v0).unwrap(), "width = 1\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

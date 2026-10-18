@@ -247,6 +247,9 @@ pub enum Msg {
     /// Take a view out of the sidebar.
     HideView(Nav),
     SetSidebar(Vec<Nav>),
+    /// The sidebar as it was, as saved (`None`: the default): the Undo of
+    /// the migration to Inbox and Day.
+    RestoreSidebar(Option<Vec<String>>),
     SetSettings(Box<SettingsChange>),
     SignIn(String),
     SignOut,
@@ -668,7 +671,15 @@ impl Component for Window {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let tx: Tx = sender.input_sender().clone();
-        let prefs = Prefs::load();
+        let mut prefs = Prefs::load();
+        // A migration is saved at once, with the old file kept beside it:
+        // else `schema` is never stored and every launch would do it again.
+        // (`init_root` and quick add load the file too, and never save.)
+        let migrated = prefs.migrated_from.take();
+        if migrated.is_some() {
+            Prefs::back_up_v0();
+            prefs.save();
+        }
 
         // -- sidebar
         let status: Rc<RefCell<Option<StatusView>>> = Rc::default();
@@ -1033,7 +1044,7 @@ impl Component for Window {
                 .drop_on_shutdown()
         });
 
-        let nav = Nav::from_key(&prefs.view).unwrap_or(Nav::Today);
+        let nav = Nav::from_key(&prefs.view).unwrap_or(Nav::Inbox);
         let mut model = Window {
             nav,
             lists: Vec::new(),
@@ -1098,6 +1109,26 @@ impl Component for Window {
             tray,
             quitting,
         };
+        if let Some(old) = migrated {
+            // Said when the window first shows, not at login in the tray,
+            // where ten seconds go by with nobody looking.
+            let old = Cell::new(Some(old));
+            let toasts = widgets.toasts.clone();
+            let tx = tx.clone();
+            widgets.window.connect_map(move |_| {
+                let Some(old) = old.take() else { return };
+                let undo = adw::Toast::builder()
+                    .title("Sidebar now shows Inbox and Day.")
+                    .button_label("Undo")
+                    .timeout(10)
+                    .build();
+                let tx = tx.clone();
+                undo.connect_button_clicked(move |_| {
+                    tx.emit(Msg::RestoreSidebar(Some(old.clone())))
+                });
+                toasts.add_toast(undo);
+            });
+        }
         model.reload(&sender);
         sender.oneshot_command(async { Cmd::Settings(client::settings().await) });
         ComponentParts { model, widgets }
@@ -1788,7 +1819,7 @@ impl Component for Window {
                     .map(|l| l.name.clone())
                     .unwrap_or_default();
                 if self.nav == Nav::List(href.clone()) {
-                    self.nav = Nav::Today;
+                    self.nav = self.prefs.home();
                 }
                 sender.oneshot_command(async move {
                     let said = client::delete_list(&href)
@@ -1998,6 +2029,10 @@ impl Component for Window {
                 self.prefs.set_sidebar_views(&views);
                 self.prefs.save();
             }
+            Msg::RestoreSidebar(keys) => {
+                self.prefs.sidebar = keys;
+                self.prefs.save();
+            }
             Msg::SetSettings(change) => {
                 sender.oneshot_command(async move {
                     Cmd::Settings(client::set_settings(&change).await)
@@ -2088,7 +2123,7 @@ impl Component for Window {
                         if let Nav::List(href) = &self.nav
                             && !self.lists.iter().any(|x| &x.href == href)
                         {
-                            self.nav = Nav::Today;
+                            self.nav = self.prefs.home();
                         }
                     }
                     Err(e) => self.error = Some(e),
