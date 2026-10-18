@@ -322,6 +322,26 @@ pub fn dump_json(state: &Dump) -> String {
     serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".into())
 }
 
+/// The search field in the open popover, for the `search` and `searchfocus`
+/// drive verbs. The error is what to tell the person driving.
+pub(crate) fn popover_search() -> Result<gtk::SearchEntry, &'static str> {
+    let p = crate::ui::last_popover()
+        .filter(|p| p.is_visible())
+        .ok_or("no popover open")?;
+    let mut stack: Vec<gtk::Widget> = p.child().into_iter().collect();
+    while let Some(widget) = stack.pop() {
+        if let Some(entry) = widget.downcast_ref::<gtk::SearchEntry>() {
+            return Ok(entry.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c);
+        }
+    }
+    Err("no search field in the popover")
+}
+
 /// The toast the overlay is showing, if any: its title label's text.
 pub(crate) fn visible_toast(overlay: &gtk::Widget) -> Option<String> {
     let mut stack = vec![overlay.clone()];

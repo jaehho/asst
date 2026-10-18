@@ -13,7 +13,8 @@
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
 #   scripts/dev keys [MOD+]KEY...  real key presses to the window, unfocused (Hyprland send_shortcut):
 #                                  `keys Tab h i SHIFT+Return CTRL+Return`. Goes to the main
-#                                  surface, so not into an open popover (those don't take focus here)
+#                                  surface, so not into an open popover (those don't take focus here),
+#                                  unless `drive searchfocus` put the keyboard in its search field
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev texts [FILE]       what the window, an open dialog and popover show, as JSON:
@@ -383,5 +384,5 @@ CONF
       rm -f "$DEV/bus"
     fi
     ;;
-  *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

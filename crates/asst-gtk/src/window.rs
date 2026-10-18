@@ -3342,7 +3342,8 @@ impl Window {
 
     /// Development builds: `nav today`, `key j`, `open <words>`, `reveal <words>`, `close`,
     /// `menu <words>`, `popup date|list|link|priority|reminders|menu|view|more`,
-    /// `popdown`, `title <text>`, `notes <text>`, `add`, `type <text>`,
+    /// `popdown`, `search <text>` and `searchfocus` (the open popover's search field),
+    /// `title <text>`, `notes <text>`, `add`, `type <text>`,
     /// `submit`, `select <words>`, `prefs [sidebar]`, `hide <view>`, `find [text]`,
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
@@ -3647,25 +3648,19 @@ impl Window {
             "add" => sender.input(Msg::ShowAdd(None)),
             // Choose a row or a button in the open popover by its words.
             // `search <text>`: into the open popover's search field.
-            "search" => {
-                let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
-                    eprintln!("drive: no popover open");
-                    return;
-                };
-                let mut stack: Vec<gtk::Widget> = p.child().into_iter().collect();
-                while let Some(widget) = stack.pop() {
-                    if let Some(entry) = widget.downcast_ref::<gtk::SearchEntry>() {
-                        entry.set_text(arg);
-                        return;
-                    }
-                    let mut child = widget.first_child();
-                    while let Some(c) = child {
-                        child = c.next_sibling();
-                        stack.push(c);
-                    }
+            "search" => match crate::devel::popover_search() {
+                Ok(entry) => entry.set_text(arg),
+                Err(e) => eprintln!("drive: {e}"),
+            },
+            // `searchfocus`: the keyboard to the popover's search field, so
+            // `scripts/dev keys` reach it. A popover that took the keyboard
+            // on its own would close in this unfocused window.
+            "searchfocus" => match crate::devel::popover_search() {
+                Ok(entry) => {
+                    entry.grab_focus();
                 }
-                eprintln!("drive: no search field in the popover");
-            }
+                Err(e) => eprintln!("drive: {e}"),
+            },
             "pick" => {
                 let Some(p) = ui::last_popover().filter(|p| p.is_visible()) else {
                     eprintln!("drive: no popover open");

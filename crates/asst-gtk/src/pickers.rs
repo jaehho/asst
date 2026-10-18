@@ -73,6 +73,13 @@ pub fn focus_in(p: &gtk::Popover, w: &impl IsA<gtk::Widget>) {
     }
 }
 
+/// Esc in a picker's search field closes the picker. A SearchEntry takes Esc
+/// as stop-search, so the popover never sees the key.
+fn close_on_stop_search(search: &gtk::SearchEntry, popover: &gtk::Popover) {
+    let popover = popover.clone();
+    search.connect_stop_search(move |_| popover.popdown());
+}
+
 fn page_header(title: &str, back: impl Fn() + 'static) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let button = gtk::Button::from_icon_name("go-previous-symbolic");
@@ -392,6 +399,7 @@ pub fn date_popover(
             }
         });
     }
+    close_on_stop_search(&search, &popover);
 
     stack.add_named(&main, Some("main"));
 
@@ -1111,6 +1119,7 @@ pub fn list_popover_with(
             }
         });
     }
+    close_on_stop_search(&search, &popover);
     {
         let search = search.clone();
         popover.connect_map(move |p| {
