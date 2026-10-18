@@ -30,7 +30,7 @@ pub struct Prefs {
     /// Lists in the sidebar by name, instead of in the order dragged into.
     pub lists_by_name: bool,
     /// The order lists were dragged into, as hrefs. Lists not in it follow,
-    /// in the server's order.
+    /// in name order.
     pub list_order: Vec<String>,
     /// A list's icon (a Lucide name, see `ui::list_icon_names`), by href.
     /// Window-only: the server has nowhere to keep one.

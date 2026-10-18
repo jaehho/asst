@@ -31,7 +31,7 @@
 #                                  dropped and stays until a config reload.
 #
 # ASST_DEV (default ~/.cache/asst-dev/<name>, name from ASST_DEV_NAME or
-# "gui") holds the bus address, config, cache and notes folder; the name is also the
+# "gui") holds the bus address, config and cache; the name is also the
 # Radicale user, so instances don't share lists. The bus has a stand-in
 # notification server (scripts/notify-host.py, printing to notify.log), and
 # starts the dev window when a notification opens a task in it.
@@ -157,9 +157,9 @@ print(json.dumps(slots))
 }
 
 # Files older harness versions left in the instance dir. The live set is
-# the bus file, the logs and session.conf, plus config/ state/ data/ notes/.
+# the bus file, the logs and session.conf, plus config/ state/ data/.
 clear_stale() {
-  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|config|state|data|notes)$'
+  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|config|state|data)$'
   local f base
   for f in "$DEV"/* "$DEV"/.*; do
     [ -e "$f" ] || continue
@@ -289,14 +289,11 @@ case "${1:-}" in
     build
     if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then exit 0; fi
     radicale_up
-    mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data" "$DEV/notes"
-    # Never the default, which is the real ~/Nextcloud/Notes.
+    mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data"
     if [ "${2:-}" = "--signed-out" ]; then
-      echo "notes = \"$DEV/notes\"" > "$DEV/config/asst/config.toml"
+      : > "$DEV/config/asst/config.toml"
     else
       cat > "$DEV/config/asst/config.toml" <<CONF
-notes = "$DEV/notes"
-
 [account]
 server = "http://127.0.0.1:5232"
 dav_url = "http://127.0.0.1:5232/"
@@ -417,8 +414,6 @@ CONF
     # Not `down --all`: Radicale and the other instances stay as they are.
     "$0" down
     rm -f "$DEV/config/asst/window.toml" "$DEV"/state/asst/asst.db*
-    rm -rf "$DEV/notes"
-    mkdir -p "$DEV/notes"
     # This instance's CalDAV collection only; other instances share Radicale.
     rm -rf "$RADICALE/data/collection-root/$(basename "$DEV")"
     clear_stale

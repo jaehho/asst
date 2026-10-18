@@ -1,7 +1,6 @@
 //! A task as a row: a checkbox in its priority's
 //! color, the due date in a colored chip, the title, small icons for notes,
-//! reminders, a link and linked notes, and the list's name in views that
-//! span lists.
+//! reminders and a repeat, and the list's name in views that span lists.
 //! Right-click for the task menu; drag it onto a list or a view.
 
 use std::cell::RefCell;
