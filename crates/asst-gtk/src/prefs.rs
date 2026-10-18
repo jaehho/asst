@@ -2,7 +2,7 @@
 //! settings are in `config.toml` and go through D-Bus.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use asst_core::api::ListView;
 use serde::{Deserialize, Serialize};
@@ -109,14 +109,53 @@ fn path() -> PathBuf {
 
 impl Prefs {
     pub fn load() -> Prefs {
-        std::fs::read_to_string(path())
-            .ok()
-            .map(|s| Prefs::parse(&s))
-            .unwrap_or_default()
+        Prefs::load_from(&path())
     }
 
-    fn parse(text: &str) -> Prefs {
-        let mut p: Prefs = toml::from_str(text).unwrap_or_default();
+    /// The prefs in `file`; the defaults when there is no file. A file that
+    /// cannot be read or parsed is moved to `<file>.bad` first and said so on
+    /// stderr. The window writes the file whole, so its next save would
+    /// otherwise replace everything the file held, not only the bad key, with
+    /// the defaults.
+    fn load_from(file: &Path) -> Prefs {
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Prefs::default(),
+            Err(e) => return Prefs::set_aside(file, &e.to_string()),
+        };
+        Prefs::parse(&text).unwrap_or_else(|e| {
+            // `Display` draws the offending line; the log wants one line.
+            let line = e
+                .span()
+                .and_then(|at| text.get(..at.start))
+                .map_or(String::new(), |before| {
+                    format!("line {}: ", before.matches('\n').count() + 1)
+                });
+            Prefs::set_aside(file, &format!("{line}{}", e.message()))
+        })
+    }
+
+    /// Keep an unusable `file` as `<file>.bad` (replacing an older one) and
+    /// start from the defaults.
+    fn set_aside(file: &Path, why: &str) -> Prefs {
+        let bad = file.with_extension("toml.bad");
+        match std::fs::rename(file, &bad) {
+            Ok(()) => eprintln!(
+                "asst-gtk: {}: {why}; kept as {}, starting from defaults",
+                file.display(),
+                bad.display()
+            ),
+            Err(e) => eprintln!(
+                "asst-gtk: {}: {why}; could not move it to {}: {e}; starting from defaults",
+                file.display(),
+                bad.display()
+            ),
+        }
+        Prefs::default()
+    }
+
+    fn parse(text: &str) -> Result<Prefs, toml::de::Error> {
+        let mut p: Prefs = toml::from_str(text)?;
         p.day_zoom = crate::model::clamp_px_per_hour(p.day_zoom);
         if p.sidebar.is_none() && !p.filters.is_empty() {
             let mut keys: Vec<String> = DEFAULT_SIDEBAR.iter().map(Nav::key).collect();
@@ -161,7 +200,7 @@ impl Prefs {
                 keys.insert(at, "day".into());
             }
         }
-        p
+        Ok(p)
     }
 
     pub fn save(&self) {
@@ -303,10 +342,14 @@ impl PrefPatch {
 mod tests {
     use super::*;
 
+    fn parse(text: &str) -> Prefs {
+        Prefs::parse(text).unwrap()
+    }
+
     #[test]
     fn sidebar_starts_with_the_defaults_and_keeps_old_extras() {
-        assert_eq!(Prefs::parse("").sidebar_views(), DEFAULT_SIDEBAR);
-        let old = Prefs::parse("filters = [\"tomorrow\"]\n");
+        assert_eq!(parse("").sidebar_views(), DEFAULT_SIDEBAR);
+        let old = parse("filters = [\"tomorrow\"]\n");
         assert_eq!(
             old.sidebar_views(),
             [
@@ -321,18 +364,16 @@ mod tests {
         );
         // A sidebar arranged before Matrix stays as it was; the stock four
         // gain Matrix (and then Day).
-        let custom = Prefs::parse("sidebar = [\"today\", \"inbox\"]\n");
+        let custom = parse("sidebar = [\"today\", \"inbox\"]\n");
         assert_eq!(custom.sidebar_views(), [Nav::Today, Nav::Inbox]);
-        let stock =
-            Prefs::parse("sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n");
+        let stock = parse("sidebar = [\"inbox\", \"today\", \"scheduled\", \"completed\"]\n");
         assert_eq!(stock.sidebar_views(), DEFAULT_SIDEBAR);
         // Stock five with Matrix gains Day once.
-        let with_matrix = Prefs::parse(
-            "sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"completed\"]\n",
-        );
+        let with_matrix =
+            parse("sidebar = [\"inbox\", \"today\", \"matrix\", \"scheduled\", \"completed\"]\n");
         assert_eq!(with_matrix.sidebar_views(), DEFAULT_SIDEBAR);
         // Time and Plan become one Day tile at the first of the two.
-        let merged = Prefs::parse(
+        let merged = parse(
             "sidebar = [\"inbox\", \"today\", \"time\", \"plan\", \"scheduled\", \"completed\"]\n",
         );
         assert_eq!(
@@ -347,12 +388,46 @@ mod tests {
         );
         let text = toml::to_string(&old).unwrap();
         assert!(!text.contains("filters"));
-        assert_eq!(Prefs::parse(&text).sidebar_views(), old.sidebar_views());
+        assert_eq!(parse(&text).sidebar_views(), old.sidebar_views());
 
         let mut none = Prefs::default();
         none.set_sidebar_views(&[]);
         let text = toml::to_string(&none).unwrap();
-        assert!(Prefs::parse(&text).sidebar_views().is_empty());
+        assert!(parse(&text).sidebar_views().is_empty());
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_kept_not_overwritten() {
+        // One key of the wrong type: the whole file is refused.
+        let bad = "width = \"wide\"\nview = \"matrix\"\nlist_order = [\"/b/\"]\n";
+        assert!(Prefs::parse(bad).is_err());
+
+        let dir = std::env::temp_dir().join(format!("asst-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("window.toml");
+        let kept = file.with_extension("toml.bad");
+
+        // No file: the defaults, and nothing made.
+        assert_eq!(Prefs::load_from(&file), Prefs::default());
+        assert!(!kept.exists());
+
+        // A good file loads as it is.
+        std::fs::write(&file, "view = \"matrix\"\n").unwrap();
+        assert_eq!(Prefs::load_from(&file).view, "matrix");
+        assert!(!kept.exists());
+
+        // A bad one is moved, whole, before the defaults take its place.
+        std::fs::write(&file, bad).unwrap();
+        assert_eq!(Prefs::load_from(&file), Prefs::default());
+        assert!(!file.exists());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), bad);
+
+        // A second bad file replaces the first copy rather than failing.
+        std::fs::write(&file, "height = true\n").unwrap();
+        assert_eq!(Prefs::load_from(&file), Prefs::default());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "height = true\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -364,7 +439,7 @@ mod tests {
         place(&mut p.plan, "abc", day, 9 * 60, 30);
         place(&mut p.plan, "def", day, 10 * 60, 60);
         let text = toml::to_string(&p).unwrap();
-        let back = Prefs::parse(&text);
+        let back = parse(&text);
         assert_eq!(back.plan, p.plan);
         assert!(text.contains("uid = \"abc\""));
         let live: std::collections::HashSet<&str> = ["abc"].into_iter().collect();
