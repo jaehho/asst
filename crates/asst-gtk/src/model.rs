@@ -159,6 +159,16 @@ impl Nav {
         Nav::filters().into_iter().find(|n| n.key() == key)
     }
 
+    /// The Ctrl chord that opens this view, shown or not (three have one).
+    pub fn chord(&self) -> Option<&'static str> {
+        match self {
+            Nav::Inbox => Some("Ctrl+I"),
+            Nav::Today => Some("Ctrl+T"),
+            Nav::Scheduled => Some("Ctrl+U"),
+            _ => None,
+        }
+    }
+
     /// Where a task added here goes: a list, a date, or neither.
     pub fn is_list(&self) -> bool {
         matches!(self, Nav::Inbox | Nav::List(_))

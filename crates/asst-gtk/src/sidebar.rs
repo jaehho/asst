@@ -1,6 +1,8 @@
 //! The sidebar: colored tiles for the views chosen here (a tile's menu hides
 //! it and adds the hidden ones back), then the account's lists with their
-//! color rings and counts. Tasks dragged onto a tile or a list land there;
+//! color rings and counts. The tiles and the Lists heading stay put and only
+//! the lists scroll; the heading's `...` menu has the views as a checklist
+//! and what the lists do. Tasks dragged onto a tile or a list land there;
 //! lists dragged among themselves take a new order. The inbox list is the
 //! Inbox tile's, and has a row of its own only while that tile is hidden.
 
@@ -14,7 +16,7 @@ use relm4::gtk::{self, gdk, glib, pango};
 
 use crate::model::{self, Counts, Nav};
 use crate::pickers;
-use crate::prefs::Prefs;
+use crate::prefs::{PrefPatch, Prefs};
 use crate::row::DRAG_PREFIX;
 use crate::ui::{self, Item};
 use crate::window::{Msg, Tx};
@@ -208,6 +210,110 @@ fn tile_key(key: gdk::Key, state: gdk::ModifierType) -> Option<TileKey> {
     }
 }
 
+/// One line of the options menu's Views list.
+#[derive(Debug, PartialEq)]
+struct ViewChoice {
+    nav: Nav,
+    shown: bool,
+    /// The key that opens it: `Alt+N` for the Nth tile, else its Ctrl chord.
+    hint: Option<String>,
+}
+
+/// Every view for the checklist: the tiles in their order, then the hidden
+/// views in `Nav::filters` order.
+fn view_choices(shown: &[Nav], hidden: &[Nav]) -> Vec<ViewChoice> {
+    let tiles = shown.iter().enumerate().map(|(at, nav)| ViewChoice {
+        nav: nav.clone(),
+        shown: true,
+        hint: (at < 9)
+            .then(|| format!("Alt+{}", at + 1))
+            .or_else(|| nav.chord().map(String::from)),
+    });
+    let rest = hidden.iter().map(|nav| ViewChoice {
+        nav: nav.clone(),
+        shown: false,
+        hint: nav.chord().map(String::from),
+    });
+    tiles.chain(rest).collect()
+}
+
+/// What the `...` menu is built from, as of the last `update`: the menu
+/// itself is made each time it opens.
+#[derive(Default)]
+struct Options {
+    views: Vec<ViewChoice>,
+    counts: bool,
+    signed_in: bool,
+    /// How many lists have a row, for Sort A-Z.
+    lists: usize,
+}
+
+/// A dim caption over a part of the `...` menu.
+fn menu_heading(text: &str) -> gtk::Widget {
+    ui::label(text, &["caption-heading", "menu-heading"]).upcast()
+}
+
+/// The sidebar's options: which views are tiles, then what the lists do.
+fn options_menu(o: &Options, tx: &Tx) -> gtk::Popover {
+    let mut items: Vec<gtk::Widget> = vec![menu_heading("Views")];
+    for v in &o.views {
+        let (tx, nav, shown) = (tx.clone(), v.nav.clone(), v.shown);
+        let title = v.nav.title(&[]);
+        let mut item = Item::new(Some(v.nav.icon()), &title)
+            .tint(v.nav.tint())
+            .checked(v.shown);
+        if let Some(hint) = &v.hint {
+            item = item.secondary(hint);
+        }
+        items.push(
+            item.build(move || {
+                tx.emit(if shown {
+                    Msg::HideView(nav.clone())
+                } else {
+                    Msg::ShowView(nav.clone(), None)
+                })
+            })
+            .upcast(),
+        );
+    }
+    {
+        let tx = tx.clone();
+        items.push(
+            Item::new(Some("dock-left-symbolic"), "Reset sidebar")
+                .secondary("Inbox, Day")
+                .build(move || tx.emit(Msg::ResetSidebar))
+                .upcast(),
+        );
+    }
+    items.push(ui::separator());
+    items.push(menu_heading("Lists"));
+    {
+        let tx = tx.clone();
+        let sort = Item::new(Some("view-sort-ascending-symbolic"), "Sort A-Z")
+            .build(move || tx.emit(Msg::SortLists));
+        sort.set_sensitive(o.lists > 1);
+        items.push(sort.upcast());
+    }
+    {
+        let (tx, on) = (tx.clone(), o.counts);
+        items.push(
+            Item::new(Some("view-list-ordered-symbolic"), "Show task counts")
+                .checked(on)
+                .build(move || tx.emit(Msg::PatchPrefs(PrefPatch::ShowCounts(!on))))
+                .upcast(),
+        );
+    }
+    {
+        let tx = tx.clone();
+        let new = Item::new(Some("plus-large-symbolic"), "New list…")
+            .secondary("p")
+            .build(move || tx.emit(Msg::NewList));
+        new.set_sensitive(o.signed_in);
+        items.push(new.upcast());
+    }
+    ui::menu(&items)
+}
+
 pub struct Sidebar {
     pub root: adw::ToolbarView,
     tx: Tx,
@@ -217,9 +323,11 @@ pub struct Sidebar {
     lists_box: gtk::ListBox,
     rows: RefCell<Vec<ListRow>>,
     lists_key: RefCell<String>,
-    account: gtk::Label,
-    account_sub: gtk::Label,
+    /// `Not signed in`, under the Lists heading while that is so.
+    caption: gtk::Label,
     add_list: gtk::Button,
+    lists_menu: gtk::MenuButton,
+    options: Rc<RefCell<Options>>,
     sync: gtk::Button,
 }
 
@@ -260,15 +368,36 @@ fn drop_target(widget: &impl IsA<gtk::Widget>, nav: Nav, tx: &Tx) {
     widget.add_controller(target);
 }
 
+/// Who is signed in and where: `jaeho on cloud.example.com`.
+fn account_line(s: &StatusView) -> Option<String> {
+    let host = s
+        .server
+        .as_deref()
+        .map(|h| {
+            h.trim_start_matches("https://")
+                .trim_start_matches("http://")
+        })
+        .unwrap_or_default();
+    match (&s.username, host) {
+        (Some(u), h) if !h.is_empty() => Some(format!("{u} on {h}")),
+        (Some(u), _) => Some(u.clone()),
+        (None, h) if !h.is_empty() => Some(h.to_string()),
+        (None, _) => None,
+    }
+}
+
 /// The sync button's tooltip, worked out when it shows so the time is right.
 fn sync_tooltip(status: Option<&StatusView>) -> String {
     let Some(s) = status else {
         return "Sync now".into();
     };
     let keys = "<span size=\"small\" alpha=\"70%\">s</span>";
+    let account = account_line(s)
+        .map(|a| format!("{}\n", glib::markup_escape_text(&a)))
+        .unwrap_or_default();
     match s.state {
         SyncState::Offline => format!(
-            "<b>Can't reach the server</b>\nChanges made now are sent when it's back.{}",
+            "{account}<b>Can't reach the server</b>\nChanges made now are sent when it's back.{}",
             match s.pending {
                 0 => String::new(),
                 1 => "\n1 change waiting to be sent".into(),
@@ -276,7 +405,7 @@ fn sync_tooltip(status: Option<&StatusView>) -> String {
             }
         ),
         _ => format!(
-            "{}\n{keys}",
+            "{account}{}\n{keys}",
             glib::markup_escape_text(&model::sync_state(s, pickers::now()))
         ),
     }
@@ -334,8 +463,9 @@ impl Sidebar {
         });
         header.pack_end(&sync);
 
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.add_css_class("sidebar-content");
+        // The tiles and the Lists heading stay put; only the lists scroll.
+        let pinned = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned.add_css_class("sidebar-content");
 
         let tiles_box = gtk::FlowBox::builder()
             .homogeneous(true)
@@ -347,16 +477,17 @@ impl Sidebar {
             .activate_on_single_click(true)
             .build();
         tiles_box.add_css_class("filter-tiles");
-        content.append(&tiles_box);
+        pinned.append(&tiles_box);
 
         let source = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         source.add_css_class("source-header");
         let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
         names.set_hexpand(true);
-        let account = ui::label("Lists", &["heading"]);
-        let account_sub = ui::label("", &["caption", "dim-label"]);
-        names.append(&account);
-        names.append(&account_sub);
+        names.set_valign(gtk::Align::Center);
+        names.append(&ui::label("Lists", &["heading"]));
+        let caption = ui::label("Not signed in", &["caption", "dim-label"]);
+        caption.set_visible(false);
+        names.append(&caption);
         source.append(&names);
         let add_list = gtk::Button::from_icon_name("plus-large-symbolic");
         add_list.add_css_class("flat");
@@ -367,25 +498,42 @@ impl Sidebar {
             add_list.connect_clicked(move |_| tx.emit(Msg::NewList));
         }
         source.append(&add_list);
-        content.append(&source);
+        let options = Rc::new(RefCell::new(Options::default()));
+        let lists_menu = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Sidebar options")
+            .valign(gtk::Align::Center)
+            .build();
+        lists_menu.add_css_class("flat");
+        {
+            let (tx, options) = (tx.clone(), options.clone());
+            lists_menu.set_create_popup_func(move |mb| {
+                mb.set_popover(Some(&options_menu(&options.borrow(), &tx)));
+            });
+        }
+        source.append(&lists_menu);
+        pinned.append(&source);
         let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
         rule.add_css_class("source-rule");
-        content.append(&rule);
+        pinned.append(&rule);
 
         let lists_box = gtk::ListBox::new();
         lists_box.add_css_class("sidebar-lists");
         lists_box.set_selection_mode(gtk::SelectionMode::None);
-        content.append(&lists_box);
 
         let scroller = gtk::ScrolledWindow::builder()
-            .child(&content)
+            .child(&lists_box)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
+        ui::scroll_while_dragging(&scroller);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        body.append(&pinned);
+        body.append(&scroller);
         let root = adw::ToolbarView::new();
         root.add_css_class("app-sidebar");
         root.add_top_bar(&header);
-        root.set_content(Some(&scroller));
+        root.set_content(Some(&body));
 
         let s = Rc::new(Sidebar {
             root,
@@ -396,9 +544,10 @@ impl Sidebar {
             lists_box,
             rows: RefCell::default(),
             lists_key: RefCell::default(),
-            account,
-            account_sub,
+            caption,
             add_list,
+            lists_menu,
+            options,
             sync,
         });
         {
@@ -502,31 +651,15 @@ impl Sidebar {
             }
         }
 
-        match st.status {
-            Some(s) if signed_in => {
-                self.account.set_text("Nextcloud");
-                let host = s
-                    .server
-                    .as_deref()
-                    .map(|h| {
-                        h.trim_start_matches("https://")
-                            .trim_start_matches("http://")
-                    })
-                    .unwrap_or_default();
-                let who = match (&s.username, host) {
-                    (Some(u), h) if !h.is_empty() => format!("{u}@{h}"),
-                    (Some(u), _) => u.clone(),
-                    (None, h) => h.to_string(),
-                };
-                self.account_sub.set_text(&who);
-                self.account_sub.set_visible(true);
-            }
-            _ => {
-                self.account.set_text("Lists");
-                self.account_sub.set_text("Not signed in");
-            }
-        }
+        self.caption
+            .set_visible(st.status.is_some_and(|s| s.state == SyncState::NoAccount));
         self.add_list.set_sensitive(signed_in);
+        *self.options.borrow_mut() = Options {
+            views: view_choices(&shown, &st.prefs.hidden_views()),
+            counts: st.prefs.show_counts,
+            signed_in,
+            lists: st.lists.len(),
+        };
 
         let Some(s) = st.status else { return };
         self.sync.remove_css_class("spinning");
@@ -554,6 +687,11 @@ impl Sidebar {
         if let Some(t) = tiles.iter().find(|t| &t.nav == nav) {
             show_tile_menu(&t.child, &t.nav, &t.hidden, &self.tx, middle(&t.child));
         }
+    }
+
+    /// The `...` menu next to Lists, as a click on it opens it.
+    pub fn open_lists_menu(&self) {
+        self.lists_menu.popup();
     }
 
     /// The menu of the row for list `href`, as a right-click opens it.
@@ -616,14 +754,8 @@ impl Sidebar {
             child.set_child(Some(&grid));
             child.add_css_class("filter-tile");
             child.add_css_class(nav.tint());
-            let keys = match nav {
-                Nav::Inbox => Some("Ctrl+I"),
-                Nav::Today => Some("Ctrl+T"),
-                Nav::Scheduled => Some("Ctrl+U"),
-                _ => None,
-            };
-            if let Some(k) = keys {
-                ui::tip(&child, &nav.title(&[]), k);
+            if let Some(keys) = nav.chord() {
+                ui::tip(&child, &nav.title(&[]), keys);
             }
             if !matches!(
                 nav,
@@ -833,6 +965,95 @@ impl Sidebar {
 mod tests {
     use super::*;
     use gdk::ModifierType as M;
+
+    fn choice(nav: Nav, shown: bool, hint: Option<&str>) -> ViewChoice {
+        ViewChoice {
+            nav,
+            shown,
+            hint: hint.map(String::from),
+        }
+    }
+
+    #[test]
+    fn sidebar_choices_list_shown_in_order_then_hidden() {
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::Scheduled, Nav::Inbox]);
+        let got = view_choices(&p.sidebar_views(), &p.hidden_views());
+        // The tiles first, as they stand, each with the key of its place;
+        // then the rest as `Nav::filters` has them, a Ctrl chord where
+        // one exists.
+        assert_eq!(
+            got,
+            [
+                choice(Nav::Scheduled, true, Some("Alt+1")),
+                choice(Nav::Inbox, true, Some("Alt+2")),
+                choice(Nav::Today, false, Some("Ctrl+T")),
+                choice(Nav::Day, false, None),
+                choice(Nav::Matrix, false, None),
+                choice(Nav::Completed, false, None),
+                choice(Nav::Tomorrow, false, None),
+                choice(Nav::Anytime, false, None),
+                choice(Nav::Repeating, false, None),
+                choice(Nav::All, false, None),
+            ]
+        );
+        // Nothing is dropped or doubled, whatever is shown.
+        p.set_sidebar_views(&Nav::filters());
+        let got = view_choices(&p.sidebar_views(), &p.hidden_views());
+        assert_eq!(got.len(), Nav::filters().len());
+        assert!(got.iter().all(|c| c.shown));
+        // Only nine places have an Alt digit; the tenth falls back to its chord.
+        assert_eq!(got[8].hint.as_deref(), Some("Alt+9"));
+        assert_eq!(got[9].hint, None);
+    }
+
+    #[test]
+    fn the_account_line_names_the_user_and_the_host_without_its_scheme() {
+        let status = |server: Option<&str>, user: Option<&str>| StatusView {
+            state: SyncState::Idle,
+            message: None,
+            server: server.map(String::from),
+            username: user.map(String::from),
+            last_sync: None,
+            pending: 0,
+            zone: "UTC".into(),
+            location: None,
+        };
+        for (server, user, want) in [
+            (
+                Some("https://cloud.example.com"),
+                Some("jaeho"),
+                Some("jaeho on cloud.example.com"),
+            ),
+            (
+                Some("http://nas.lan"),
+                Some("jaeho"),
+                Some("jaeho on nas.lan"),
+            ),
+            (None, Some("jaeho"), Some("jaeho")),
+            (
+                Some("https://cloud.example.com"),
+                None,
+                Some("cloud.example.com"),
+            ),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                account_line(&status(server, user)).as_deref(),
+                want,
+                "{server:?} {user:?}"
+            );
+        }
+        // It leads the sync button's tooltip, and an unsigned-in one has
+        // nothing to lead with.
+        let tip = sync_tooltip(Some(&status(
+            Some("https://cloud.example.com"),
+            Some("jaeho"),
+        )));
+        assert!(tip.starts_with("jaeho on cloud.example.com\n"), "{tip}");
+        let tip = sync_tooltip(Some(&status(None, None)));
+        assert!(!tip.contains(" on "), "{tip}");
+    }
 
     #[test]
     fn a_tile_moves_hides_and_opens_its_menu_from_the_keyboard() {

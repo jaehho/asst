@@ -96,8 +96,9 @@ window.dark {
 
 /* -- sidebar ------------------------------------------------------------- */
 
+/* The tiles and the Lists heading, which stay put. */
 .sidebar-content {
-  margin: 6px 12px 12px 12px;
+  margin: 6px 12px 0 12px;
 }
 
 .filter-tiles {
@@ -160,6 +161,7 @@ flowboxchild.filter-tile:drop(active) {
 
 list.sidebar-lists {
   background: transparent;
+  margin: 0 12px 12px 12px;
 }
 
 list.sidebar-lists > row.list-row {

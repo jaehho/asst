@@ -754,7 +754,7 @@ impl Component for Window {
                 .vadjustment()
                 .connect_value_changed(move |a| title_revealer.set_reveal_child(a.value() > 48.0));
         }
-        scroll_while_dragging(&scroller);
+        ui::scroll_while_dragging(&scroller);
         // A click on the column's background closes the open task. Rows,
         // buttons and fields do their own thing (another row opens instead).
         {
@@ -3710,7 +3710,8 @@ impl Window {
     /// `popdown`, `search <text>` and `searchfocus` (the open popover's search field),
     /// `title <text>`, `notes <text>`, `add`, `type <text>`,
     /// `submit`, `select <words>`, `prefs [sidebar]`, `hide <view>`, `show <view>`,
-    /// `tile-menu <view>`, `undo` (the toast's button), `find [text]`,
+    /// `tile-menu <view>`, `lists-menu` (the sidebar's `...`), `sort-lists`,
+    /// `undo` (the toast's button), `find [text]`,
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
     /// `clear [list]` (asks), `clear! [list]`, `archive <list>`, `unarchive <list>`,
@@ -4121,6 +4122,8 @@ impl Window {
                     sender.input(Msg::ShowView(n, None));
                 }
             }
+            // The `...` menu by the Lists heading; `pick` then chooses a row.
+            "lists-menu" => w.sidebar.open_lists_menu(),
             // A tile's menu, as its right-click opens it; `pick` then
             // chooses a row.
             "tile-menu" => match Nav::from_key(arg) {
@@ -4598,45 +4601,6 @@ fn more_menu(tx: Tx) -> gtk::Popover {
     };
     let archived = CURRENT_ARCHIVED.with(|a| a.borrow().contains(&list.href));
     sidebar::list_menu(list, archived, &tx, true)
-}
-
-/// Scroll the view while something dragged over it nears its top or bottom
-/// edge, faster the nearer, so a task can be dragged past what's on screen.
-fn scroll_while_dragging(scroller: &gtk::ScrolledWindow) {
-    const EDGE: f64 = 56.0;
-    let speed = Rc::new(Cell::new(0.0));
-    let ticking: Rc<Cell<bool>> = Rc::default();
-    let motion = gtk::DropControllerMotion::new();
-    {
-        let (speed, ticking, scroller) = (speed.clone(), ticking.clone(), scroller.clone());
-        motion.connect_motion(move |_, _, y| {
-            let height = f64::from(scroller.height());
-            speed.set(if y < EDGE {
-                -(EDGE - y) / 3.0
-            } else if y > height - EDGE {
-                (y - (height - EDGE)) / 3.0
-            } else {
-                0.0
-            });
-            // A frame clock only while scrolling, not for the whole drag.
-            if speed.get() != 0.0 && !ticking.replace(true) {
-                let (speed, ticking) = (speed.clone(), ticking.clone());
-                scroller.add_tick_callback(move |s, _| {
-                    let step = speed.get();
-                    let adj = s.vadjustment();
-                    let before = adj.value();
-                    adj.set_value(before + step);
-                    if step == 0.0 || adj.value() == before {
-                        ticking.set(false);
-                        return glib::ControlFlow::Break;
-                    }
-                    glib::ControlFlow::Continue
-                });
-            }
-        });
-    }
-    motion.connect_leave(move |_| speed.set(0.0));
-    scroller.add_controller(motion);
 }
 
 /// Where the add card puts a task in `nav` when the text says nothing else.
