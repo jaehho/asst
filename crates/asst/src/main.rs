@@ -935,6 +935,9 @@ fn print_status(style: &Style, s: &StatusView) {
     if let Some(m) = &s.message {
         println!("  {}", style.dim(m));
     }
+    if let Some(why) = &s.location {
+        println!("Location reminders: {}", style.yellow(why));
+    }
     if s.pending > 0 {
         println!(
             "{} change{} waiting to be sent",

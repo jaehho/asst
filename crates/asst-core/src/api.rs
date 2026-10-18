@@ -110,6 +110,11 @@ pub struct StatusView {
     /// Local changes not yet on the server.
     pub pending: usize,
     pub zone: String,
+    /// Why location reminders cannot ring on this machine, once asstd has
+    /// found out (no position source, GeoClue missing); gone again when a
+    /// position arrives or no task has a location reminder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

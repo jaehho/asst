@@ -1255,6 +1255,22 @@ pub fn reminder_popover(
                 });
                 line.append(&remove);
                 current.append(&line);
+                // This machine cannot tell where it is: say so right here,
+                // under the reminder, not only in a log (#12).
+                if let Some(why) = ui::location_note() {
+                    let note = gtk::Label::builder()
+                        .label(&why)
+                        .wrap(true)
+                        .max_width_chars(34)
+                        .xalign(0.0)
+                        .margin_start(32)
+                        .margin_end(6)
+                        .margin_bottom(4)
+                        .build();
+                    note.add_css_class("caption");
+                    note.add_css_class("warning");
+                    current.append(&note);
+                }
             }
         })
     });
