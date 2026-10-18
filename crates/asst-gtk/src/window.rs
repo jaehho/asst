@@ -480,6 +480,11 @@ pub struct Widgets {
     sidebar: Rc<Sidebar>,
     header_title: gtk::Label,
     stack: gtk::Stack,
+    /// The task column's scroller. Entering a view, and leaving the add
+    /// card, put the keyboard here: on the column but on no button in it,
+    /// as the first focusable child (Day's Carry, say) would take Space
+    /// and Enter.
+    scroller: gtk::ScrolledWindow,
     clamp: adw::Clamp,
     rows: Vec<(String, gtk::Widget)>,
     editor: Rc<Editor>,
@@ -730,6 +735,29 @@ impl Component for Window {
                 }
             });
             scroller.add_controller(click);
+        }
+
+        // Entering a view leaves the keyboard on the scroller, and a scrolled
+        // window answers Tab there by moving on past its column: send it in.
+        {
+            let keys = gtk::EventControllerKey::new();
+            let clamp = clamp.clone();
+            keys.connect_key_pressed(move |c, key, _, state| {
+                let plain = !state.intersects(
+                    gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::ALT_MASK,
+                );
+                if key == gdk::Key::Tab
+                    && plain
+                    && c.widget().is_some_and(|w| w.is_focus())
+                    && clamp.child_focus(gtk::DirectionType::TabForward)
+                {
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            scroller.add_controller(keys);
         }
 
         let error_page = adw::StatusPage::builder()
@@ -1051,6 +1079,7 @@ impl Component for Window {
             sidebar,
             header_title,
             stack,
+            scroller,
             clamp,
             rows: Vec::new(),
             editor,
@@ -1135,7 +1164,7 @@ impl Component for Window {
                 if w.outer.is_collapsed() {
                     w.outer.set_show_sidebar(false);
                 }
-                w.clamp.grab_focus();
+                w.scroller.grab_focus();
             }
             Msg::ToggleSidebar => w.outer.set_show_sidebar(!w.outer.shows_sidebar()),
             Msg::Refresh => self.reload(&sender),
@@ -1545,7 +1574,7 @@ impl Component for Window {
                 });
             }
             Msg::HideAdd => {
-                w.clamp.grab_focus();
+                w.scroller.grab_focus();
                 let card = w
                     .add_card
                     .root
