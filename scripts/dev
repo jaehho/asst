@@ -18,7 +18,8 @@
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev texts [FILE]       what the window, an open dialog and popover show, as JSON:
-#                                  labels, entries, buttons, icons, tooltips (default $DEV/texts.json)
+#                                  labels, entries, buttons, icons, tooltips, and whether each takes input
+#                                  (default $DEV/texts.json)
 #   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
 #   scripts/dev reset              wipe this instance's state, then up and seed
 #   scripts/dev down [--all]       stop the window, the tray, asstd and the bus;

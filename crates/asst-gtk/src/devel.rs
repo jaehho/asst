@@ -9,7 +9,8 @@
 //!   (see [`dump_json`]); empty path prints it on `window.log`.
 //! - `texts(path)` writes what the window, an open dialog and the open
 //!   popover show, widget by widget (see [`texts_json`]): labels, entries,
-//!   buttons, icons and tooltips. For checks on words, with no pixels.
+//!   buttons, icons and tooltips, and whether each takes input. For checks
+//!   on words, with no pixels.
 //!
 //! A popover in a window without keyboard focus closes as soon as it opens;
 //! `ASST_NO_AUTOHIDE=1` keeps them up for these checks. The quick-add popup
@@ -117,6 +118,9 @@ pub struct Shown {
     pub icon: Option<String>,
     pub tooltip: Option<String>,
     pub classes: Vec<String>,
+    /// Whether it takes input: a disabled button is `false`, and so is
+    /// anything under a disabled parent.
+    pub sensitive: bool,
     /// `[x, y, width, height]` in pixels, relative to the root it was found
     /// under.
     pub bounds: Option<[f32; 4]>,
@@ -139,6 +143,7 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
                 icon,
                 tooltip: w.tooltip_text().map(|t| t.to_string()),
                 classes: w.css_classes().iter().map(|c| c.to_string()).collect(),
+                sensitive: w.is_sensitive(),
                 bounds: w
                     .compute_bounds(widget)
                     .map(|b| [b.x(), b.y(), b.width(), b.height()]),

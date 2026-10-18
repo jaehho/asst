@@ -3832,7 +3832,9 @@ impl Window {
                 eprintln!("drive: nothing in the popover says {arg:?}");
             }
             "type" => w.add_card.set_text(arg),
-            "submit" => w.add_card.submit(),
+            "submit" => {
+                w.add_card.submit();
+            }
             "title" => w.editor.type_title(arg),
             "notes" => w.editor.type_notes(arg),
             "close" => sender.input(Msg::CloseEditor),

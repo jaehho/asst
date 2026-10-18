@@ -143,10 +143,14 @@ impl Component for QuickAdd {
                             && gtk::prelude::GtkWindowExt::focus(&root)
                                 .is_some_and(|f| f.is::<gtk::Text>()) =>
                     {
-                        keep_open.set(
-                            state.contains(gdk::ModifierType::SHIFT_MASK) || card.keeps_adding(),
-                        );
-                        card.submit();
+                        // Only for an add that goes: a refused one has no
+                        // answer to reset it.
+                        if card.submit() {
+                            keep_open.set(
+                                state.contains(gdk::ModifierType::SHIFT_MASK)
+                                    || card.keeps_adding(),
+                            );
+                        }
                         glib::Propagation::Stop
                     }
                     _ => glib::Propagation::Proceed,

@@ -5,7 +5,9 @@
 //! the card open for the next one; in the notes, Enter adds too and
 //! Shift+Enter starts a new line. In the window, what is typed is added when
 //! the card is left (Esc, another view, the window closing); the cancel
-//! button is what throws it away.
+//! button is what throws it away. Text with nothing left once the date, list
+//! and priority are read out is no task: Add stays off and says so, and
+//! nothing is sent, so what was typed is still there to finish.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -24,6 +26,10 @@ use crate::model::{self, capitalize};
 use crate::pickers::{self, DateOpts, Schedule};
 use crate::window::{Msg, Tx};
 use crate::{notes, ui};
+
+/// The Add button's words: ready, and what is missing.
+const ADD: &str = "Add Task";
+const ADD_NEEDS_TITLE: &str = "Add a title";
 
 /// Starts making a list of the name given.
 pub type MakeList = Rc<dyn Fn(String)>;
@@ -59,6 +65,7 @@ pub struct AddCard {
     reminders: gtk::MenuButton,
     reminder_dot: gtk::Widget,
     keep: gtk::ToggleButton,
+    add: gtk::Button,
     /// Lists matching the `#word` being typed.
     suggest: gtk::Popover,
     suggest_rows: gtk::ListBox,
@@ -198,7 +205,7 @@ impl AddCard {
             ui::tip(&cancel, "Cancel", "Esc");
         }
         actions.append(&cancel);
-        let add = gtk::Button::with_label("Add Task");
+        let add = gtk::Button::with_label(ADD_NEEDS_TITLE);
         add.add_css_class("suggested-action");
         add.set_sensitive(false);
         actions.append(&add);
@@ -234,6 +241,7 @@ impl AddCard {
             reminders: reminders.clone(),
             reminder_dot: reminder_dot.upcast(),
             keep,
+            add: add.clone(),
             suggest,
             suggest_rows,
             suggested: RefCell::default(),
@@ -258,10 +266,10 @@ impl AddCard {
             let weak = Rc::downgrade(&card);
             notes_enter(&card.notes, move || {
                 if let Some(c) = weak.upgrade() {
-                    if c.entry.text().trim().is_empty() {
-                        c.entry.grab_focus();
-                    } else {
+                    if c.has_title() {
                         c.submit();
+                    } else {
+                        c.entry.grab_focus();
                     }
                 }
             });
@@ -269,9 +277,7 @@ impl AddCard {
         }
         {
             let weak = Rc::downgrade(&card);
-            let add = add.clone();
-            entry.connect_changed(move |e| {
-                add.set_sensitive(!e.text().trim().is_empty());
+            entry.connect_changed(move |_| {
                 if let Some(c) = weak.upgrade() {
                     c.parse();
                     // Once the cursor has moved past what was typed.
@@ -496,6 +502,8 @@ impl AddCard {
     pub fn set_lists(&self, lists: &[ListView], sunday_first: bool) {
         *self.lists.borrow_mut() = lists.to_vec();
         self.sunday_first.set(sunday_first);
+        // A `#word` may name a list now, and then it is not the title.
+        self.parse();
         self.refresh();
     }
 
@@ -584,7 +592,7 @@ impl AddCard {
     /// Add the task being typed, if there is one and this card keeps what
     /// is left in it. For leaving the card by any way but its cancel button.
     pub fn save_draft(&self) -> bool {
-        let save = self.save_on_leave && !self.entry.text().trim().is_empty();
+        let save = self.save_on_leave && self.has_title();
         if save {
             self.leaving.set(true);
             self.submit();
@@ -666,8 +674,18 @@ impl AddCard {
         }
     }
 
+    /// Whether anything is left of the text for a title, once the date, the
+    /// list and the priority in it are read out.
+    fn has_title(&self) -> bool {
+        !self.parsed().summary.is_empty()
+    }
+
     fn parse(&self) {
         let p = self.parsed();
+        let titled = !p.summary.is_empty();
+        self.add.set_sensitive(titled);
+        self.add
+            .set_label(if titled { ADD } else { ADD_NEEDS_TITLE });
         self.chips.remove_all();
         let text = self.entry.text();
         for (label, class) in chips(&p) {
@@ -865,18 +883,20 @@ impl AddCard {
         self.list_ring.append(&ui::list_mark_of(list, 14));
     }
 
-    pub fn submit(&self) {
-        let text = self.entry.text().trim().to_string();
-        if text.is_empty() {
-            return;
+    /// Add what is typed. `false` when there was nothing to add: no title,
+    /// and then the text stays where it is.
+    pub fn submit(&self) -> bool {
+        let parsed = self.parsed();
+        if parsed.summary.is_empty() {
+            return false;
         }
         if self.making.borrow().is_some() {
             // The list this task is going to doesn't exist yet.
             self.add_when_made.set(true);
-            return;
+            return true;
         }
         self.suggest.popdown();
-        let parsed = self.parsed();
+        let text = self.entry.text().trim().to_string();
         let chosen = self.chosen.borrow();
         let buffer = self.notes.buffer();
         let notes = buffer
@@ -924,6 +944,7 @@ impl AddCard {
         }
         self.refresh();
         self.entry.grab_focus();
+        true
     }
 }
 
