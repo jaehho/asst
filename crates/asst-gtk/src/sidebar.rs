@@ -434,10 +434,10 @@ pub struct Sidebar {
     hidden_box: gtk::ListBox,
     /// Whether the hidden lists are open: for this session only.
     hidden_open: Cell<bool>,
-    /// The view `update` saw last. Moving onto a hidden list opens the
-    /// Hidden lists row once, so it can be shut again while that list is
-    /// on screen.
-    opened_for: RefCell<Nav>,
+    /// The hidden list on screen when `update` last looked, by href. A
+    /// hidden list coming on screen opens the Hidden lists row once, so it
+    /// can be shut again while that list stays there.
+    opened_for: RefCell<Option<String>>,
     /// Every row, the shown ones first and then those under Hidden lists.
     rows: RefCell<Vec<ListRow>>,
     lists_key: RefCell<String>,
@@ -464,6 +464,23 @@ pub struct State<'a> {
     pub status: Option<&'a StatusView>,
     pub prefs: &'a Prefs,
     pub links: &'a [LinkView],
+}
+
+/// The hidden list the view on screen is, by href, and whether the Hidden
+/// lists row opens by itself for it: when that list was not on screen at
+/// the last look (`was`). That is a move onto it, the list on screen being
+/// archived, and the lists arriving after a window that opened on one; the
+/// row can be shut after, and stays shut while the list stays.
+fn hidden_on_screen(
+    was: Option<&str>,
+    nav: &Nav,
+    hidden: &[(ListView, Why)],
+) -> (Option<String>, bool) {
+    let now = hidden
+        .iter()
+        .map(|(l, _)| l.href.as_str())
+        .find(|href| *nav == Nav::List((*href).to_string()));
+    (now.map(String::from), now.is_some() && now != was)
 }
 
 /// A drop of a task onto `widget` sends `DropTask` with `nav`.
@@ -697,7 +714,7 @@ impl Sidebar {
             hidden_chevron,
             hidden_box,
             hidden_open: Cell::new(false),
-            opened_for: RefCell::new(Nav::Inbox),
+            opened_for: RefCell::default(),
             rows: RefCell::default(),
             lists_key: RefCell::default(),
             caption,
@@ -794,16 +811,12 @@ impl Sidebar {
             kept = self.focused_row();
             self.build_lists(st.lists, st.hidden);
         }
-        // Hidden lists open by themselves for a hidden list that has just
-        // come on screen, once: the row can still be closed after.
-        let on_hidden = st
-            .hidden
-            .iter()
-            .any(|(l, _)| *st.nav == Nav::List(l.href.clone()));
-        if on_hidden && *self.opened_for.borrow() != *st.nav {
+        let (on_screen, opens) =
+            hidden_on_screen(self.opened_for.borrow().as_deref(), st.nav, st.hidden);
+        if opens {
             self.hidden_open.set(true);
         }
-        *self.opened_for.borrow_mut() = st.nav.clone();
+        *self.opened_for.borrow_mut() = on_screen;
         self.show_hidden();
         if let Some(kept) = kept {
             self.refocus_row(kept);
@@ -1440,6 +1453,54 @@ mod tests {
         assert!(tip.starts_with("jaeho on cloud.example.com\n"), "{tip}");
         let tip = sync_tooltip(Some(&status(None, None)));
         assert!(!tip.contains(" on "), "{tip}");
+    }
+
+    fn hidden_list(href: &str, why: Why) -> (ListView, Why) {
+        let list = ListView {
+            href: href.into(),
+            name: href.trim_matches('/').into(),
+            color: None,
+            writable: true,
+            inbox: false,
+            open: 0,
+            done: 0,
+        };
+        (list, why)
+    }
+
+    #[test]
+    fn the_hidden_lists_row_opens_once_for_a_hidden_list_on_screen() {
+        let parked = Nav::List("/parked/".into());
+        let work = Nav::List("/work/".into());
+        let archived = |href| hidden_list(href, Why::Archived);
+        let one = [archived("/parked/")];
+        let both = [archived("/parked/"), archived("/work/")];
+        let look = |was: &Option<String>, nav: &Nav, hidden: &[(ListView, Why)]| {
+            hidden_on_screen(was.as_deref(), nav, hidden)
+        };
+
+        // The window opened on a hidden list, and the lists came after the
+        // first look: the row opens when they do, once.
+        let (seen, opens) = look(&None, &parked, &[]);
+        assert_eq!((seen.as_deref(), opens), (None, false));
+        let (seen, opens) = look(&seen, &parked, &one);
+        assert_eq!((seen.as_deref(), opens), (Some("/parked/"), true));
+        let (seen, opens) = look(&seen, &parked, &one);
+        assert_eq!((seen.as_deref(), opens), (Some("/parked/"), false));
+
+        // The list on screen is archived under the cursor.
+        let (seen, opens) = look(&None, &work, &one);
+        assert_eq!((seen.as_deref(), opens), (None, false));
+        let (seen, opens) = look(&seen, &work, &both);
+        assert_eq!((seen.as_deref(), opens), (Some("/work/"), true));
+
+        // From one hidden list to another it opens again, and after a stop
+        // on any other view it does too.
+        let (seen, opens) = look(&seen, &parked, &both);
+        assert_eq!((seen.as_deref(), opens), (Some("/parked/"), true));
+        let (seen, opens) = look(&seen, &Nav::Day, &both);
+        assert_eq!((seen.as_deref(), opens), (None, false));
+        assert!(look(&seen, &parked, &both).1);
     }
 
     #[test]
