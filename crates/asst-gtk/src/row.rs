@@ -180,7 +180,7 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
             "steno" => "Filed from a Steno meeting",
             "github" => "GitHub issue",
             "asst" => "Created in asst",
-            "mail" => "From mail-digest",
+            "mail" => "From email",
             _ => "Another CalDAV client",
         };
         // A paired issue's number rides on the same line (#18).
