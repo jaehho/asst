@@ -42,6 +42,8 @@ pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// Take the request and never answer it.
+    pub hang: bool,
 }
 
 impl Reply {
@@ -53,6 +55,7 @@ impl Reply {
                 "application/json; charset=utf-8".into(),
             )],
             body: body.into(),
+            hang: false,
         }
     }
 
@@ -62,6 +65,15 @@ impl Reply {
             status,
             headers: Vec::new(),
             body: String::new(),
+            hang: false,
+        }
+    }
+
+    /// Read the request, then say nothing: the client waits.
+    pub fn hang() -> Reply {
+        Reply {
+            hang: true,
+            ..Reply::status(200)
         }
     }
 
@@ -214,6 +226,11 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
         return;
     };
     let reply = shared.answer(req);
+    if reply.hang {
+        // Until the client gives up and the connection drops.
+        let _ = stream.read(&mut [0u8; 1]).await;
+        return;
+    }
     let mut out = format!("HTTP/1.1 {} {}\r\n", reply.status, reason(reply.status));
     for (name, value) in &reply.headers {
         out.push_str(&format!("{name}: {value}\r\n"));

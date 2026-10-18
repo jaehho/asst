@@ -419,6 +419,10 @@ const API: &str = "https://api.github.com";
 pub struct GitHub {
     auth: HeaderValue,
     base: String,
+    /// A shorter wait than the 30 seconds every request gets, so a test
+    /// can see a timeout.
+    #[cfg(any(test, feature = "testing"))]
+    timeout: Option<Duration>,
 }
 
 /// A repository, named or numbered: the name changes with a rename, the id
@@ -511,6 +515,8 @@ impl GitHub {
         Ok(GitHub {
             auth,
             base: API.into(),
+            #[cfg(any(test, feature = "testing"))]
+            timeout: None,
         })
     }
 
@@ -522,6 +528,15 @@ impl GitHub {
             base: base.trim_end_matches('/').into(),
             ..GitHub::new(token)?
         })
+    }
+
+    /// Give up on a request after `limit` instead of 30 seconds.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_timeout(self, limit: Duration) -> GitHub {
+        GitHub {
+            timeout: Some(limit),
+            ..self
+        }
     }
 
     // ponytail: each request builds its own client (and reads the system
@@ -560,6 +575,12 @@ impl GitHub {
         let req = req
             .body(body.map(|b| b.to_string()).unwrap_or_default())
             .map_err(|e| RemoteError::Protocol(e.to_string()))?;
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(limit) = self.timeout {
+            return tokio::time::timeout(limit, caldav::send(req))
+                .await
+                .map_err(|_| RemoteError::Network("timed out".into()))?;
+        }
         caldav::send(req).await
     }
 
@@ -1488,6 +1509,21 @@ mod repo_tests {
             gh.renamed("a/b").await,
             Err(RemoteError::Network(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_is_a_timeout_not_a_finding() {
+        let fake = FakeGitHub::start().await;
+        fake.reply("GET", "/repositories/1379104005", Reply::hang());
+        let gh = GitHub::with_base("tok", &fake.base())
+            .unwrap()
+            .with_timeout(Duration::from_millis(150));
+        let err = gh.repo(Target::Id(LAB_ID), None).await.unwrap_err();
+        assert!(
+            matches!(&err, RemoteError::Network(m) if m == "timed out"),
+            "{err:?}"
+        );
+        assert_eq!(fake.count("/repositories/1379104005"), 1);
     }
 
     #[test]

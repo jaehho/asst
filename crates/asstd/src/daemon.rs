@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use asst_core::api::{
-    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings, SettingsChange,
-    StatusView, SyncState, TaskView, short_ids,
+    AddSpec, Added, Change, LinkState, LinkView, ListChange, ListSpec, ListView, Settings,
+    SettingsChange, StatusView, SyncState, TaskView, short_ids,
 };
 use asst_core::caldav::{self, Account, CalDav, RemoteError};
 use asst_core::config::{self, AccountConfig, Config};
 use asst_core::github;
 use asst_core::quickadd;
-use asst_core::store::{Query, Row, Store, StoreError};
+use asst_core::store::{GhLinkRow, Query, Row, Store, StoreError};
 use asst_core::sync::{self, Report, SyncError};
 use asst_core::task::{Edit, priority_from_level};
 use asst_core::time::{Trigger, When};
@@ -81,6 +81,80 @@ pub struct Daemon {
 struct GhState {
     synced: Option<DateTime<Utc>>,
     error: Option<String>,
+    /// Why the repo's issues are not being read, for as long as it holds.
+    hold: Option<Hold>,
+}
+
+/// A finding that stops a link's pass until the repo is confirmed to be
+/// the one that was linked. Kept in memory: nothing is written for it, and
+/// the next look at the repo finds it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pub state: LinkState,
+    pub note: String,
+    pub since: DateTime<Utc>,
+}
+
+/// A link missing for this long gets a hint at the way out.
+const UNLINK_HINT_AFTER: chrono::Duration = chrono::Duration::days(14);
+
+/// What a link needs a look for, if anything: a held pass first, then a
+/// rename its list has not followed, then an archived repo. `open` is the
+/// list's open tasks, for the archived note.
+#[derive(Debug, PartialEq, Eq)]
+struct Condition {
+    state: LinkState,
+    note: String,
+    since: Option<DateTime<Utc>>,
+}
+
+fn link_condition(
+    row: &GhLinkRow,
+    list_name: &str,
+    hold: Option<&Hold>,
+    open: usize,
+    zone: Tz,
+    now: DateTime<Utc>,
+) -> Option<Condition> {
+    let day = |at: DateTime<Utc>| at.with_timezone(&zone).format("%Y-%m-%d").to_string();
+    if let Some(h) = hold {
+        let gone_a_while = h.state == LinkState::Unreachable && now - h.since >= UNLINK_HINT_AFTER;
+        let note = if gone_a_while {
+            format!(
+                "{}; asst unlink {} if it is gone for good",
+                h.note, row.repo
+            )
+        } else {
+            h.note.clone()
+        };
+        return Some(Condition {
+            state: h.state,
+            note,
+            since: Some(h.since),
+        });
+    }
+    if let (Some(from), Some(at)) = (&row.follow_from, row.follow_at) {
+        let at = DateTime::from_timestamp(at, 0)?;
+        return Some(Condition {
+            state: LinkState::Renamed,
+            note: format!(
+                "renamed from {from} on {}; the list is still called {list_name:?}",
+                day(at)
+            ),
+            since: Some(at),
+        });
+    }
+    let first_seen = DateTime::from_timestamp(row.archived.filter(|t| *t > 0)?, 0)?;
+    let tasks = match open {
+        0 => "0 open tasks".to_string(),
+        1 => "1 task is still open here; archived lists still sync and ring".to_string(),
+        n => format!("{n} tasks are still open here; archived lists still sync and ring"),
+    };
+    Some(Condition {
+        state: LinkState::Archived,
+        note: format!("first seen archived {}; {tasks}", day(first_seen)),
+        since: Some(first_seen),
+    })
 }
 
 /// What the D-Bus side should tell clients.
@@ -809,27 +883,35 @@ impl Daemon {
     /// The links between repos and lists, as `asst link` shows them.
     pub fn links(&self) -> Result<Vec<LinkView>> {
         let store = self.store();
+        let counts = store.counts()?;
+        let now = Utc::now();
         store
-            .gh_links()?
+            .gh_link_rows()?
             .into_iter()
-            .map(|(repo, href)| {
+            .map(|row| {
                 let name = store
-                    .find_list(&href)
+                    .find_list(&row.list)
                     .map(|l| l.name)
-                    .unwrap_or_else(|_| href.clone());
-                let state = self
+                    .unwrap_or_else(|_| row.list.clone());
+                let seen = self
                     .gh_state
                     .lock()
                     .expect("not poisoned")
-                    .get(&repo)
+                    .get(&row.repo)
                     .cloned()
                     .unwrap_or_default();
+                let open = counts.get(&row.list).map_or(0, |(open, _)| *open);
+                let found = link_condition(&row, &name, seen.hold.as_ref(), open, self.zone, now);
                 Ok(LinkView {
-                    repo,
-                    list: href,
+                    repo_id: row.repo_id,
+                    state: found.as_ref().map(|c| c.state),
+                    since: found.as_ref().and_then(|c| c.since),
+                    note: found.map(|c| c.note),
+                    repo: row.repo,
+                    list: row.list,
                     name,
-                    synced: state.synced,
-                    error: state.error,
+                    synced: seen.synced,
+                    error: seen.error,
                 })
             })
             .collect()
@@ -844,9 +926,31 @@ impl Daemon {
                 *entry = GhState {
                     synced: Some(Utc::now()),
                     error: None,
+                    hold: None,
                 }
             }
             Err(e) => entry.error = Some(e),
+        }
+    }
+
+    /// The repo is not the one that was linked, or cannot be told to be:
+    /// its issues are not read until a look settles it. The time it began
+    /// is kept while the same state goes on.
+    pub fn gh_hold(&self, repo: &str, state: LinkState, note: String, now: DateTime<Utc>) {
+        let mut all = self.gh_state.lock().expect("not poisoned");
+        let entry = all.entry(repo.to_string()).or_default();
+        let since = match &entry.hold {
+            Some(h) if h.state == state => h.since,
+            _ => now,
+        };
+        entry.hold = Some(Hold { state, note, since });
+    }
+
+    /// A look at the repo confirmed it is the one that was linked.
+    pub fn gh_release(&self, repo: &str) {
+        let mut all = self.gh_state.lock().expect("not poisoned");
+        if let Some(entry) = all.get_mut(repo) {
+            entry.hold = None;
         }
     }
 
@@ -889,8 +993,7 @@ impl Daemon {
             repo: repo.to_string(),
             list: l.href,
             name: l.name,
-            synced: None,
-            error: None,
+            ..LinkView::default()
         })
     }
 
@@ -1379,6 +1482,139 @@ mod tests {
         assert!(daemon.unlink("jaehho/asst").unwrap());
         assert!(!daemon.unlink("jaehho/asst").unwrap());
         assert_eq!(daemon.links().unwrap().len(), 1);
+    }
+
+    fn link_row(archived: Option<i64>, follow: Option<(&str, i64)>) -> GhLinkRow {
+        GhLinkRow {
+            repo: "jaehho/lab".into(),
+            list: "/cal/lab/".into(),
+            repo_id: Some(1379104005),
+            archived,
+            follow_from: follow.map(|(from, _)| from.to_string()),
+            follow_at: follow.map(|(_, at)| at),
+        }
+    }
+
+    #[test]
+    fn a_link_says_what_needs_a_look_the_most_pressing_first() {
+        use chrono::TimeZone;
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let at = |d: u32, h: u32| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let now = at(20, 16);
+        let found = |row: &GhLinkRow, hold: Option<&Hold>, open: usize| {
+            link_condition(row, "lab", hold, open, zone, now)
+        };
+
+        // Looked at and live, or not looked at: nothing to say
+        assert_eq!(found(&link_row(Some(0), None), None, 3), None);
+        assert_eq!(found(&link_row(None, None), None, 3), None);
+
+        // Archived: when it was first seen (in the user's day), and what
+        // is left open here
+        let archived = link_row(Some(at(19, 2).timestamp()), None);
+        let c = found(&archived, None, 0).unwrap();
+        assert_eq!(c.state, LinkState::Archived);
+        assert_eq!(c.since, Some(at(19, 2)));
+        assert_eq!(c.note, "first seen archived 2026-10-18; 0 open tasks");
+        assert_eq!(
+            found(&archived, None, 1).unwrap().note,
+            "first seen archived 2026-10-18; 1 task is still open here; \
+             archived lists still sync and ring"
+        );
+        assert_eq!(
+            found(&archived, None, 4).unwrap().note,
+            "first seen archived 2026-10-18; 4 tasks are still open here; \
+             archived lists still sync and ring"
+        );
+
+        // A rename the list has not followed comes before an archive
+        let renamed = link_row(
+            Some(at(19, 2).timestamp()),
+            Some(("jaehho/champalimaud", at(18, 15).timestamp())),
+        );
+        let c = found(&renamed, None, 0).unwrap();
+        assert_eq!(c.state, LinkState::Renamed);
+        assert_eq!(c.since, Some(at(18, 15)));
+        assert_eq!(
+            c.note,
+            "renamed from jaehho/champalimaud on 2026-10-18; the list is still called \"lab\""
+        );
+
+        // A held pass comes before both
+        let hold = |state, days: i64| Hold {
+            state,
+            note: "GitHub cannot find it".into(),
+            since: now - chrono::Duration::days(days),
+        };
+        let held = hold(LinkState::Replaced, 0);
+        let c = found(&renamed, Some(&held), 0).unwrap();
+        assert_eq!(
+            (c.state, c.note.as_str()),
+            (LinkState::Replaced, "GitHub cannot find it")
+        );
+        assert_eq!(c.since, Some(now));
+
+        // Not finding a repo says how to let go of it, after two weeks
+        let new = hold(LinkState::Unreachable, 13);
+        assert_eq!(
+            found(&renamed, Some(&new), 0).unwrap().note,
+            "GitHub cannot find it"
+        );
+        let old = hold(LinkState::Unreachable, 14);
+        assert_eq!(
+            found(&renamed, Some(&old), 0).unwrap().note,
+            "GitHub cannot find it; asst unlink jaehho/lab if it is gone for good"
+        );
+        // ... and only for that state
+        let replaced = hold(LinkState::Replaced, 30);
+        assert_eq!(
+            found(&renamed, Some(&replaced), 0).unwrap().note,
+            "GitHub cannot find it"
+        );
+    }
+
+    #[test]
+    fn a_hold_keeps_its_start_while_it_goes_on_and_ends_with_a_confirmed_pass() {
+        use chrono::TimeZone;
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let store = Store::in_memory(zone).unwrap();
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        let at = |m: u32| Utc.with_ymd_and_hms(2026, 10, 18, 12, m, 0).unwrap();
+        let hold = |daemon: &Daemon| {
+            daemon
+                .gh_state
+                .lock()
+                .unwrap()
+                .get("jaehho/lab")
+                .and_then(|s| s.hold.clone())
+        };
+
+        daemon.gh_hold("jaehho/lab", LinkState::Unreachable, "a".into(), at(0));
+        daemon.gh_hold("jaehho/lab", LinkState::Unreachable, "b".into(), at(5));
+        let h = hold(&daemon).unwrap();
+        assert_eq!(
+            (h.since, h.note.as_str()),
+            (at(0), "b"),
+            "same state, same start"
+        );
+        daemon.gh_hold("jaehho/lab", LinkState::Replaced, "c".into(), at(9));
+        assert_eq!(
+            hold(&daemon).unwrap().since,
+            at(9),
+            "another state starts again"
+        );
+
+        // A refusal says nothing about what it held; a confirmed look lifts it
+        daemon.gh_pass_done("jaehho/lab", Err("GitHub refused".into()));
+        assert!(hold(&daemon).is_some());
+        daemon.gh_release("jaehho/lab");
+        assert!(hold(&daemon).is_none());
+        daemon.gh_hold("jaehho/lab", LinkState::Conflict, "d".into(), at(12));
+        daemon.gh_pass_done("jaehho/lab", Ok(()));
+        assert!(
+            hold(&daemon).is_none(),
+            "a pass that ran has confirmed the repo"
+        );
     }
 
     #[tokio::test]

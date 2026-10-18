@@ -629,8 +629,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         style.dim("no list is linked; `asst link <list> <owner/repo>`")
                     );
                 }
-                for l in links {
+                for l in &links {
                     println!("{} ⇄ {}", l.name, l.repo);
+                    if let Some(note) = out::link_note(&style, l) {
+                        println!("{note}");
+                    }
+                }
+                if let Some(hint) = out::links_hint(&style, &links) {
+                    println!("{hint}");
                 }
             }
         },
@@ -857,6 +863,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 return show_json(&raw);
             }
             print_status(&style, &serde_json::from_str(&raw)?);
+            // Links are an extra: a daemon that cannot list them still has a status
+            if let Ok(raw) = proxy.links().await
+                && let Ok(links) = serde_json::from_str::<Vec<LinkView>>(&raw)
+                && let Some(line) = out::links_status(&style, &links)
+            {
+                println!("{line}");
+            }
         }
 
         Cmd::Login {
@@ -1072,8 +1085,7 @@ mod tests {
             repo: repo.into(),
             list: format!("/cal/{name}/"),
             name: name.into(),
-            synced: None,
-            error: None,
+            ..LinkView::default()
         }
     }
 
