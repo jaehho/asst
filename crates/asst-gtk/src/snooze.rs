@@ -1,10 +1,12 @@
 //! The snooze chooser (#20): when to ring a reminder again, for the times
 //! a notification's own Snooze buttons (10, 30, 60 min by default) don't
 //! cover. A reminder's `Snooze…` button asks the window for it
-//! (`snooze-task`). It is a small popup like quick add's: a layer surface
-//! over everything, so the window need not be showing, with a few presets
-//! and a field that reads `2h`, `45m`, `5pm` or `tomorrow 8am`.
+//! (`snooze-task`), after asstd has snoozed the first length, so closing
+//! the chooser keeps that. It is a small popup like quick add's: a layer
+//! surface over everything, so the window need not be showing, with a few
+//! presets and a field that reads `2h`, `45m`, `5pm` or `tomorrow 8am`.
 
+use asst_core::config::first_snooze;
 use asst_core::fmt;
 use asst_core::quickadd;
 use asst_core::time::{When, resolve};
@@ -168,9 +170,18 @@ pub fn when_label(at: DateTime<Utc>, now: DateTime<Tz>) -> String {
 /// What choosing a time does: ask the daemon, and say how it went.
 pub type Pick = Box<dyn Fn(DateTime<Utc>, Box<dyn FnOnce(client::Result<()>)>)>;
 
+/// What the chooser says under its title: the reminder is not lost, and
+/// Esc keeps the snooze `Snooze…` made before asking.
+fn hint(buttons: &[u64]) -> String {
+    format!(
+        "Snoozed {} already. Pick a time to change it, or press Esc to keep it.",
+        fmt::minutes(first_snooze(buttons))
+    )
+}
+
 /// Open the chooser for the task named `title`. `buttons` are the lengths
-/// (minutes) of the Snooze buttons its notification had, which the presets
-/// leave out.
+/// (minutes) of the Snooze buttons its notification had: the presets leave
+/// them out, and the first is what asstd has snoozed the task for.
 pub fn present(title: &str, buttons: &[u64], pick: Pick) -> gtk::Window {
     crate::load_icons();
     let window = gtk::Window::builder()
@@ -204,6 +215,15 @@ pub fn present(title: &str, buttons: &[u64], pick: Pick) -> gtk::Window {
         .build();
     heading.add_css_class("heading");
     card.append(&heading);
+    let hint = gtk::Label::builder()
+        .label(hint(buttons))
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(48)
+        .build();
+    hint.add_css_class("caption");
+    hint.add_css_class("dim-label");
+    card.append(&hint);
 
     let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
     status.add_css_class("caption");
@@ -235,8 +255,11 @@ pub fn present(title: &str, buttons: &[u64], pick: Pick) -> gtk::Window {
         })
     };
 
+    let presets = choices(now, buttons);
+    // Enter on an empty field is the first preset, the soonest.
+    let soonest = presets.first().map(|c| c.at);
     let mut first: Option<gtk::Button> = None;
-    for choice in choices(now, buttons) {
+    for choice in presets {
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let label = gtk::Label::builder()
             .label(&choice.label)
@@ -284,7 +307,13 @@ pub fn present(title: &str, buttons: &[u64], pick: Pick) -> gtk::Window {
     {
         let go = go.clone();
         entry.connect_activate(move |e| {
-            if let Some(at) = parse(&e.text(), pickers::now()) {
+            let text = e.text();
+            let at = if text.trim().is_empty() {
+                soonest
+            } else {
+                parse(&text, pickers::now())
+            };
+            if let Some(at) = at {
                 go(at);
             }
         });

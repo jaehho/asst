@@ -489,7 +489,8 @@ pub async fn open_in_window(
 }
 
 /// The window's chooser for when to ring a task's reminder again
-/// (`snooze-task`), started the same way.
+/// (`snooze-task`), started the same way. The caller snoozes the task
+/// first, so closing the chooser leaves the reminder ringing again.
 pub async fn snooze_in_window(
     conn: &zbus::Connection,
     href: &str,
