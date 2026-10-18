@@ -165,6 +165,10 @@ pub enum Msg {
     DropQuadrant(String, Quadrant),
     /// Place or move a day-plan slot: href, start minutes, duration minutes.
     PlanSet(String, u32, u32),
+    /// A keyboard nudge of a placed slot, same arguments. It says nothing:
+    /// the block moves where it is watched, and the opposite arrow takes
+    /// it back.
+    PlanNudge(String, u32, u32),
     /// Take a task off the day plan.
     PlanUnplace(String),
     /// Undo a plan change: restore this slot on `date`, or take the task
@@ -449,6 +453,8 @@ pub struct Window {
     dirty: bool,
     shown: u64,
     pending_d: Option<Instant>,
+    /// The day-plan toast on screen or waiting, which the next one replaces.
+    plan_toast: Option<adw::Toast>,
     last_focus_sync: Option<Instant>,
     signing_in: Option<String>,
     sign_in_error: Option<String>,
@@ -1010,6 +1016,7 @@ impl Component for Window {
             dirty: false,
             shown: 0,
             pending_d: None,
+            plan_toast: None,
             last_focus_sync: None,
             signing_in: None,
             sign_in_error: None,
@@ -1388,7 +1395,15 @@ impl Component for Window {
                             tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
-                    w.toasts.add_toast(toast);
+                    self.plan_toast(w, toast);
+                }
+            }
+            Msg::PlanNudge(href, start, duration) => {
+                let day = self.day_day;
+                if crate::plan::apply_slot(&mut self.prefs, &self.open, &href, day, start, duration)
+                {
+                    self.prefs.save();
+                    self.shown = 0;
                 }
             }
             Msg::PlanUnplace(href) => {
@@ -1414,7 +1429,7 @@ impl Component for Window {
                             tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
-                    w.toasts.add_toast(toast);
+                    self.plan_toast(w, toast);
                 }
             }
             Msg::PlanCarry => {
@@ -1443,7 +1458,7 @@ impl Component for Window {
                         tx.emit(Msg::PlanUncarry(carried.clone()));
                     });
                 }
-                w.toasts.add_toast(toast);
+                self.plan_toast(w, toast);
             }
             Msg::PlanUncarry(carried) => {
                 model::uncarry(&mut self.prefs.plan, &carried);
@@ -2822,6 +2837,16 @@ impl Window {
             .map(|s| (s.start, s.duration))
     }
 
+    /// Shows a day-plan toast in place of the last one, so a run of drags
+    /// leaves one Undo on screen, not a queue of them to wait out. Only the
+    /// plan's own: dismissing the others would send a held delete early.
+    fn plan_toast(&mut self, w: &Widgets, toast: adw::Toast) {
+        if let Some(last) = self.plan_toast.replace(toast.clone()) {
+            last.dismiss();
+        }
+        w.toasts.add_toast(toast);
+    }
+
     fn nav_order(&self) -> Vec<Nav> {
         let mut navs = self.prefs.sidebar_views();
         navs.extend(
@@ -3021,7 +3046,7 @@ impl Window {
                 let Some((start, duration)) = self.plan_slot(&t.href, day) else {
                     return;
                 };
-                sender.input(Msg::PlanSet(
+                sender.input(Msg::PlanNudge(
                     t.href,
                     model::nudge_start(start, delta),
                     duration,
