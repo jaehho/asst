@@ -3410,4 +3410,47 @@ mod tests {
         rig.go().await;
         assert_eq!(kinds(&rig.log()), ["list-renamed", "repo-renamed"]);
     }
+
+    #[tokio::test]
+    async fn names_passed_on_between_two_repos_settle_in_the_rounds_that_follow() {
+        // `b` is called `c` now, and then `a` is called `b`: whichever link
+        // is looked at first finds its new name taken. Nothing is lost, and
+        // once the other has moved, it follows.
+        let mut rig = Rig::new(&["jaehho/a", "jaehho/b"]).await;
+        rig.publish(1, "jaehho/a", false);
+        rig.publish(2, "jaehho/b", false);
+        rig.go().await;
+        rig.publish(2, "jaehho/c", false);
+        rig.publish(1, "jaehho/b", false);
+        rig.fake
+            .reply("GET", "/repos/jaehho/c/issues", Reply::json(200, "[]"));
+        let before = rig.snap();
+
+        rig.go().await;
+        assert_eq!(rig.row("jaehho/c").repo_id, Some(2));
+        assert_eq!(
+            rig.link("jaehho/a").state,
+            Some(asst_core::api::LinkState::Conflict)
+        );
+        assert_eq!(rig.snap().pairs.len(), before.pairs.len());
+
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.row("jaehho/b").repo_id, Some(1));
+        assert_eq!(rig.row("jaehho/c").repo_id, Some(2));
+        assert_eq!(rig.rows().len(), 2);
+        assert_eq!(rig.link("jaehho/b").state, None, "the hold is lifted");
+        assert_eq!(rig.link("jaehho/c").state, None);
+        // Each list followed its own repo
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.lists.name("/cal/a/"), "b");
+        assert_eq!(rig.lists.name("/cal/b/"), "c");
+        let renamed: Vec<_> = rig
+            .log()
+            .into_iter()
+            .filter(|r| r.kind == "list-renamed")
+            .collect();
+        assert_eq!(renamed.len(), 2);
+    }
 }
