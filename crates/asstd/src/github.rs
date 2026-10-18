@@ -39,6 +39,10 @@ const NAME_LOOKUP_EVERY: chrono::Duration = chrono::Duration::minutes(limits::NA
 /// Who made a log row.
 pub const AUTO: &str = "auto";
 
+/// What is true of every conflict, and the way out.
+const CONFLICT_NEXT: &str = "Nothing was changed, and this link's issues are not read until \
+                             one of the two links is removed (asst unlink OWNER/REPO).";
+
 /// What the GitHub task remembers between rounds. None of it survives a
 /// restart: it only saves requests, and what a restart forgets is looked at
 /// again.
@@ -252,6 +256,9 @@ fn apply_verdict(
             if !daemon.store().gh_learn_id(repo, id)? {
                 return duplicate_id(daemon, row, id, now);
             }
+            // Nothing the person asked for changes, so the log has no row for
+            // it; the journal says it happened
+            log::info!("{repo} is GitHub repository {id}; a rename of it will be followed");
             first_sight(daemon, row, info, now)?;
             daemon.gh_release(repo);
             Ok(Gate::Go)
@@ -421,16 +428,26 @@ fn rename(
             .map_or_else(|_| other.list.clone(), |l| l.name);
         drop(store);
         let note = match taken {
-            Some(_) => format!("{repo} is now {to}, which is already linked to {name:?}"),
+            Some(_) => format!(
+                "{repo} is now {to}, but {to} is already linked to {name:?}. {CONFLICT_NEXT}"
+            ),
             None => format!(
-                "{repo} is now {to}, but the same repository (GitHub id {id}) is linked as {}",
+                "{repo} is now {to}, but the same repository (GitHub id {id}) is linked as {}. \
+                 {CONFLICT_NEXT}",
                 other.repo
             ),
         };
         let data = serde_json::json!({ "to": to, "id": id, "other": other.repo });
         return conflict(daemon, row, note, &data, now);
     }
-    let text = format!("{repo} is now {to} (GitHub id {id})");
+    let text = if witnessed {
+        format!("{repo} is now {to} (GitHub id {id}); the link moved with it")
+    } else {
+        format!(
+            "{repo} is now {to} (GitHub id {id}), found after the fact; the link moved with it, \
+             and the list is left as it is (asst projects says whether to rename it)"
+        )
+    };
     let data = serde_json::json!({
         "from": repo,
         "to": to,
@@ -465,10 +482,11 @@ fn replaced(daemon: &Daemon, row: &GhLinkRow, found: u64, now: DateTime<Utc>) ->
     let repo = row.repo.as_str();
     let note = match row.repo_id {
         Some(stored) => format!(
-            "{repo} is another repository now (GitHub id {found}, not {stored}); its issues \
-             are not read, and unlinking {repo} and linking it again follows the new one"
+            "{repo} is a different repository now (GitHub id {found}, not {stored}), so its \
+             issues are not read. To follow the new one, unlink {repo} and link it again; the \
+             list's open tasks then become issues there"
         ),
-        None => format!("{repo} is another repository now (GitHub id {found})"),
+        None => format!("{repo} is a different repository now (GitHub id {found})"),
     };
     let data = serde_json::json!({ "found": found, "stored": row.repo_id }).to_string();
     let new = log_once(
@@ -504,7 +522,7 @@ fn duplicate_id(daemon: &Daemon, row: &GhLinkRow, id: u64, now: DateTime<Utc>) -
         return Ok(Gate::Stop);
     };
     let note = format!(
-        "{repo} is the same GitHub repository (id {id}) as {}, which is linked too",
+        "{repo} is the same GitHub repository (id {id}) as {}, which is linked too. {CONFLICT_NEXT}",
         other.repo
     );
     let data = serde_json::json!({ "id": id, "other": other.repo });
@@ -1380,7 +1398,7 @@ mod tests {
         assert_eq!(log[0].list.as_deref(), Some("/cal/champalimaud/"));
         assert_eq!(
             log[0].text,
-            "jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005)"
+            "jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005); the link moved with it"
         );
         let data: serde_json::Value =
             serde_json::from_str(log[0].data.as_deref().unwrap()).unwrap();
@@ -1433,6 +1451,12 @@ mod tests {
         let data: serde_json::Value =
             serde_json::from_str(log[0].data.as_deref().unwrap()).unwrap();
         assert_eq!(data["witnessed"], false);
+        assert_eq!(
+            log[0].text,
+            "jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005), found after the \
+             fact; the link moved with it, and the list is left as it is (asst projects says \
+             whether to rename it)"
+        );
         assert_eq!(rig.issues_asked("jaehho/lab"), 0, "the pass ended there");
         assert_eq!(rig.link("jaehho/lab").state, None);
 
@@ -1491,7 +1515,15 @@ mod tests {
         assert_eq!(after.log[0].by, "auto");
         let link = rig.link("jaehho/x");
         assert_eq!(link.state, Some(asst_core::api::LinkState::Replaced));
-        assert!(link.note.as_deref().unwrap().contains("222"));
+        assert_eq!(
+            link.note.as_deref(),
+            Some(
+                "jaehho/x is a different repository now (GitHub id 222, not 111), so its \
+                 issues are not read. To follow the new one, unlink jaehho/x and link it \
+                 again; the list's open tasks then become issues there"
+            )
+        );
+        assert_eq!(after.log[0].text, link.note.clone().unwrap());
         assert_eq!(link.since, Some(rig.now));
         assert_eq!(link.repo_id, Some(111));
 
@@ -1704,7 +1736,7 @@ mod tests {
         assert_eq!(link.since, Some(rig.now));
         assert_eq!(
             link.note.as_deref(),
-            Some("first seen archived 2026-10-18; 0 open tasks")
+            Some("archived on GitHub, first seen 2026-10-18; no open tasks here")
         );
 
         // Seen again, with the tag and without it (a restart): nothing new
@@ -1817,6 +1849,15 @@ mod tests {
         assert_eq!(rig.issues_asked(other), 0);
         let link = rig.link(other);
         assert_eq!(link.state, Some(asst_core::api::LinkState::Conflict));
+        assert_eq!(
+            link.note.as_deref(),
+            Some(
+                "jaehho/LAB is the same GitHub repository (id 5) as jaehho/lab, which is \
+                 linked too. Nothing was changed, and this link's issues are not read until \
+                 one of the two links is removed (asst unlink OWNER/REPO)."
+            )
+        );
+        assert_eq!(after.log[0].text, link.note.clone().unwrap());
         assert_eq!(link.repo_id, None);
         // Told once, however many rounds
         rig.go().await;
@@ -1858,6 +1899,12 @@ mod tests {
             Some(asst_core::api::LinkState::Conflict)
         );
         assert_eq!(
+            after.log[0].text,
+            "jaehho/champalimaud is now jaehho/lab, but jaehho/lab is already linked to \
+             \"lab\". Nothing was changed, and this link's issues are not read until one of \
+             the two links is removed (asst unlink OWNER/REPO)."
+        );
+        assert_eq!(
             rig.issues_asked("jaehho/champalimaud"),
             0,
             "the moved repo's issues are not read onto lab's tasks"
@@ -1890,6 +1937,14 @@ mod tests {
         assert_eq!(
             rig.link("jaehho/old").state,
             Some(asst_core::api::LinkState::Conflict)
+        );
+        assert_eq!(
+            rig.link("jaehho/old").note.as_deref(),
+            Some(
+                "jaehho/old is now jaehho/new, but jaehho/new is already linked to \"new\". \
+                 Nothing was changed, and this link's issues are not read until one of the \
+                 two links is removed (asst unlink OWNER/REPO)."
+            )
         );
         assert_eq!(rig.link("jaehho/new").state, None, "the other link is fine");
     }
@@ -1994,7 +2049,16 @@ mod tests {
         );
         let told = rig.notices();
         assert_eq!(told.len(), 1, "told once");
-        assert_eq!(told[0].1, sentence);
+        assert_eq!(
+            told[0],
+            (
+                "List \"champalimaud\" renamed to \"lab\"".to_string(),
+                "jaehho/champalimaud is now jaehho/lab on GitHub, so its list is renamed on \
+                 the server too. Undo: asst list rename lab champalimaud"
+                    .to_string()
+            ),
+            "the notification is shorter than the row"
+        );
         assert_eq!(rig.link("jaehho/lab").state, None, "nothing left to follow");
 
         // Pass 2: nothing to do and nothing to say
@@ -2036,7 +2100,7 @@ mod tests {
                 config: config(),
                 setup: |rig| rig.lists.set_name(CHAMPALIMAUD, "lab"),
                 slug: "already-named",
-                why: "the list is already named lab",
+                why: "the list is already named \"lab\"",
             },
             Case {
                 label: "another list has the name, in any case",
@@ -2100,7 +2164,13 @@ mod tests {
             assert_eq!(rig.lists.name(CHAMPALIMAUD), name, "{label}");
             let log = rig.log();
             assert_eq!(kinds(&log), ["list-kept", "repo-renamed"], "{label}");
-            assert_eq!(log[0].text, format!("rename not followed: {}", case.why));
+            assert_eq!(
+                log[0].text,
+                format!(
+                    "jaehho/champalimaud is now jaehho/lab; its list was not renamed: {}",
+                    case.why
+                )
+            );
             assert_eq!(
                 (log[0].repo.as_str(), log[0].by.as_str()),
                 ("jaehho/lab", "auto")
@@ -2215,7 +2285,11 @@ mod tests {
         assert_eq!(rig.row("jaehho/lab").follow_from, None);
         let log = rig.log();
         assert_eq!(kinds(&log), ["list-kept", "repo-renamed"]);
-        assert_eq!(log[0].text, "rename not followed: expired");
+        assert_eq!(
+            log[0].text,
+            "jaehho/champalimaud is now jaehho/lab; its list was not renamed: asstd could \
+             not do it for 30 days and gave up"
+        );
         assert_eq!(rig.lists.name(CHAMPALIMAUD), "champalimaud");
         assert!(rig.notices().is_empty());
         assert_eq!(rig.link("jaehho/lab").state, None, "nothing left waiting");
@@ -2278,7 +2352,8 @@ mod tests {
         );
         assert_eq!(
             log[0].text,
-            "rename not followed: the list was renamed to \"Lab notes\" meanwhile"
+            "jaehho/champalimaud is now jaehho/lab; its list was not renamed: the list was \
+             renamed to \"Lab notes\" meanwhile"
         );
         assert_eq!(rig.row("jaehho/lab").follow_from, None);
         assert!(rig.notices().is_empty());
@@ -2299,7 +2374,8 @@ mod tests {
         assert_eq!(kinds(&log), ["list-kept", "repo-renamed"]);
         assert_eq!(
             log[0].text,
-            "rename not followed: the server refused: the server answered 403"
+            "jaehho/champalimaud is now jaehho/lab; its list was not renamed: the server \
+             refused it (the server answered 403)"
         );
         assert_eq!(rig.row("jaehho/lab").follow_from, None);
         assert_eq!(rig.lists.renames(), 1, "asked once");

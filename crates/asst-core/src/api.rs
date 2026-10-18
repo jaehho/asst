@@ -568,7 +568,7 @@ mod tests {
         let archived = LinkView {
             repo_id: Some(1379104203),
             state: Some(LinkState::Archived),
-            note: Some("first seen archived 2026-10-18; 0 open tasks".into()),
+            note: Some("archived on GitHub, first seen 2026-10-18; no open tasks here".into()),
             ..fine
         };
         let json = serde_json::to_value(&archived).unwrap();

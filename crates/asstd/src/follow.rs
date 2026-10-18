@@ -114,6 +114,20 @@ impl Intent {
             }
         }
     }
+
+    /// The notification for a rename that is done: what happened to which
+    /// list, why, and the one command that undoes it. The log row has the
+    /// repo's id too; a notification has no use for it.
+    fn notice(&self) -> (String, String) {
+        (
+            format!("List {:?} renamed to {:?}", self.from, self.to),
+            format!(
+                "{} is now {} on GitHub, so its list is renamed on the server too. \
+                 Undo: asst list rename {} {}",
+                self.repo_from, self.repo_to, self.to, self.from
+            ),
+        )
+    }
 }
 
 /// A rename the log says was begun and not finished.
@@ -155,11 +169,16 @@ impl Keep<'_> {
     /// The reason, in words, for a repo that was `old` and is `new`.
     fn words(&self, old: &str, new: &str) -> String {
         match self {
-            Keep::Expired => "expired".into(),
+            Keep::Expired => format!(
+                "asstd could not do it for {} days and gave up",
+                limits::MARKER_EXPIRES_DAYS
+            ),
             Keep::Why(KeepWhy::Custom, list) => {
                 format!("the list is called {list:?}, not {:?}", github::short(old))
             }
-            Keep::Why(KeepWhy::AlreadyNamed, list) => format!("the list is already named {list}"),
+            Keep::Why(KeepWhy::AlreadyNamed, list) => {
+                format!("the list is already named {list:?}")
+            }
             Keep::Why(KeepWhy::SameName, _) => "the repo's name did not change".into(),
             Keep::Why(KeepWhy::Clash, _) => {
                 format!("another list is already named {:?}", github::short(new))
@@ -168,7 +187,7 @@ impl Keep<'_> {
             Keep::Why(KeepWhy::Inbox, _) => "the list is the inbox".into(),
             Keep::Why(KeepWhy::Off, _) => "follow_rename is off".into(),
             Keep::Why(KeepWhy::Empty, _) => format!("{new} has no name to give a list"),
-            Keep::Refused(why) => format!("the server refused: {why}"),
+            Keep::Refused(why) => format!("the server refused it ({why})"),
             Keep::Changed(now) => format!("the list was renamed to {now:?} meanwhile"),
         }
     }
@@ -376,7 +395,8 @@ fn finish(
     };
     daemon.store().gh_end_follow(&link.repo, ended)?;
     log::info!("{text}");
-    daemon.notify("A list followed its repo's new name", &text);
+    let (summary, body) = intent.notice();
+    daemon.notify(&summary, &body);
     Ok(())
 }
 
@@ -390,7 +410,11 @@ fn keep(
     why: &Keep,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let text = format!("rename not followed: {}", why.words(old, &link.repo));
+    let text = format!(
+        "{old} is now {}; its list was not renamed: {}",
+        link.repo,
+        why.words(old, &link.repo)
+    );
     let data = serde_json::json!({
         "reason": why.slug(),
         "href": link.list,
@@ -415,7 +439,7 @@ fn keep(
         }),
     };
     daemon.store().gh_end_follow(&link.repo, ended)?;
-    log::info!("{old} is now {}: {text}", link.repo);
+    log::info!("{text}");
     Ok(())
 }
 
@@ -455,6 +479,16 @@ mod tests {
              jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005). \
              Undo: asst list rename lab champalimaud"
         );
+        // The notification: what, why and the undo, without the id
+        assert_eq!(
+            intent.notice(),
+            (
+                "List \"champalimaud\" renamed to \"lab\"".to_string(),
+                "jaehho/champalimaud is now jaehho/lab on GitHub, so its list is renamed on \
+                 the server too. Undo: asst list rename lab champalimaud"
+                    .to_string()
+            )
+        );
         // The row's data is what a restart reads back
         let json = serde_json::to_string(&intent).unwrap();
         assert_eq!(serde_json::from_str::<Intent>(&json).unwrap(), intent);
@@ -466,7 +500,11 @@ mod tests {
     fn a_list_that_keeps_its_name_says_why_in_words() {
         let (old, new) = ("jaehho/champalimaud", "jaehho/lab");
         let cases = [
-            (Keep::Expired, "expired", "expired"),
+            (
+                Keep::Expired,
+                "expired",
+                "asstd could not do it for 30 days and gave up",
+            ),
             (
                 Keep::Why(KeepWhy::Custom, "Lab work"),
                 "custom",
@@ -475,7 +513,7 @@ mod tests {
             (
                 Keep::Why(KeepWhy::AlreadyNamed, "lab"),
                 "already-named",
-                "the list is already named lab",
+                "the list is already named \"lab\"",
             ),
             (
                 Keep::Why(KeepWhy::Clash, "champalimaud"),
@@ -505,7 +543,7 @@ mod tests {
             (
                 Keep::Refused("the server answered 403".into()),
                 "refused",
-                "the server refused: the server answered 403",
+                "the server refused it (the server answered 403)",
             ),
             (
                 Keep::Changed("Lab notes"),

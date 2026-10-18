@@ -2206,14 +2206,16 @@ mod tests {
             synced: Some(now().with_timezone(&Utc) - Duration::seconds(150)),
             error: error.map(str::to_string),
             state,
-            note: state.map(|_| "first seen archived 2026-10-18; 0 open tasks".to_string()),
+            note: state.map(|_| {
+                "archived on GitHub, first seen 2026-10-18; no open tasks here".to_string()
+            }),
             ..LinkView::default()
         };
         let archived = link(Some(LinkState::Archived), None);
         assert_eq!(
             link_state(&archived, now()),
             "Issues of jaehho/mail-digest read 2 minutes ago\n\
-             first seen archived 2026-10-18; 0 open tasks"
+             archived on GitHub, first seen 2026-10-18; no open tasks here"
         );
         // A fine link has no second line, even with a stale note
         let fine = LinkView {

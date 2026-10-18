@@ -146,14 +146,22 @@ fn link_condition(
         });
     }
     let first_seen = DateTime::from_timestamp(row.archived.filter(|t| *t > 0)?, 0)?;
+    // Archiving the list in the window only hides it: it still syncs, and
+    // its reminders still ring
     let tasks = match open {
-        0 => "0 open tasks".to_string(),
-        1 => "1 task is still open here; archived lists still sync and ring".to_string(),
-        n => format!("{n} tasks are still open here; archived lists still sync and ring"),
+        0 => "no open tasks here".to_string(),
+        1 => "1 task is still open here (a list archived in the window still syncs and rings)"
+            .to_string(),
+        n => format!(
+            "{n} tasks are still open here (a list archived in the window still syncs and rings)"
+        ),
     };
     Some(Condition {
         state: LinkState::Archived,
-        note: format!("first seen archived {}; {tasks}", day(first_seen)),
+        note: format!(
+            "archived on GitHub, first seen {}; {tasks}",
+            day(first_seen)
+        ),
         since: Some(first_seen),
     })
 }
@@ -1014,7 +1022,7 @@ impl Daemon {
         let links = store.gh_links()?;
         if let Some((other, _)) = links.iter().find(|(r, href)| *href == l.href && r != repo) {
             return Err(Error::Invalid(format!(
-                "{} is linked to {other}; unlink it first",
+                "{} is linked to {other}; unlink {other} first",
                 l.name
             )));
         }
@@ -1028,7 +1036,7 @@ impl Daemon {
                 .find_list(href)
                 .map_or_else(|_| href.clone(), |o| o.name);
             return Err(Error::Invalid(format!(
-                "{other} is linked to {name}; unlink it first"
+                "{other} is already linked to {name}; unlink {other} first to link it to another list"
             )));
         }
         store.gh_link(repo, &l.href)?;
@@ -1517,12 +1525,19 @@ mod tests {
         daemon.store().gh_pair("jaehho/asst", &pair).unwrap();
         // Again is nothing new; another repo for the same list is refused
         daemon.link("work", "jaehho/asst").unwrap();
-        assert!(daemon.link("work", "jaehho/other").is_err());
+        assert_eq!(
+            daemon.link("work", "jaehho/other").unwrap_err().to_string(),
+            "Work is linked to jaehho/asst; unlink jaehho/asst first"
+        );
         // So is the same repo for another list, in any case: the store
         // would move the link and drop its pairs, so unlink comes first
         for typed in ["jaehho/asst", "Jaehho/ASST"] {
             let err = daemon.link("home", typed).unwrap_err().to_string();
-            assert_eq!(err, "jaehho/asst is linked to Work; unlink it first");
+            assert_eq!(
+                err,
+                "jaehho/asst is already linked to Work; unlink jaehho/asst first to link it \
+                 to another list"
+            );
         }
         assert_eq!(
             daemon.links().unwrap().len(),
@@ -1691,16 +1706,19 @@ mod tests {
         let c = found(&archived, None, 0).unwrap();
         assert_eq!(c.state, LinkState::Archived);
         assert_eq!(c.since, Some(at(19, 2)));
-        assert_eq!(c.note, "first seen archived 2026-10-18; 0 open tasks");
+        assert_eq!(
+            c.note,
+            "archived on GitHub, first seen 2026-10-18; no open tasks here"
+        );
         assert_eq!(
             found(&archived, None, 1).unwrap().note,
-            "first seen archived 2026-10-18; 1 task is still open here; \
-             archived lists still sync and ring"
+            "archived on GitHub, first seen 2026-10-18; 1 task is still open here \
+             (a list archived in the window still syncs and rings)"
         );
         assert_eq!(
             found(&archived, None, 4).unwrap().note,
-            "first seen archived 2026-10-18; 4 tasks are still open here; \
-             archived lists still sync and ring"
+            "archived on GitHub, first seen 2026-10-18; 4 tasks are still open here \
+             (a list archived in the window still syncs and rings)"
         );
 
         // A rename the list has not followed comes before an archive
