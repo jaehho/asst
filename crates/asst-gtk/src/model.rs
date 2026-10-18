@@ -845,6 +845,24 @@ pub fn reorder(tasks: &[TaskView], moved: &str, target: &str, after: bool) -> Ve
         .collect()
 }
 
+/// Where the cursor goes when its row has left the view (checked off, moved
+/// to another day): the row that followed it, else the nearest one before.
+/// `before` and `after` are the rows' hrefs, top to bottom, of the build the
+/// cursor was in and of the one that replaced it. Nothing when the cursor
+/// was not in `before`, which is a view change, not a row leaving.
+pub fn cursor_after_leaving<'a>(
+    before: &[&str],
+    cursor: &str,
+    after: &[&'a str],
+) -> Option<&'a str> {
+    let at = before.iter().position(|h| *h == cursor)?;
+    let (behind, ahead) = before.split_at(at);
+    ahead[1..]
+        .iter()
+        .chain(behind.iter().rev())
+        .find_map(|h| after.iter().find(|a| *a == h).copied())
+}
+
 // -- day plan ----------------------------------------------------------------
 
 /// First hour row of the Plan grid (inclusive).
@@ -1998,6 +2016,32 @@ mod tests {
             [("b".to_string(), 1024), ("a".to_string(), 2048)]
         );
         assert!(reorder(&list, "/a/a.ics", "/a/a.ics", false).is_empty());
+    }
+
+    #[test]
+    fn the_cursor_carries_on_from_a_row_that_left() {
+        let before = ["a", "b", "c", "d"];
+        // The row after it, so a run of `x` goes down the list.
+        assert_eq!(
+            cursor_after_leaving(&before, "b", &["a", "c", "d"]),
+            Some("c")
+        );
+        // The next row left too: the one after that.
+        assert_eq!(cursor_after_leaving(&before, "b", &["a", "d"]), Some("d"));
+        // The last row: the one above it.
+        assert_eq!(
+            cursor_after_leaving(&before, "d", &["a", "b", "c"]),
+            Some("c")
+        );
+        // Rows that arrived do not count as following it.
+        assert_eq!(
+            cursor_after_leaving(&before, "b", &["a", "new", "c", "d"]),
+            Some("c")
+        );
+        // The only row, or one that was not in the last build (another
+        // view): nowhere.
+        assert_eq!(cursor_after_leaving(&["a"], "a", &[]), None);
+        assert_eq!(cursor_after_leaving(&before, "z", &["a", "b"]), None);
     }
 
     #[test]

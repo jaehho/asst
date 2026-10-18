@@ -3260,6 +3260,16 @@ impl Window {
             if flashing {
                 self.hold(sender, motion::lasts(ROLLED_MS));
             }
+            // A row that leaves under the cursor (checked off, moved to
+            // another day) hands it to the one after, so a run of `x` or
+            // `m` goes down the list instead of stopping for a `j`.
+            if let Some(c) = &self.cursor {
+                let old: Vec<&str> = w.rows.iter().map(|(h, _)| h.as_str()).collect();
+                let new: Vec<&str> = built.rows.iter().map(|(h, _)| h.as_str()).collect();
+                if !new.contains(&c.as_str()) {
+                    self.cursor = model::cursor_after_leaving(&old, c, &new).map(str::to_string);
+                }
+            }
             w.rows = built.rows;
             self.built = Built {
                 nav: self.loaded.then_some(view),
