@@ -1,7 +1,7 @@
-//! The sidebar: colored tiles for the views chosen in
-//! Preferences, then the account's lists with their color rings and counts.
-//! Tasks dragged onto a tile or a list land there; lists dragged among
-//! themselves take a new order.
+//! The sidebar: colored tiles for the views chosen here (a tile's menu hides
+//! it and adds the hidden ones back), then the account's lists with their
+//! color rings and counts. Tasks dragged onto a tile or a list land there;
+//! lists dragged among themselves take a new order.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,6 +23,9 @@ struct Tile {
     child: gtk::FlowBoxChild,
     count: gtk::Label,
     dot: gtk::Widget,
+    /// The views not in the sidebar, for the menu's "Add to sidebar". The
+    /// tiles are built again whenever these change.
+    hidden: Rc<Vec<Nav>>,
 }
 
 struct ListRow {
@@ -95,6 +98,94 @@ pub fn list_menu(list: &ListView, archived: bool, tx: &Tx, select: bool) -> gtk:
     delete.set_sensitive(list.writable);
     items.push(delete.upcast());
     ui::menu(&items)
+}
+
+/// One row for each hidden view: a click appends it to the sidebar.
+pub fn add_view_items(hidden: &[Nav], tx: &Tx) -> Vec<gtk::Widget> {
+    hidden
+        .iter()
+        .map(|nav| {
+            let (tx, nav) = (tx.clone(), nav.clone());
+            Item::new(Some(nav.icon()), &nav.title(&[]))
+                .tint(nav.tint())
+                .build(move || tx.emit(Msg::ShowView(nav.clone(), None)))
+                .upcast()
+        })
+        .collect()
+}
+
+/// A tile's menu: hide it, add a hidden view, start over.
+fn tile_menu(nav: &Nav, hidden: &[Nav], tx: &Tx) -> gtk::Popover {
+    let mut items: Vec<gtk::Widget> = Vec::new();
+    {
+        let (tx, nav) = (tx.clone(), nav.clone());
+        items.push(
+            Item::new(
+                Some("cross-large-circle-outline-symbolic"),
+                &format!("Hide {}", nav.title(&[])),
+            )
+            .secondary("Del")
+            .build(move || tx.emit(Msg::HideView(nav.clone())))
+            .upcast(),
+        );
+    }
+    if !hidden.is_empty() {
+        items.push(ui::separator());
+        items.push(ui::label("Add to sidebar", &["caption-heading", "menu-heading"]).upcast());
+        items.extend(add_view_items(hidden, tx));
+    }
+    items.push(ui::separator());
+    {
+        let tx = tx.clone();
+        items.push(
+            Item::new(Some("dock-left-symbolic"), "Reset sidebar")
+                .secondary("Inbox, Day")
+                .build(move || tx.emit(Msg::ResetSidebar))
+                .upcast(),
+        );
+    }
+    ui::menu(&items)
+}
+
+fn show_tile_menu(
+    tile: &gtk::FlowBoxChild,
+    nav: &Nav,
+    hidden: &[Nav],
+    tx: &Tx,
+    at: gdk::Rectangle,
+) {
+    crate::row::show_at(&tile_menu(nav, hidden, tx), tile, at);
+}
+
+/// Where a menu opened from the keyboard points: the middle of the tile.
+fn middle(tile: &gtk::FlowBoxChild) -> gdk::Rectangle {
+    gdk::Rectangle::new(tile.width() / 2, tile.height() / 2, 1, 1)
+}
+
+/// What a key does on a focused tile.
+#[derive(Debug, PartialEq)]
+enum TileKey {
+    /// Alt+Left, Alt+Right: a place earlier or later.
+    Move(i32),
+    Hide,
+    Menu,
+}
+
+fn tile_key(key: gdk::Key, state: gdk::ModifierType) -> Option<TileKey> {
+    // Caps Lock does not count.
+    let mods = state
+        & (gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SUPER_MASK);
+    match key {
+        gdk::Key::Left if mods == gdk::ModifierType::ALT_MASK => Some(TileKey::Move(-1)),
+        gdk::Key::Right if mods == gdk::ModifierType::ALT_MASK => Some(TileKey::Move(1)),
+        gdk::Key::Delete if mods.is_empty() => Some(TileKey::Hide),
+        gdk::Key::Menu if mods.is_empty() => Some(TileKey::Menu),
+        gdk::Key::F10 if mods == gdk::ModifierType::SHIFT_MASK => Some(TileKey::Menu),
+        _ => None,
+    }
 }
 
 pub struct Sidebar {
@@ -326,7 +417,7 @@ impl Sidebar {
         let key = format!("{shown:?}");
         if *self.tiles_key.borrow() != key {
             *self.tiles_key.borrow_mut() = key;
-            self.build_tiles(&shown);
+            self.build_tiles(&shown, Rc::new(st.prefs.hidden_views()));
             self.tiles_box.set_visible(!shown.is_empty());
         }
         for t in self.tiles.borrow().iter() {
@@ -432,7 +523,24 @@ impl Sidebar {
         }
     }
 
-    fn build_tiles(&self, shown: &[Nav]) {
+    /// The menu of the tile for `nav`, as a right-click or the Menu key opens it.
+    pub fn open_tile_menu(&self, nav: &Nav) {
+        let tiles = self.tiles.borrow();
+        if let Some(t) = tiles.iter().find(|t| &t.nav == nav) {
+            show_tile_menu(&t.child, &t.nav, &t.hidden, &self.tx, middle(&t.child));
+        }
+    }
+
+    fn build_tiles(&self, shown: &[Nav], hidden: Rc<Vec<Nav>>) {
+        // The keyboard stays on the tile it was on through a move or a hide:
+        // read before the old tiles go, which takes the focus with them.
+        let focused = self
+            .tiles
+            .borrow()
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.child.is_focus())
+            .map(|(at, t)| (t.nav.clone(), at));
         self.tiles_box.remove_all();
         let mut tiles = Vec::new();
         for nav in shown {
@@ -493,33 +601,38 @@ impl Sidebar {
                 .button(gdk::BUTTON_SECONDARY)
                 .build();
             {
-                let tx = self.tx.clone();
-                let nav = nav.clone();
+                let (tx, nav, hidden) = (self.tx.clone(), nav.clone(), hidden.clone());
                 let child_weak = child.downgrade();
                 menu_click.connect_pressed(move |g, _, x, y| {
                     g.set_state(gtk::EventSequenceState::Claimed);
                     let Some(child) = child_weak.upgrade() else {
                         return;
                     };
-                    let (a, b, nav) = (tx.clone(), tx.clone(), nav.clone());
-                    let menu = ui::menu(&[
-                        Item::new(
-                            Some("cross-large-circle-outline-symbolic"),
-                            "Hide from sidebar",
-                        )
-                        .build(move || a.emit(Msg::HideView(nav.clone())))
-                        .upcast(),
-                        Item::new(Some("dock-left-symbolic"), "Edit sidebar…")
-                            .build(move || b.emit(Msg::Preferences(Some("sidebar"))))
-                            .upcast(),
-                    ]);
-                    crate::row::show_at(
-                        &menu,
-                        &child,
-                        gdk::Rectangle::new(x as i32, y as i32, 1, 1),
-                    );
+                    let at = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                    show_tile_menu(&child, &nav, &hidden, &tx, at);
                 });
             }
+            let keys = gtk::EventControllerKey::new();
+            {
+                let (tx, nav, hidden) = (self.tx.clone(), nav.clone(), hidden.clone());
+                let child_weak = child.downgrade();
+                keys.connect_key_pressed(move |_, key, _, state| {
+                    let Some(action) = tile_key(key, state) else {
+                        return glib::Propagation::Proceed;
+                    };
+                    match action {
+                        TileKey::Move(by) => tx.emit(Msg::MoveView(nav.clone(), by)),
+                        TileKey::Hide => tx.emit(Msg::HideView(nav.clone())),
+                        TileKey::Menu => {
+                            if let Some(child) = child_weak.upgrade() {
+                                show_tile_menu(&child, &nav, &hidden, &tx, middle(&child));
+                            }
+                        }
+                    }
+                    glib::Propagation::Stop
+                });
+            }
+            child.add_controller(keys);
             child.add_controller(menu_click);
             self.tiles_box.append(&child);
             tiles.push(Tile {
@@ -527,7 +640,17 @@ impl Sidebar {
                 child,
                 count,
                 dot: dot.upcast(),
+                hidden: hidden.clone(),
             });
+        }
+        // The place it had, when the tile itself went.
+        if let Some((nav, at)) = focused
+            && let Some(t) = tiles
+                .iter()
+                .find(|t| t.nav == nav)
+                .or_else(|| tiles.get(at.min(tiles.len().saturating_sub(1))))
+        {
+            t.child.grab_focus();
         }
         *self.tiles.borrow_mut() = tiles;
     }
@@ -669,5 +792,44 @@ impl Sidebar {
             }
         });
         row.add_controller(target);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gdk::ModifierType as M;
+
+    #[test]
+    fn a_tile_moves_hides_and_opens_its_menu_from_the_keyboard() {
+        let none = M::empty();
+        assert_eq!(
+            tile_key(gdk::Key::Left, M::ALT_MASK),
+            Some(TileKey::Move(-1))
+        );
+        assert_eq!(
+            tile_key(gdk::Key::Right, M::ALT_MASK),
+            Some(TileKey::Move(1))
+        );
+        assert_eq!(tile_key(gdk::Key::Delete, none), Some(TileKey::Hide));
+        assert_eq!(tile_key(gdk::Key::Menu, none), Some(TileKey::Menu));
+        assert_eq!(tile_key(gdk::Key::F10, M::SHIFT_MASK), Some(TileKey::Menu));
+        // Caps Lock changes nothing.
+        assert_eq!(
+            tile_key(gdk::Key::Right, M::ALT_MASK | M::LOCK_MASK),
+            Some(TileKey::Move(1))
+        );
+        // The plain arrows are the flow box's, and a chord with more in it
+        // is somebody else's.
+        for (key, mods) in [
+            (gdk::Key::Left, none),
+            (gdk::Key::Right, M::SHIFT_MASK),
+            (gdk::Key::Left, M::ALT_MASK | M::CONTROL_MASK),
+            (gdk::Key::Delete, M::SHIFT_MASK),
+            (gdk::Key::F10, none),
+            (gdk::Key::Up, M::ALT_MASK),
+        ] {
+            assert_eq!(tile_key(key, mods), None, "{key:?} {mods:?}");
+        }
     }
 }

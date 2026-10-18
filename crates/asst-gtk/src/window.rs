@@ -39,6 +39,10 @@ pub type Tx = relm4::Sender<Msg>;
 /// How long a repeating task's new date stays lit (`.due-chip.rolled`).
 const ROLLED_MS: u32 = 1200;
 
+/// Seconds an Undo for a change to the sidebar stays on screen: long enough
+/// to read where the view can be added back.
+const UNDO_SECS: u32 = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
     Window,
@@ -246,10 +250,18 @@ pub enum Msg {
     PatchPrefs(PrefPatch),
     /// Take a view out of the sidebar.
     HideView(Nav),
-    SetSidebar(Vec<Nav>),
+    /// Put a view in the sidebar, at the place given (clamped) else last.
+    ShowView(Nav, Option<usize>),
+    /// A tile earlier (negative) or later in the sidebar.
+    MoveView(Nav, i32),
+    /// Back to the default sidebar.
+    ResetSidebar,
     /// The sidebar as it was, as saved (`None`: the default): the Undo of
-    /// the migration to Inbox and Day.
+    /// the migration to Inbox and Day, and of a reset.
     RestoreSidebar(Option<Vec<String>>),
+    /// The saved sidebar, replaced on load by Inbox and Day (see
+    /// `Prefs::migrated_from`), now that there is a window to say so in.
+    SidebarMigrated(Vec<String>),
     SetSettings(Box<SettingsChange>),
     SignIn(String),
     SignOut,
@@ -465,8 +477,9 @@ pub struct Window {
     dirty: bool,
     shown: u64,
     pending_d: Option<Instant>,
-    /// The day-plan toast on screen or waiting, which the next one replaces.
-    plan_toast: Option<adw::Toast>,
+    /// The toast for the last change to the window's own state (plan,
+    /// sidebar, archive), on screen or waiting, which the next one replaces.
+    edit_toast: Option<adw::Toast>,
     last_focus_sync: Option<Instant>,
     signing_in: Option<String>,
     sign_in_error: Option<String>,
@@ -1082,7 +1095,7 @@ impl Component for Window {
             dirty: false,
             shown: 0,
             pending_d: None,
-            plan_toast: None,
+            edit_toast: None,
             last_focus_sync: None,
             signing_in: None,
             sign_in_error: None,
@@ -1113,20 +1126,11 @@ impl Component for Window {
             // Said when the window first shows, not at login in the tray,
             // where ten seconds go by with nobody looking.
             let old = Cell::new(Some(old));
-            let toasts = widgets.toasts.clone();
             let tx = tx.clone();
             widgets.window.connect_map(move |_| {
-                let Some(old) = old.take() else { return };
-                let undo = adw::Toast::builder()
-                    .title("Sidebar now shows Inbox and Day.")
-                    .button_label("Undo")
-                    .timeout(10)
-                    .build();
-                let tx = tx.clone();
-                undo.connect_button_clicked(move |_| {
-                    tx.emit(Msg::RestoreSidebar(Some(old.clone())))
-                });
-                toasts.add_toast(undo);
+                if let Some(old) = old.take() {
+                    tx.emit(Msg::SidebarMigrated(old));
+                }
             });
         }
         model.reload(&sender);
@@ -1513,7 +1517,7 @@ impl Component for Window {
                             tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
-                    self.plan_toast(w, toast);
+                    self.edit_toast(w, toast);
                 }
             }
             Msg::PlanNudge(href, start, duration) => {
@@ -1547,7 +1551,7 @@ impl Component for Window {
                             tx.emit(Msg::PlanUndo(h.clone(), day, prior));
                         });
                     }
-                    self.plan_toast(w, toast);
+                    self.edit_toast(w, toast);
                 }
             }
             Msg::PlanCarry => {
@@ -1576,7 +1580,7 @@ impl Component for Window {
                         tx.emit(Msg::PlanUncarry(carried.clone()));
                     });
                 }
-                self.plan_toast(w, toast);
+                self.edit_toast(w, toast);
             }
             Msg::PlanUncarry(carried) => {
                 model::uncarry(&mut self.prefs.plan, &carried);
@@ -1882,17 +1886,17 @@ impl Component for Window {
                     self.prefs.archived.push(href.clone());
                 }
                 self.prefs.save();
-                let undo = adw::Toast::builder()
-                    .title(glib::markup_escape_text(&format!(
+                self.undo_toast(
+                    w,
+                    &tx,
+                    &format!(
                         "{} {}",
                         if on { "Archived" } else { "Unarchived" },
                         quoted(&name)
-                    )))
-                    .button_label("Undo")
-                    .timeout(4)
-                    .build();
-                undo.connect_button_clicked(move |_| tx.emit(Msg::Archive(href.clone(), !on)));
-                w.toasts.add_toast(undo);
+                    ),
+                    Msg::Archive(href, !on),
+                    4,
+                );
             }
             Msg::CopyList(href) => {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
@@ -2011,27 +2015,53 @@ impl Component for Window {
                 }
             }
             Msg::HideView(nav) => {
-                let before = self.prefs.sidebar_views();
-                let mut views = before.clone();
-                views.retain(|n| *n != nav);
-                self.prefs.set_sidebar_views(&views);
+                let Some(at) = self.prefs.hide_view(&nav) else {
+                    return;
+                };
                 self.prefs.save();
-                let undo = adw::Toast::builder()
-                    .title(format!("Took {} out of the sidebar", nav.title(&[])))
-                    .button_label("Undo")
-                    .timeout(4)
-                    .build();
-                let tx = tx.clone();
-                undo.connect_button_clicked(move |_| tx.emit(Msg::SetSidebar(before.clone())));
-                w.toasts.add_toast(undo);
+                // Its Undo puts back this view alone, at the place it had.
+                self.undo_toast(
+                    w,
+                    &tx,
+                    &format!(
+                        "{} hidden. Right-click a tile to add it back.",
+                        nav.title(&[])
+                    ),
+                    Msg::ShowView(nav, Some(at)),
+                    UNDO_SECS,
+                );
             }
-            Msg::SetSidebar(views) => {
-                self.prefs.set_sidebar_views(&views);
+            Msg::ShowView(nav, at) => {
+                self.prefs.show_view(nav, at);
                 self.prefs.save();
+            }
+            Msg::MoveView(nav, by) => {
+                self.prefs.move_view(&nav, by);
+                self.prefs.save();
+            }
+            Msg::ResetSidebar => {
+                let old = self.prefs.reset_sidebar();
+                self.prefs.save();
+                self.undo_toast(
+                    w,
+                    &tx,
+                    "Sidebar reset to Inbox and Day.",
+                    Msg::RestoreSidebar(old),
+                    UNDO_SECS,
+                );
             }
             Msg::RestoreSidebar(keys) => {
                 self.prefs.sidebar = keys;
                 self.prefs.save();
+            }
+            Msg::SidebarMigrated(old) => {
+                self.undo_toast(
+                    w,
+                    &tx,
+                    "Sidebar now shows Inbox and Day.",
+                    Msg::RestoreSidebar(Some(old)),
+                    10,
+                );
             }
             Msg::SetSettings(change) => {
                 sender.oneshot_command(async move {
@@ -2971,14 +3001,32 @@ impl Window {
             .map(|s| (s.start, s.duration))
     }
 
-    /// Shows a day-plan toast in place of the last one, so a run of drags
-    /// leaves one Undo on screen, not a queue of them to wait out. Only the
-    /// plan's own: dismissing the others would send a held delete early.
-    fn plan_toast(&mut self, w: &Widgets, toast: adw::Toast) {
-        if let Some(last) = self.plan_toast.replace(toast.clone()) {
+    /// Shows the toast for a change to the window's own state (the day plan,
+    /// the sidebar, an archive) in place of the last such toast, so a run of
+    /// drags or hides leaves one Undo on screen, not a queue of them to wait
+    /// out. Only these: dismissing the others would send a held delete early.
+    fn edit_toast(&mut self, w: &Widgets, toast: adw::Toast) {
+        if let Some(last) = self.edit_toast.replace(toast.clone()) {
             last.dismiss();
         }
         w.toasts.add_toast(toast);
+    }
+
+    /// An `edit_toast` whose Undo sends `undo`, which puts back that change
+    /// and no other.
+    fn undo_toast(&mut self, w: &Widgets, tx: &Tx, text: &str, undo: Msg, secs: u32) {
+        let toast = adw::Toast::builder()
+            .title(glib::markup_escape_text(text))
+            .button_label("Undo")
+            .timeout(secs)
+            .build();
+        let (tx, undo) = (tx.clone(), Cell::new(Some(undo)));
+        toast.connect_button_clicked(move |_| {
+            if let Some(undo) = undo.take() {
+                tx.emit(undo);
+            }
+        });
+        self.edit_toast(w, toast);
     }
 
     fn nav_order(&self) -> Vec<Nav> {
@@ -3148,7 +3196,7 @@ impl Window {
                         .title(glib::markup_escape_text(&said))
                         .timeout(3)
                         .build();
-                    self.plan_toast(w, toast);
+                    self.edit_toast(w, toast);
                     return;
                 }
                 let start = model::place_start(&t.task, &self.prefs.plan, day, self.now());
@@ -3569,7 +3617,8 @@ impl Window {
     /// `menu <words>`, `popup date|list|link|priority|reminders|menu|view|more`,
     /// `popdown`, `search <text>` and `searchfocus` (the open popover's search field),
     /// `title <text>`, `notes <text>`, `add`, `type <text>`,
-    /// `submit`, `select <words>`, `prefs [sidebar]`, `hide <view>`, `find [text]`,
+    /// `submit`, `select <words>`, `prefs [sidebar]`, `hide <view>`, `show <view>`,
+    /// `tile-menu <view>`, `undo` (the toast's button), `find [text]`,
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
     /// `clear [list]` (asks), `clear! [list]`, `archive <list>`, `unarchive <list>`,
@@ -3954,6 +4003,23 @@ impl Window {
             "hide" => {
                 if let Some(n) = Nav::from_key(arg) {
                     sender.input(Msg::HideView(n));
+                }
+            }
+            "show" => {
+                if let Some(n) = Nav::from_key(arg) {
+                    sender.input(Msg::ShowView(n, None));
+                }
+            }
+            // A tile's menu, as its right-click opens it; `pick` then
+            // chooses a row.
+            "tile-menu" => match Nav::from_key(arg) {
+                Some(n) => w.sidebar.open_tile_menu(&n),
+                None => eprintln!("drive: no view {arg:?}"),
+            },
+            // The Undo of the toast on screen.
+            "undo" => {
+                if !crate::devel::press_toast_button(w.toasts.upcast_ref()) {
+                    eprintln!("drive: no toast with a button");
                 }
             }
             "unfocus" => gtk::prelude::GtkWindowExt::set_focus(&w.window, None::<&gtk::Widget>),

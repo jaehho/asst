@@ -352,12 +352,18 @@ pub fn show_at(p: &gtk::Popover, parent: &impl IsA<gtk::Widget>, at: gdk::Rectan
     p.set_parent(parent);
     p.set_pointing_to(Some(&at));
     p.set_position(gtk::PositionType::Bottom);
-    p.connect_closed(|p| {
-        let p = p.clone();
+    // Kept until the popover is let go of: a click on a menu item may
+    // rebuild what the menu hangs from before the idle below runs, and GTK
+    // would finalize it with the popover still a child, whose `parent()` is
+    // then freed memory.
+    let parent: gtk::Widget = parent.clone().upcast();
+    p.connect_closed(move |p| {
+        let (p, parent) = (p.clone(), parent.clone());
         glib::idle_add_local_once(move || {
             if p.parent().is_some() {
                 p.unparent();
             }
+            drop(parent);
         });
     });
     p.popup();

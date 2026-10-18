@@ -360,15 +360,16 @@ pub(crate) fn visible_toast(overlay: &gtk::Widget) -> Option<String> {
     let mut stack = vec![overlay.clone()];
     while let Some(w) = stack.pop() {
         if w.type_().name() == "AdwToastWidget" {
-            let mut labels = vec![w.clone()];
-            while let Some(l) = labels.pop() {
+            // In tree order, so the title comes before the Undo button's.
+            let mut labels = std::collections::VecDeque::from([w.clone()]);
+            while let Some(l) = labels.pop_front() {
                 if let Some(text) = l.downcast_ref::<gtk::Label>() {
                     return Some(text.text().to_string());
                 }
                 let mut c = l.first_child();
                 while let Some(child) = c {
                     c = child.next_sibling();
-                    labels.push(child);
+                    labels.push_back(child);
                 }
             }
         }
@@ -379,6 +380,36 @@ pub(crate) fn visible_toast(overlay: &gtk::Widget) -> Option<String> {
         }
     }
     None
+}
+
+/// Press the button of the toast the overlay is showing (its Undo).
+/// Whether there was one.
+pub(crate) fn press_toast_button(overlay: &gtk::Widget) -> bool {
+    let mut stack = vec![overlay.clone()];
+    while let Some(w) = stack.pop() {
+        if w.type_().name() == "AdwToastWidget" {
+            let mut inside = vec![w.clone()];
+            while let Some(b) = inside.pop() {
+                if let Some(button) = b.downcast_ref::<gtk::Button>()
+                    && button.label().is_some_and(|l| !l.is_empty())
+                {
+                    button.emit_clicked();
+                    return true;
+                }
+                let mut c = b.first_child();
+                while let Some(child) = c {
+                    c = child.next_sibling();
+                    inside.push(child);
+                }
+            }
+        }
+        let mut c = w.first_child();
+        while let Some(child) = c {
+            c = child.next_sibling();
+            stack.push(child);
+        }
+    }
+    false
 }
 
 /// The part of `outer` that `inner` covers: the window's own background

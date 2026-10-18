@@ -296,15 +296,34 @@ impl Prefs {
         self.views.get(&nav.key()).cloned().unwrap_or_default()
     }
 
-    /// The views in the sidebar, top to bottom.
+    /// The views in the sidebar, top to bottom. A view named twice counts
+    /// once, at its first place.
     pub fn sidebar_views(&self) -> Vec<Nav> {
-        match &self.sidebar {
+        let mut views: Vec<Nav> = match &self.sidebar {
             Some(keys) => keys
                 .iter()
                 .filter_map(|k| Nav::from_key(k).filter(|n| !matches!(n, Nav::List(_))))
                 .collect(),
             None => DEFAULT_SIDEBAR.to_vec(),
-        }
+        };
+        let mut seen = Vec::new();
+        views.retain(|n| {
+            let new = !seen.contains(n);
+            if new {
+                seen.push(n.clone());
+            }
+            new
+        });
+        views
+    }
+
+    /// The views that are not in the sidebar, in `Nav::filters` order.
+    pub fn hidden_views(&self) -> Vec<Nav> {
+        let shown = self.sidebar_views();
+        Nav::filters()
+            .into_iter()
+            .filter(|n| !shown.contains(n))
+            .collect()
     }
 
     /// Where the window starts when the view last shown is unknown, and
@@ -319,6 +338,50 @@ impl Prefs {
 
     pub fn set_sidebar_views(&mut self, views: &[Nav]) {
         self.sidebar = Some(views.iter().map(Nav::key).collect());
+    }
+
+    /// Take a view out of the sidebar. The place it had, for `show_view` to
+    /// put it back at; `None` (and no change) when it was not shown.
+    pub fn hide_view(&mut self, nav: &Nav) -> Option<usize> {
+        let mut views = self.sidebar_views();
+        let at = views.iter().position(|n| n == nav)?;
+        views.remove(at);
+        self.set_sidebar_views(&views);
+        Some(at)
+    }
+
+    /// Put a view in the sidebar at `at`, else last. A place past the end is
+    /// the end, and a view already shown stays where it is.
+    pub fn show_view(&mut self, nav: Nav, at: Option<usize>) {
+        let mut views = self.sidebar_views();
+        if views.contains(&nav) {
+            return;
+        }
+        views.insert(at.map_or(views.len(), |at| at.min(views.len())), nav);
+        self.set_sidebar_views(&views);
+    }
+
+    /// Move a shown view `delta` places up (negative) or down, stopping at
+    /// the ends.
+    pub fn move_view(&mut self, nav: &Nav, delta: i32) {
+        let mut views = self.sidebar_views();
+        let Some(from) = views.iter().position(|n| n == nav) else {
+            return;
+        };
+        let to = from
+            .saturating_add_signed(delta as isize)
+            .min(views.len() - 1);
+        if to != from {
+            let moved = views.remove(from);
+            views.insert(to, moved);
+            self.set_sidebar_views(&views);
+        }
+    }
+
+    /// Back to the default sidebar. What `sidebar` held, as saved, for the
+    /// Undo to write back.
+    pub fn reset_sidebar(&mut self) -> Option<Vec<String>> {
+        self.sidebar.take()
     }
 
     pub fn is_archived(&self, href: &str) -> bool {
@@ -632,6 +695,184 @@ day_zoom = 52.0
         assert_eq!(p.home(), Nav::Day);
         p.set_sidebar_views(&[]);
         assert_eq!(p.home(), Nav::Inbox);
+    }
+
+    #[test]
+    fn hide_returns_the_index_and_show_puts_it_back() {
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::Inbox, Nav::Today, Nav::Day]);
+        assert_eq!(p.hide_view(&Nav::Today), Some(1));
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Day]);
+
+        // Not shown: nothing to hide, nothing changed.
+        let before = p.clone();
+        assert_eq!(p.hide_view(&Nav::Today), None);
+        assert_eq!(p, before);
+
+        p.show_view(Nav::Today, Some(1));
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Today, Nav::Day]);
+        // No place given, or one past the end: last.
+        p.show_view(Nav::Matrix, None);
+        p.show_view(Nav::Tomorrow, Some(99));
+        assert_eq!(
+            p.sidebar_views(),
+            [Nav::Inbox, Nav::Today, Nav::Day, Nav::Matrix, Nav::Tomorrow]
+        );
+
+        // The default sidebar has no key yet: the first hide writes it, and
+        // the last tile may go too.
+        let mut d = Prefs::default();
+        assert_eq!(d.sidebar, None);
+        assert_eq!(d.hide_view(&Nav::Day), Some(1));
+        assert_eq!(d.sidebar, Some(keys(&[Nav::Inbox])));
+        assert_eq!(d.hide_view(&Nav::Inbox), Some(0));
+        assert!(d.sidebar_views().is_empty());
+        assert_eq!(d.home(), Nav::Inbox);
+        // What was saved is what comes back.
+        assert!(
+            parse(&toml::to_string(&d).unwrap())
+                .sidebar_views()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn show_is_a_noop_for_a_present_view() {
+        let mut p = Prefs::default();
+        let before = p.clone();
+        p.show_view(Nav::Inbox, Some(1));
+        p.show_view(Nav::Day, None);
+        // Not even the key is written.
+        assert_eq!(p, before);
+
+        p.set_sidebar_views(&[Nav::Today, Nav::Inbox]);
+        let before = p.clone();
+        p.show_view(Nav::Inbox, Some(0));
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn move_view_clamps_at_the_ends() {
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::Inbox, Nav::Today, Nav::Day]);
+        p.move_view(&Nav::Today, 1);
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Day, Nav::Today]);
+        p.move_view(&Nav::Today, 1);
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Day, Nav::Today]);
+        p.move_view(&Nav::Today, -1);
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Today, Nav::Day]);
+        // Further than there is room for stops at the end.
+        p.move_view(&Nav::Day, -5);
+        assert_eq!(p.sidebar_views(), [Nav::Day, Nav::Inbox, Nav::Today]);
+        p.move_view(&Nav::Day, i32::MAX);
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Today, Nav::Day]);
+        p.move_view(&Nav::Inbox, i32::MIN);
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Today, Nav::Day]);
+
+        // A view that is not shown stays where it is, and a move that goes
+        // nowhere does not write the default sidebar down.
+        let before = p.clone();
+        p.move_view(&Nav::Matrix, 1);
+        assert_eq!(p, before);
+        let mut d = Prefs::default();
+        d.move_view(&Nav::Inbox, -1);
+        d.move_view(&Nav::Day, 1);
+        assert_eq!(d, Prefs::default());
+    }
+
+    #[test]
+    fn reset_returns_the_old_raw_value_and_restore_roundtrips() {
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::Today, Nav::Inbox, Nav::Matrix]);
+        let old = p.reset_sidebar();
+        assert_eq!(old, Some(keys(&[Nav::Today, Nav::Inbox, Nav::Matrix])));
+        assert_eq!(p.sidebar, None);
+        assert_eq!(p.sidebar_views(), DEFAULT_SIDEBAR);
+        // What the window saves after a reset is the default, and stays it.
+        let again = parse(&toml::to_string(&p).unwrap());
+        assert_eq!(again.sidebar_views(), DEFAULT_SIDEBAR);
+        assert_eq!(again.migrated_from, None);
+        // The Undo writes the raw value back, whatever it was.
+        p.sidebar = old;
+        assert_eq!(p.sidebar_views(), [Nav::Today, Nav::Inbox, Nav::Matrix]);
+
+        // The default has nothing saved, and Undo puts back nothing saved.
+        let mut d = Prefs::default();
+        let old = d.reset_sidebar();
+        assert_eq!(old, None);
+        d.sidebar = old;
+        assert_eq!(d, Prefs::default());
+
+        // All ten, put there on purpose, come back as ten and are not
+        // taken for a sidebar nobody arranged.
+        let mut all = parse("schema = 1\n");
+        all.set_sidebar_views(&Nav::filters());
+        let old = all.reset_sidebar();
+        all.sidebar = old;
+        let reread = parse(&toml::to_string(&all).unwrap());
+        assert_eq!(reread.sidebar_views(), Nav::filters());
+        assert_eq!(reread.migrated_from, None);
+    }
+
+    #[test]
+    fn each_hide_undo_restores_only_its_own_view() {
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::Inbox, Nav::Today, Nav::Day, Nav::Matrix]);
+        // The toast carries the place the view had when it was hidden.
+        let a = p.hide_view(&Nav::Today).unwrap();
+        let b = p.hide_view(&Nav::Matrix).unwrap();
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Day]);
+
+        // Undo of the first: B stays hidden.
+        p.show_view(Nav::Today, Some(a));
+        assert_eq!(p.sidebar_views(), [Nav::Inbox, Nav::Today, Nav::Day]);
+        // Undo of the second, the other way round: A stays hidden.
+        let mut q = Prefs::default();
+        q.set_sidebar_views(&[Nav::Inbox, Nav::Day]);
+        q.show_view(Nav::Matrix, Some(b));
+        assert_eq!(q.sidebar_views(), [Nav::Inbox, Nav::Day, Nav::Matrix]);
+    }
+
+    #[test]
+    fn hidden_views_follow_filters_order() {
+        assert_eq!(
+            Prefs::default().hidden_views(),
+            [
+                Nav::Today,
+                Nav::Matrix,
+                Nav::Scheduled,
+                Nav::Completed,
+                Nav::Tomorrow,
+                Nav::Anytime,
+                Nav::Repeating,
+                Nav::All
+            ]
+        );
+        // The order in the sidebar does not matter, only what is in it.
+        let mut p = Prefs::default();
+        p.set_sidebar_views(&[Nav::All, Nav::Day, Nav::Today, Nav::Inbox]);
+        assert_eq!(
+            p.hidden_views(),
+            [
+                Nav::Matrix,
+                Nav::Scheduled,
+                Nav::Completed,
+                Nav::Tomorrow,
+                Nav::Anytime,
+                Nav::Repeating
+            ]
+        );
+        p.set_sidebar_views(&Nav::filters());
+        assert!(p.hidden_views().is_empty());
+        p.set_sidebar_views(&[]);
+        assert_eq!(p.hidden_views(), Nav::filters());
+    }
+
+    #[test]
+    fn a_view_named_twice_is_shown_once() {
+        let p = parse("schema = 1\nsidebar = [\"day\", \"inbox\", \"day\"]\n");
+        assert_eq!(p.sidebar_views(), [Nav::Day, Nav::Inbox]);
+        assert_eq!(p.hidden_views().len(), 8);
     }
 
     #[test]
