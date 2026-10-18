@@ -10,7 +10,7 @@ systemctl --user enable --now asstd
 asst login cloud.example.com       # opens the browser; approves an app password for asst
 ```
 
-`make install` puts a **wrapper** at `~/.local/bin/{asst,asst-gtk,asstd}` (one script, three names). It runs the binary from the checkout that installed it right away and rebuilds in the background, so opening the window never waits on cargo. The next launch picks up source changes. With no binary yet, a failed build refuses to start and points at `~/.local/state/asst-live.log`; `ASST_SRC` runs a different tree. `make test-live` pins that behavior.
+`make install` puts a **wrapper** at `~/.local/bin/{asst,asst-gtk,asstd}` (one script, three names). It runs the binary from the checkout that installed it right away and rebuilds in the background, so opening the window never waits on cargo. The next launch picks up source changes; `ASST_NO_REBUILD=1` skips that rebuild for a script that calls `asst` often. With no binary yet, a failed build refuses to start and points at `~/.local/state/asst-live.log`; `ASST_SRC` runs a different tree. `make test-live` pins that behavior.
 
 `packaging/PKGBUILD` builds `asst-git` for Arch. Needs gtk4, libadwaita, gtk4-layer-shell, and a Secret Service (gnome-keyring, KeePassXC) for the app password.
 

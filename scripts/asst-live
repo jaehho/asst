@@ -7,6 +7,8 @@
 #   - with no binary yet, a failed build never runs (first install is exact)
 #   - with a binary already there, run it now and rebuild in the background,
 #     so opening the window never waits on a dirty cargo tree
+#   - ASST_NO_REBUILD=1 skips that background rebuild, for callers that run
+#     asst many times an hour and only read (the dash board does)
 #   - exec, so the app is this process (signals, one PID, exit status)
 #   - build output lands in a log; GUI launches have no console
 set -eu
@@ -71,7 +73,7 @@ rebuild_later() {
 }
 
 if [ -x "$bin" ]; then
-  rebuild_later
+  [ -n "${ASST_NO_REBUILD:-}" ] || rebuild_later
   exec "$bin" "$@"
 fi
 

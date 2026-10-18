@@ -95,6 +95,19 @@ grep -q '^built$' "$MARKER" || {
   exit 1
 }
 
+# ASST_NO_REBUILD: run the binary, leave cargo alone.
+: >"$MARKER"
+ASST_NO_REBUILD=1 "$tmp/bin/asst" quiet >/dev/null 2>&1
+sleep 0.5
+grep -q '^args:quiet$' "$MARKER" || {
+  echo "FAIL: ASST_NO_REBUILD did not run the binary; got $(cat "$MARKER")" >&2
+  exit 1
+}
+if grep -q '^built$' "$MARKER"; then
+  echo "FAIL: ASST_NO_REBUILD still rebuilt" >&2
+  exit 1
+fi
+
 # After `make install`, the baked-in tree wins over $HOME/projects/asst,
 # and the sentinel must not have eaten the fallback check.
 sed "s|^DEFAULT_ROOT=\"@ROOT@\"|DEFAULT_ROOT=\"$tmp/src\"|" \
