@@ -19,7 +19,7 @@
 
 use asst_core::caldav::{RemoteError, RemoteList};
 use asst_core::github::{self, FollowRename, KeepWhy, limits};
-use asst_core::store::{Ended, GhLinkRow, LogRow, NewLog};
+use asst_core::store::{Ended, GH_LOG_KEEP, GhLinkRow, LogRow, NewLog};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -313,6 +313,9 @@ async fn try_follow(
         repo_to: link.repo.clone(),
         id: link.repo_id,
     };
+    if pending_id.is_none() {
+        close_superseded(daemon, href)?;
+    }
     let row = match pending_id {
         Some(id) => id,
         None => daemon.store().gh_log_add(&NewLog {
@@ -337,6 +340,27 @@ async fn try_follow(
             Ok(())
         }
     }
+}
+
+/// Intents of this list that nothing will finish. The repo was renamed
+/// again before the server was reached, and the marker kept the first old
+/// name; the list still has it (or this would not be going ahead), so the
+/// earlier rename was never carried out, and its row says so.
+fn close_superseded(daemon: &Daemon, href: &str) -> Result<()> {
+    let store = daemon.store();
+    let kept = u32::try_from(GH_LOG_KEEP).unwrap_or(u32::MAX);
+    for row in store.gh_log_recent(None, kept)? {
+        let ours = row
+            .data
+            .as_deref()
+            .and_then(|d| serde_json::from_str::<Intent>(d).ok())
+            .is_some_and(|intent| intent.href == href);
+        if row.kind == "list-renaming" && ours {
+            let text = "rename not followed: the repo was renamed again before it was done";
+            store.gh_log_retag(row.id, "list-kept", text)?;
+        }
+    }
+    Ok(())
 }
 
 fn link_of(daemon: &Daemon, href: &str) -> Result<Option<GhLinkRow>> {

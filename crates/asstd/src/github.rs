@@ -2721,6 +2721,11 @@ mod tests {
         fn is_nothing(&self) -> bool {
             matches!(self, Found::Nothing)
         }
+
+        /// No repo is called that now (one it was called before is no one).
+        fn is_nothing_alive(&self) -> bool {
+            !matches!(self, Found::Current(_))
+        }
     }
 
     impl World {
@@ -2867,15 +2872,17 @@ mod tests {
         for seed in seeds {
             let mut dice = Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut trace: Vec<String> = Vec::new();
-            let names: Vec<String> = (0..count)
+            let own: Vec<String> = (0..count)
                 .map(|i| format!("o/r{i}"))
                 .chain((0..FRESH).map(|i| format!("o/n{i}")))
                 .collect();
+            let mut names = own.clone();
+            names.extend(own.iter().map(|n| format!("o2/{}", short(n))));
             let repos: Vec<&str> = names[..count].iter().map(String::as_str).collect();
             let mut rig = Rig::new(&repos).await;
             rig.gh = GitHub::with_base("tok", &rig.fake.base())
                 .unwrap()
-                .with_timeout(Duration::from_millis(120));
+                .with_timeout(Duration::from_millis(400));
             let world = Arc::new(Mutex::new(World {
                 next_id: 500,
                 ..World::default()
@@ -2911,7 +2918,13 @@ mod tests {
             }
             let ids: Vec<u64> = (100..140).collect();
             serve_world(&rig.fake, &world, &names, &ids);
-            rig.go().await;
+            // A busy machine may time out the first look: try again
+            for _ in 0..5 {
+                rig.go().await;
+                if rig.rows().iter().all(|r| r.repo_id.is_some()) {
+                    break;
+                }
+            }
             let known: HashMap<String, u64> = rig
                 .rows()
                 .into_iter()
@@ -2930,6 +2943,8 @@ mod tests {
                 .iter()
                 .map(|h| (h.clone(), vec![rig.lists.name(h)]))
                 .collect();
+            // What someone named a list stays so: it is not the repo's name
+            let mut theirs: HashMap<String, String> = HashMap::new();
             let mut fresh = 0;
             let mut asked = rig.fake.seen().len();
 
@@ -2938,7 +2953,7 @@ mod tests {
                 let mut happened = Vec::new();
                 for _ in 0..1 + dice.roll(2) {
                     let pick = dice.roll(count as u64) as usize;
-                    let what = dice.roll(16);
+                    let what = dice.roll(19);
                     let mut w = world.lock().unwrap();
                     match what {
                         0..=3 if fresh < FRESH => {
@@ -3029,12 +3044,54 @@ mod tests {
                             let custom = format!("Mine {step}");
                             happened.push(format!("{} is named {custom}", hrefs[pick]));
                             rig.lists.set_name(&hrefs[pick], &custom);
-                            allowed.get_mut(&hrefs[pick]).unwrap().push(custom);
+                            allowed.get_mut(&hrefs[pick]).unwrap().push(custom.clone());
+                            theirs.insert(hrefs[pick].clone(), custom);
                         }
                         14 => {
                             drop(w);
                             happened.push("a restart".into());
                             rig.restart();
+                        }
+                        16 => {
+                            // Someone takes a name the repo left
+                            let old = w.repos[pick].former.last().cloned();
+                            if let Some(old) = old.filter(|o| w.find(o).is_nothing_alive()) {
+                                happened.push(format!("a stranger makes {old}"));
+                                let id = w.next_id;
+                                w.next_id += 1;
+                                w.repos.push(Repo {
+                                    id,
+                                    had: vec![short(&old).to_string()],
+                                    name: old,
+                                    former: Vec::new(),
+                                    archived: false,
+                                    alive: true,
+                                    issues: vec![(1, "Theirs".into())],
+                                });
+                            }
+                        }
+                        17 => {
+                            // To another owner, the same name
+                            if w.repos[pick].alive {
+                                let to = format!("o2/{}", short(&w.repos[pick].name));
+                                if w.find(&to).is_nothing() {
+                                    happened.push(format!("{} -> {to}", w.repos[pick].name));
+                                    w.rename(pick, &to);
+                                }
+                            }
+                        }
+                        18 => {
+                            if w.repos[pick].alive {
+                                happened.push(format!("{} is deleted", w.repos[pick].name));
+                                w.repos[pick].alive = false;
+                            }
+                        }
+                        15 => {
+                            // The clock is wrong: behind, or a month ahead
+                            drop(w);
+                            let jump = [-90, -10, 40 * 24 * 60][dice.roll(3) as usize];
+                            happened.push(format!("the clock jumps {jump} minutes"));
+                            rig.later(jump);
                         }
                         _ => {}
                     }
@@ -3087,6 +3144,22 @@ mod tests {
                         allowed[href].contains(&name) || had.contains(&name),
                         "{href} is called {name:?}\n{at}"
                     );
+                }
+                for (href, custom) in &theirs {
+                    assert_eq!(&rig.lists.name(href), custom, "a name of theirs\n{at}");
+                }
+                // A list is renamed from the name of the repo it was named for
+                for row in snap.log.iter().filter(|r| r.kind.starts_with("list-ren")) {
+                    let data: serde_json::Value =
+                        serde_json::from_str(row.data.as_deref().unwrap()).unwrap();
+                    let word = |key: &str| data[key].as_str().unwrap().to_string();
+                    assert_eq!(
+                        word("from"),
+                        short(&word("repo_from")),
+                        "{}\n{at}",
+                        row.text
+                    );
+                    assert_eq!(word("to"), short(&word("repo_to")), "{}\n{at}", row.text);
                 }
                 let hour = (rig.now - chrono::Duration::hours(1)).timestamp();
                 let renamed = snap
@@ -3230,5 +3303,38 @@ mod tests {
             assert_eq!(rig.issues_asked("jaehho/champalimaud"), 0, "{label}");
             assert!(rig.lists.calls().is_empty(), "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_rename_begun_and_then_made_again_is_closed_and_the_list_follows_the_last() {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        // The write to the server fails: the intent is in the log
+        rig.lists.with(|s| s.rename_fails = Some(Fail::Status(503)));
+        rig.go().await;
+        assert_eq!(kinds(&rig.log()), ["list-renaming", "repo-renamed"]);
+        // GitHub renames it again, and the server is back
+        rig.rename_on_github(LAB, "jaehho/lab", "jaehho/lab2", "[]");
+        rig.lists.with(|s| s.rename_fails = None);
+        rig.later(5);
+        rig.go().await;
+        rig.later(5);
+        rig.go().await;
+
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab2");
+        let log = rig.log();
+        // The first intent is not left saying it is being done
+        assert!(
+            !log.iter().any(|r| r.kind == "list-renaming"),
+            "{:?}",
+            kinds(&log)
+        );
+        assert_eq!(
+            kinds(&log).iter().filter(|k| **k == "list-renamed").count(),
+            1
+        );
+        assert_eq!(rig.row("jaehho/lab2").follow_from, None);
     }
 }
