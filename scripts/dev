@@ -169,15 +169,38 @@ CONF
   exit 1
 }
 
+# hyprctl follows HYPRLAND_INSTANCE_SIGNATURE, and a shell that outlived a
+# Hyprland restart still exports the dead one. Keep the inherited one while
+# it answers; else take the newest live instance, from `hyprctl instances`
+# (which ignores the signature). One stderr line when it swaps or finds none.
+live_hyprland() {
+  hyprctl version > /dev/null 2>&1 && return 0
+  local sig
+  sig="$(hyprctl instances -j 2> /dev/null | python3 -c '
+import json, sys
+live = json.load(sys.stdin)
+print(max(live, key=lambda i: i["time"])["instance"] if live else "")
+' 2> /dev/null)" || true
+  if [ -z "$sig" ]; then
+    echo "scripts/dev: no live Hyprland (HYPRLAND_INSTANCE_SIGNATURE=${HYPRLAND_INSTANCE_SIGNATURE:-unset} is dead)" >&2
+    return 1
+  fi
+  echo "scripts/dev: HYPRLAND_INSTANCE_SIGNATURE=${HYPRLAND_INSTANCE_SIGNATURE:-unset} is dead; using $sig" >&2
+  export HYPRLAND_INSTANCE_SIGNATURE="$sig"
+}
+
 hide_window() {
   # Named rule, so a later `up` replaces it in place. There is no remove
   # or reset on hl.window_rule (the userdata has no methods, and the name
   # map only holds one rule per name), so this stays until Hyprland
   # reloads its config. `down --all` leaves it too; it matches only the
-  # devel app id, so a normal asst window is unaffected.
-  if command -v hyprctl > /dev/null; then
-    hyprctl eval 'hl.window_rule({ name = "asst-devel", match = { class = "^(dev.jaeho.Asst.Devel)$" }, workspace = "name:asstdev silent", no_initial_focus = true, render_unfocused = true, float = true, size = "1280 820" })' > /dev/null
-  fi
+  # devel app id, so a normal asst window is unaffected. Without the rule
+  # the window just opens unhidden, so a failure warns and `up` goes on.
+  command -v hyprctl > /dev/null || return 0
+  live_hyprland || return 0
+  local out
+  out="$(hyprctl eval 'hl.window_rule({ name = "asst-devel", match = { class = "^(dev.jaeho.Asst.Devel)$" }, workspace = "name:asstdev silent", no_initial_focus = true, render_unfocused = true, float = true, size = "1280 820" })' 2>&1)" \
+    || echo "scripts/dev: the devel window rule is not set: $out" >&2
 }
 
 # The part that runs inside dbus-run-session.
@@ -291,6 +314,7 @@ CONF
     ;;
   keys)
     shift
+    live_hyprland || exit 1
     for k in "$@"; do
       mods="" key="$k"
       case "$k" in *+*) mods="${k%+*}"; key="${k##*+}"; mods="${mods//+/ }" ;; esac
