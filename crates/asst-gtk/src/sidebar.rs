@@ -1,7 +1,8 @@
 //! The sidebar: colored tiles for the views chosen here (a tile's menu hides
 //! it and adds the hidden ones back), then the account's lists with their
 //! color rings and counts. Tasks dragged onto a tile or a list land there;
-//! lists dragged among themselves take a new order.
+//! lists dragged among themselves take a new order. The inbox list is the
+//! Inbox tile's, and has a row of its own only while that tile is hidden.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -205,7 +206,11 @@ pub struct Sidebar {
 
 pub struct State<'a> {
     pub nav: &'a Nav,
+    /// The lists that have a row (`Prefs::sidebar_lists`): the inbox is not
+    /// among them while its tile shows.
     pub lists: &'a [ListView],
+    /// The inbox list's href, which the Inbox view highlights if it has a row.
+    pub inbox: Option<&'a str>,
     pub counts: &'a Counts,
     pub status: Option<&'a StatusView>,
     pub prefs: &'a Prefs,
@@ -469,7 +474,9 @@ impl Sidebar {
                 }
                 None => r.link.set_visible(false),
             }
-            if *st.nav == Nav::List(r.href.clone()) {
+            if *st.nav == Nav::List(r.href.clone())
+                || (*st.nav == Nav::Inbox && st.inbox == Some(r.href.as_str()))
+            {
                 r.row.add_css_class("selected");
             } else {
                 r.row.remove_css_class("selected");

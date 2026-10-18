@@ -443,6 +443,24 @@ impl Prefs {
         out
     }
 
+    /// The inbox list's href while the Inbox tile is in the sidebar: the
+    /// tile is that list, so it has no row of its own then.
+    pub fn inbox_on_tile<'a>(&self, lists: &'a [ListView]) -> Option<&'a str> {
+        let tile = self.sidebar_views().contains(&Nav::Inbox);
+        crate::model::inbox(lists)
+            .filter(|_| tile)
+            .map(|l| l.href.as_str())
+    }
+
+    /// The lists that have a row in the sidebar: `arrange`, less the inbox
+    /// list while the Inbox tile shows it. Hiding the tile brings the row.
+    pub fn sidebar_lists(&self, lists: &[ListView]) -> Vec<ListView> {
+        let on_tile = self.inbox_on_tile(lists);
+        let mut out = self.arrange(lists);
+        out.retain(|l| Some(l.href.as_str()) != on_tile);
+        out
+    }
+
     /// Dragging made `shown_before` into `shown_after` (hrefs, top to
     /// bottom). `list_order` also holds lists that are not on screen
     /// (archived ones, a list that a response left out) and so must not be
@@ -1099,6 +1117,41 @@ day_zoom = 52.0
         assert_eq!(names(p.arrange(&lists)), ["Work 9", "Work 10", "Home"]);
         p.lists_by_name = true;
         assert_eq!(names(p.arrange(&lists)), ["Home", "Work 9", "Work 10"]);
+    }
+
+    #[test]
+    fn inbox_shows_once_and_returns_when_its_tile_is_hidden() {
+        let lists = [
+            list("/w/", "Work"),
+            ListView {
+                inbox: true,
+                ..list("/i/", "Inbox")
+            },
+            list("/h/", "Home"),
+        ];
+        let mut p = Prefs::default();
+        assert!(p.sidebar_views().contains(&Nav::Inbox));
+        // The tile is the inbox: no row for it.
+        assert_eq!(p.inbox_on_tile(&lists), Some("/i/"));
+        assert_eq!(names(p.sidebar_lists(&lists)), ["Home", "Work"]);
+        // Without the tile the row is the only way in, in its own place.
+        p.hide_view(&Nav::Inbox);
+        assert_eq!(p.inbox_on_tile(&lists), None);
+        assert_eq!(names(p.sidebar_lists(&lists)), ["Home", "Inbox", "Work"]);
+        p.show_view(Nav::Inbox, None);
+        assert_eq!(names(p.sidebar_lists(&lists)), ["Home", "Work"]);
+        // A drag among the rows on screen leaves the inbox's place alone.
+        p.reorder_lists(
+            &lists,
+            &hrefs(&p.sidebar_lists(&lists)),
+            &strings(&["/w/", "/h/"]),
+        );
+        assert_eq!(names(p.sidebar_lists(&lists)), ["Work", "Home"]);
+        p.hide_view(&Nav::Inbox);
+        assert_eq!(names(p.sidebar_lists(&lists)), ["Work", "Inbox", "Home"]);
+        // Archived lists stay out either way.
+        p.archived.push("/w/".into());
+        assert_eq!(names(p.sidebar_lists(&lists)), ["Inbox", "Home"]);
     }
 
     #[test]

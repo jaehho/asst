@@ -173,25 +173,35 @@ fn task_row(t: &TaskView, q: &str, sub: &str) -> gtk::ListBoxRow {
 
 /// The lists `q` (trimmed, lowercase) finds, each with the caption under
 /// it. An empty query offers what the sidebar shows, so archived lists
-/// stay out; a typed one finds them too, captioned `Archived`.
+/// stay out, and so does the inbox while its tile shows; a typed one finds
+/// archived lists too, captioned `Archived`. The inbox list is found as the
+/// Inbox view (`inbox_alias`), never twice.
 fn list_hits<'a>(
     lists: &'a [ListView],
     q: &str,
-    archived: &[String],
+    prefs: &Prefs,
 ) -> Vec<(&'a ListView, Option<&'static str>)> {
+    let inbox = model::inbox(lists).map(|l| l.href.as_str());
+    let on_tile = prefs.inbox_on_tile(lists);
     lists
         .iter()
         .filter_map(|l| {
-            let gone = archived.contains(&l.href);
+            let gone = prefs.is_archived(&l.href);
             if q.is_empty() {
-                return (!gone).then_some((l, None));
+                return (!gone && Some(l.href.as_str()) != on_tile).then_some((l, None));
             }
-            l.name
-                .to_lowercase()
-                .contains(q)
+            (Some(l.href.as_str()) != inbox && l.name.to_lowercase().contains(q))
                 .then_some((l, gone.then_some("Archived")))
         })
         .collect()
+}
+
+/// The inbox list's name when `q` is part of it and the Inbox view's own
+/// name does not already say so: a list named "Work" that is the inbox is
+/// found by "wor" as the Inbox view.
+fn inbox_alias<'a>(lists: &'a [ListView], q: &str) -> Option<&'a str> {
+    let name = model::inbox(lists)?.name.as_str();
+    (!q.is_empty() && name.to_lowercase().contains(q) && !"inbox".contains(q)).then_some(name)
 }
 
 pub fn open(
@@ -235,7 +245,7 @@ pub fn open(
     let generation = Rc::new(Cell::new(0u64));
     let lists = lists.to_vec();
     let open = open.to_vec();
-    let archived = prefs.archived.clone();
+    let prefs = prefs.clone();
     // The sidebar's views first; typing finds the hidden ones too.
     let shown = prefs.sidebar_views();
     let mut navs = shown.clone();
@@ -262,10 +272,14 @@ pub fn open(
             let known_as = |n: &Nav| {
                 q.chars().count() >= 2 && n.keywords().iter().any(|k| k.starts_with(q.as_str()))
             };
+            // The inbox list's own name finds the Inbox view too.
+            let alias = inbox_alias(&lists, &q);
+            let named = |n: &Nav| *n == Nav::Inbox && alias.is_some();
             let views: Vec<&Nav> = navs
                 .iter()
                 .filter(|n| {
-                    (matches(&n.title(&[])) || known_as(n)) && (!q.is_empty() || shown.contains(n))
+                    (matches(&n.title(&[])) || known_as(n) || named(n))
+                        && (!q.is_empty() || shown.contains(n))
                 })
                 .collect();
             if !views.is_empty() {
@@ -275,7 +289,13 @@ pub fn open(
                     icon.add_css_class(n.tint());
                     let title = bold(&n.title(&[]), &q);
                     let also = (!n.title(&[]).to_lowercase().contains(&q))
-                        .then(|| n.keywords().iter().find(|k| k.starts_with(q.as_str())))
+                        .then(|| {
+                            n.keywords()
+                                .iter()
+                                .find(|k| k.starts_with(q.as_str()))
+                                .copied()
+                                .or(alias.filter(|_| named(n)))
+                        })
                         .flatten()
                         .map(|k| format!("“{k}”"));
                     add(
@@ -284,7 +304,7 @@ pub fn open(
                     );
                 }
             }
-            let found_lists = list_hits(&lists, &q, &archived);
+            let found_lists = list_hits(&lists, &q, &prefs);
             if !found_lists.is_empty() {
                 results.append(&header("Lists"));
                 for (l, sub) in found_lists {
@@ -500,9 +520,8 @@ fn find_search(w: &gtk::Widget) -> Option<gtk::SearchEntry> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_empty_query_leaves_archived_lists_out() {
-        let list = |href: &str, name: &str| ListView {
+    fn list(href: &str, name: &str) -> ListView {
+        ListView {
             href: href.into(),
             name: name.into(),
             color: None,
@@ -510,30 +529,99 @@ mod tests {
             inbox: false,
             open: 0,
             done: 0,
-        };
+        }
+    }
+
+    fn inbox(href: &str, name: &str) -> ListView {
+        ListView {
+            inbox: true,
+            ..list(href, name)
+        }
+    }
+
+    fn hits(lists: &[ListView], q: &str, prefs: &Prefs) -> Vec<(String, Option<&'static str>)> {
+        list_hits(lists, q, prefs)
+            .into_iter()
+            .map(|(l, caption)| (l.name.clone(), caption))
+            .collect()
+    }
+
+    fn hit(name: &str, caption: Option<&'static str>) -> (String, Option<&'static str>) {
+        (name.into(), caption)
+    }
+
+    /// The Inbox tile hidden, so the inbox list has a row like the others.
+    fn without_the_tile() -> Prefs {
+        let mut prefs = Prefs::default();
+        prefs.hide_view(&Nav::Inbox);
+        prefs
+    }
+
+    #[test]
+    fn an_empty_query_leaves_archived_lists_out() {
         let lists = [
+            inbox("/i/", "Inbox"),
             list("/w/", "Work"),
             list("/m/", "mail-digest"),
             list("/b/", "Mailbox"),
         ];
-        let archived = ["/m/".to_string()];
-        let hits = |q: &str| {
-            list_hits(&lists, q, &archived)
-                .into_iter()
-                .map(|(l, caption)| (l.name.as_str(), caption))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(hits(""), [("Work", None), ("Mailbox", None)]);
+        let mut prefs = without_the_tile();
+        prefs.archived.push("/m/".into());
         assert_eq!(
-            hits("mail"),
-            [("mail-digest", Some("Archived")), ("Mailbox", None)]
+            hits(&lists, "", &prefs),
+            [hit("Inbox", None), hit("Work", None), hit("Mailbox", None)]
         );
-        assert_eq!(hits("dig"), [("mail-digest", Some("Archived"))]);
-        assert_eq!(hits("zzz"), []);
         assert_eq!(
-            list_hits(&lists, "", &[]).len(),
-            3,
+            hits(&lists, "mail", &prefs),
+            [hit("mail-digest", Some("Archived")), hit("Mailbox", None)]
+        );
+        assert_eq!(
+            hits(&lists, "dig", &prefs),
+            [hit("mail-digest", Some("Archived"))]
+        );
+        assert_eq!(hits(&lists, "zzz", &prefs), []);
+        assert_eq!(
+            hits(&lists, "", &without_the_tile()).len(),
+            4,
             "nothing archived: all of them"
         );
+    }
+
+    #[test]
+    fn the_inbox_is_offered_once() {
+        let lists = [
+            inbox("/i/", "Inbox"),
+            list("/w/", "Work"),
+            list("/b/", "Inbox backlog"),
+        ];
+        let tile = Prefs::default();
+        let no_tile = without_the_tile();
+        // The tile is the inbox: no row among the lists.
+        assert_eq!(
+            hits(&lists, "", &tile),
+            [hit("Work", None), hit("Inbox backlog", None)]
+        );
+        // Without the tile the list has its row, as the sidebar does.
+        assert_eq!(
+            hits(&lists, "", &no_tile),
+            [
+                hit("Inbox", None),
+                hit("Work", None),
+                hit("Inbox backlog", None)
+            ]
+        );
+        // Typing finds it as the Inbox view (the Views group), never
+        // again as a list; a list that merely has "inbox" in its name stays.
+        for prefs in [&tile, &no_tile] {
+            assert_eq!(hits(&lists, "inbox", prefs), [hit("Inbox backlog", None)]);
+        }
+        // A list that is the inbox under another name is found by it.
+        let renamed = [list("/w/", "Work"), inbox("/p/", "Personal")];
+        assert_eq!(inbox_alias(&renamed, "pers"), Some("Personal"));
+        assert_eq!(hits(&renamed, "pers", &tile), []);
+        assert_eq!(inbox_alias(&renamed, ""), None);
+        assert_eq!(inbox_alias(&renamed, "work"), None);
+        // The Inbox view's own name already finds it.
+        assert_eq!(inbox_alias(&lists, "inb"), None);
     }
 }

@@ -1199,6 +1199,7 @@ impl Component for Window {
                 self.shown = 0;
             }
             Msg::Navigate(nav) => {
+                let nav = model::canonical_nav(nav, &self.lists);
                 if nav != self.nav {
                     self.nav = nav;
                     self.prefs.view = self.nav.key();
@@ -1880,7 +1881,7 @@ impl Component for Window {
             }
             Msg::SortLists => {
                 let (order, by_name) = (self.prefs.list_order.clone(), self.prefs.lists_by_name);
-                let shown = self.prefs.arrange(&self.lists);
+                let shown = self.prefs.sidebar_lists(&self.lists);
                 self.prefs.sort_lists_by_name(&self.lists, &shown);
                 self.prefs.save();
                 self.undo_toast(
@@ -1992,7 +1993,7 @@ impl Component for Window {
             Msg::Reveal(href) => {
                 if let Some(t) = self.find(&href).cloned() {
                     self.close_editor(w, &sender);
-                    self.nav = Nav::List(t.list.clone());
+                    self.nav = model::canonical_nav(Nav::List(t.list.clone()), &self.lists);
                     self.prefs.view = self.nav.key();
                     if self.adding.take().is_some() {
                         let _ = w.add_card.save_draft();
@@ -2174,6 +2175,8 @@ impl Component for Window {
                         self.links = l.links;
                         self.settle();
                         w.add_card.set_lists(&self.lists, self.prefs.sunday_first);
+                        // The view saved on quitting may be the inbox list.
+                        self.nav = model::canonical_nav(self.nav.clone(), &self.lists);
                         if let Nav::List(href) = &self.nav
                             && !self.lists.iter().any(|x| &x.href == href)
                         {
@@ -2376,7 +2379,7 @@ impl Component for Window {
                     }
                     if !self.in_view(&href) {
                         self.close_editor(w, &sender);
-                        self.nav = Nav::List(t.list.clone());
+                        self.nav = model::canonical_nav(Nav::List(t.list.clone()), &self.lists);
                         self.prefs.view = self.nav.key();
                         if !t.task.is_open() {
                             let mut opts = self.prefs.view_opts(&self.nav);
@@ -3053,24 +3056,21 @@ impl Window {
         self.edit_toast(w, toast);
     }
 
-    /// The lists on show in the sidebar, top to bottom.
+    /// The lists with a row in the sidebar, top to bottom.
     fn shown_list_hrefs(&self) -> Vec<String> {
         self.prefs
-            .arrange(&self.lists)
+            .sidebar_lists(&self.lists)
             .into_iter()
             .map(|l| l.href)
             .collect()
     }
 
     fn nav_order(&self) -> Vec<Nav> {
-        let mut navs = self.prefs.sidebar_views();
-        navs.extend(
-            self.prefs
-                .arrange(&self.lists)
-                .into_iter()
-                .map(|l| Nav::List(l.href)),
-        );
-        navs
+        model::cycle_order(
+            &self.prefs.sidebar_views(),
+            &self.prefs.sidebar_lists(&self.lists),
+            &self.lists,
+        )
     }
 
     fn key(&mut self, w: &mut Widgets, key: Key, sender: &ComponentSender<Self>) {
@@ -3143,7 +3143,7 @@ impl Window {
                     Nav0::Scheduled => Some(Nav::Scheduled),
                     Nav0::List(i) => self
                         .prefs
-                        .arrange(&self.lists)
+                        .sidebar_lists(&self.lists)
                         .get(i)
                         .map(|l| Nav::List(l.href.clone())),
                 };
@@ -3318,7 +3318,8 @@ impl Window {
         }
         w.sidebar.update(&sidebar::State {
             nav: &self.nav,
-            lists: &self.prefs.arrange(&self.lists),
+            lists: &self.prefs.sidebar_lists(&self.lists),
+            inbox: model::inbox(&self.lists).map(|l| l.href.as_str()),
             counts: &counts,
             status: self.status.as_ref(),
             prefs: &self.prefs,

@@ -469,6 +469,31 @@ pub fn inbox(lists: &[ListView]) -> Option<&ListView> {
         .or_else(|| lists.iter().find(|l| l.writable))
 }
 
+/// The view as the window keeps it: the inbox list is the Inbox view,
+/// however it was reached (a list row, Quick Find, a task revealed in it),
+/// so one of the two is highlighted, never a tile and a row, or neither.
+pub fn canonical_nav(nav: Nav, lists: &[ListView]) -> Nav {
+    match nav {
+        Nav::List(href) if inbox(lists).is_some_and(|l| l.href == href) => Nav::Inbox,
+        nav => nav,
+    }
+}
+
+/// The views `]` and Ctrl+PgDn step through: the tiles, then the rows of
+/// the lists (`all` tells which of them is the inbox). Each view once.
+pub fn cycle_order(tiles: &[Nav], rows: &[ListView], all: &[ListView]) -> Vec<Nav> {
+    let mut order: Vec<Nav> = Vec::new();
+    let lists = rows
+        .iter()
+        .map(|l| canonical_nav(Nav::List(l.href.clone()), all));
+    for nav in tiles.iter().cloned().chain(lists) {
+        if !order.contains(&nav) {
+            order.push(nav);
+        }
+    }
+    order
+}
+
 /// What a view shows, top to bottom.
 pub fn plan(nav: &Nav, data: &Data, opts: &ViewOpts, now: DateTime<Tz>) -> Vec<Section> {
     let zone = now.timezone();
@@ -1940,6 +1965,54 @@ mod tests {
                 done: 0,
             })
             .collect()
+    }
+
+    #[test]
+    fn canonical_nav_folds_the_inbox_list_into_inbox() {
+        let lists = lists();
+        // "/b/" is the inbox list.
+        assert_eq!(canonical_nav(Nav::List("/b/".into()), &lists), Nav::Inbox);
+        assert_eq!(
+            canonical_nav(Nav::List("/a/".into()), &lists),
+            Nav::List("/a/".into())
+        );
+        for nav in Nav::filters() {
+            assert_eq!(canonical_nav(nav.clone(), &lists), nav);
+        }
+        // Before the lists are loaded nothing is known to be the inbox.
+        assert_eq!(
+            canonical_nav(Nav::List("/b/".into()), &[]),
+            Nav::List("/b/".into())
+        );
+    }
+
+    #[test]
+    fn cycle_order_has_no_duplicates() {
+        let lists = lists();
+        let tiles = [Nav::Inbox, Nav::Day];
+        let rows = |names: &[&str]| -> Vec<ListView> {
+            lists
+                .iter()
+                .filter(|l| names.contains(&l.href.as_str()))
+                .cloned()
+                .collect()
+        };
+        // The inbox row is not built while its tile shows.
+        assert_eq!(
+            cycle_order(&tiles, &rows(&["/a/"]), &lists),
+            [Nav::Inbox, Nav::Day, Nav::List("/a/".into())]
+        );
+        // With the tile hidden the row stands for it, and is the Inbox
+        // view, so the walk lands on the view the window is on.
+        assert_eq!(
+            cycle_order(&[Nav::Day], &rows(&["/a/", "/b/"]), &lists),
+            [Nav::Day, Nav::List("/a/".into()), Nav::Inbox]
+        );
+        // Both at once, should a caller allow it, still visits it once.
+        assert_eq!(
+            cycle_order(&tiles, &rows(&["/a/", "/b/"]), &lists),
+            [Nav::Inbox, Nav::Day, Nav::List("/a/".into())]
+        );
     }
 
     fn on(d: NaiveDate) -> Option<When> {
