@@ -38,6 +38,10 @@ pub struct Prefs {
     /// Lists put away (hrefs): out of the sidebar, the views and the counts.
     /// They still sync, and their reminders still ring.
     pub archived: Vec<String>,
+    /// Lists with nothing left to do are put away with the archived ones,
+    /// and come back by themselves when a task lands in them (see
+    /// `split_lists`).
+    pub hide_finished_lists: bool,
     /// Quick add starts in the list it added to last.
     pub remember_list: bool,
     /// A new task's priority when none is given, 1 to 4 (none).
@@ -87,6 +91,7 @@ impl Default for Prefs {
             list_order: Vec::new(),
             list_icons: BTreeMap::new(),
             archived: Vec::new(),
+            hide_finished_lists: false,
             remember_list: false,
             default_priority: 4,
             read_dates: true,
@@ -100,6 +105,32 @@ impl Default for Prefs {
             views: BTreeMap::new(),
         }
     }
+}
+
+/// Why a list is out of the sidebar's way, under Hidden lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    Archived,
+    /// Nothing left to do in it, and "Hide finished lists" is on.
+    Finished,
+}
+
+impl Why {
+    /// The words beside its row, in the sidebar and in Quick Find.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Why::Archived => "Archived",
+            Why::Finished => "All done",
+        }
+    }
+}
+
+/// The lists as the sidebar has them: the rows, and what sits under Hidden
+/// lists, each in the order the sidebar keeps them in.
+#[derive(Debug, Default, PartialEq)]
+pub struct SplitLists {
+    pub shown: Vec<ListView>,
+    pub hidden: Vec<(ListView, Why)>,
 }
 
 /// The views a new sidebar has. The rest are one menu away.
@@ -436,11 +467,14 @@ impl Prefs {
     /// Lists as the sidebar shows them: archived ones out, in the order
     /// dragged into or by name.
     pub fn arrange(&self, lists: &[ListView]) -> Vec<ListView> {
-        let mut out: Vec<ListView> = lists
-            .iter()
-            .filter(|l| !self.is_archived(&l.href, lists))
-            .cloned()
-            .collect();
+        let mut out = self.ordered(lists);
+        out.retain(|l| !self.is_archived(&l.href, lists));
+        out
+    }
+
+    /// Every list, archived ones too, in the order dragged into or by name.
+    fn ordered(&self, lists: &[ListView]) -> Vec<ListView> {
+        let mut out: Vec<ListView> = lists.to_vec();
         if self.lists_by_name {
             out.sort_by(|a, b| crate::model::natural_cmp(&a.name, &b.name));
         } else {
@@ -471,12 +505,57 @@ impl Prefs {
     }
 
     /// The lists that have a row in the sidebar: `arrange`, less the inbox
-    /// list while the Inbox tile shows it. Hiding the tile brings the row.
-    pub fn sidebar_lists(&self, lists: &[ListView]) -> Vec<ListView> {
-        let on_tile = self.inbox_on_tile(lists);
-        let mut out = self.arrange(lists);
-        out.retain(|l| Some(l.href.as_str()) != on_tile);
-        out
+    /// list while the Inbox tile shows it (hiding the tile brings the row),
+    /// and less the finished ones when those are hidden. `current` is the
+    /// view on screen.
+    pub fn sidebar_lists(&self, lists: &[ListView], current: &Nav) -> Vec<ListView> {
+        self.split_lists(lists, current).shown
+    }
+
+    /// Whether the list has nothing left to do: tasks once, none open now.
+    /// A list with no tasks at all is new, not finished. Never the inbox
+    /// list, an archived one, or the one on screen (completing its last task
+    /// would take the row from under the cursor).
+    fn is_finished(&self, l: &ListView, all: &[ListView], current: &Nav) -> bool {
+        l.open == 0
+            && l.done > 0
+            && !self.is_archived(&l.href, all)
+            && !crate::model::inbox(all).is_some_and(|i| i.href == l.href)
+            && *current != Nav::List(l.href.clone())
+    }
+
+    /// How many lists are finished right now, whether or not they are put
+    /// away: what the toggle offers to hide.
+    pub fn finished_count(&self, all: &[ListView], current: &Nav) -> usize {
+        all.iter()
+            .filter(|l| self.is_finished(l, all, current))
+            .count()
+    }
+
+    /// The sidebar's lists, in its order, split into the rows and what goes
+    /// under Hidden lists: the archived ones, and the finished ones while
+    /// `hide_finished_lists` is on. A finished list returns by itself when a
+    /// task lands in it, a new GitHub issue too. The inbox list has no row
+    /// while its tile shows, and is never hidden.
+    pub fn split_lists(&self, all: &[ListView], current: &Nav) -> SplitLists {
+        let on_tile = self.inbox_on_tile(all);
+        let mut split = SplitLists::default();
+        for l in self.ordered(all) {
+            if Some(l.href.as_str()) == on_tile {
+                continue;
+            }
+            let why = if self.is_archived(&l.href, all) {
+                Some(Why::Archived)
+            } else {
+                (self.hide_finished_lists && self.is_finished(&l, all, current))
+                    .then_some(Why::Finished)
+            };
+            match why {
+                Some(why) => split.hidden.push((l, why)),
+                None => split.shown.push(l),
+            }
+        }
+        split
     }
 
     /// Dragging made `shown_before` into `shown_after` (hrefs, top to
@@ -557,11 +636,7 @@ pub enum PrefPatch {
     SundayFirst(bool),
     Background(bool),
     ShowCounts(bool),
-    ListsByName(bool),
-    /// Take a list out of `archived`, by href.
-    Unarchive(String),
-    /// The views in the sidebar, in order.
-    SidebarViews(Vec<Nav>),
+    HideFinishedLists(bool),
     ProjectsDir(String),
     WorkCommand(String),
 }
@@ -576,9 +651,7 @@ impl PrefPatch {
             PrefPatch::SundayFirst(on) => p.sunday_first = *on,
             PrefPatch::Background(on) => p.background = *on,
             PrefPatch::ShowCounts(on) => p.show_counts = *on,
-            PrefPatch::ListsByName(on) => p.lists_by_name = *on,
-            PrefPatch::Unarchive(href) => p.archived.retain(|h| h != href),
-            PrefPatch::SidebarViews(views) => p.set_sidebar_views(views),
+            PrefPatch::HideFinishedLists(on) => p.hide_finished_lists = *on,
             PrefPatch::ProjectsDir(dir) => p.projects_dir.clone_from(dir),
             PrefPatch::WorkCommand(command) => p.work_command.clone_from(command),
         }
@@ -1151,25 +1224,43 @@ day_zoom = 52.0
         assert!(p.sidebar_views().contains(&Nav::Inbox));
         // The tile is the inbox: no row for it.
         assert_eq!(p.inbox_on_tile(&lists), Some("/i/"));
-        assert_eq!(names(p.sidebar_lists(&lists)), ["Home", "Work"]);
+        assert_eq!(
+            names(p.sidebar_lists(&lists, &Nav::Inbox)),
+            ["Home", "Work"]
+        );
         // Without the tile the row is the only way in, in its own place.
         p.hide_view(&Nav::Inbox);
         assert_eq!(p.inbox_on_tile(&lists), None);
-        assert_eq!(names(p.sidebar_lists(&lists)), ["Home", "Inbox", "Work"]);
+        assert_eq!(
+            names(p.sidebar_lists(&lists, &Nav::Inbox)),
+            ["Home", "Inbox", "Work"]
+        );
         p.show_view(Nav::Inbox, None);
-        assert_eq!(names(p.sidebar_lists(&lists)), ["Home", "Work"]);
+        assert_eq!(
+            names(p.sidebar_lists(&lists, &Nav::Inbox)),
+            ["Home", "Work"]
+        );
         // A drag among the rows on screen leaves the inbox's place alone.
         p.reorder_lists(
             &lists,
-            &hrefs(&p.sidebar_lists(&lists)),
+            &hrefs(&p.sidebar_lists(&lists, &Nav::Inbox)),
             &strings(&["/w/", "/h/"]),
         );
-        assert_eq!(names(p.sidebar_lists(&lists)), ["Work", "Home"]);
+        assert_eq!(
+            names(p.sidebar_lists(&lists, &Nav::Inbox)),
+            ["Work", "Home"]
+        );
         p.hide_view(&Nav::Inbox);
-        assert_eq!(names(p.sidebar_lists(&lists)), ["Work", "Inbox", "Home"]);
+        assert_eq!(
+            names(p.sidebar_lists(&lists, &Nav::Inbox)),
+            ["Work", "Inbox", "Home"]
+        );
         // Archived lists stay out either way.
         p.archived.push("/w/".into());
-        assert_eq!(names(p.sidebar_lists(&lists)), ["Inbox", "Home"]);
+        assert_eq!(
+            names(p.sidebar_lists(&lists, &Nav::Inbox)),
+            ["Inbox", "Home"]
+        );
     }
 
     /// Work, Inbox and Home, with `inbox` the list new tasks go to.
@@ -1220,6 +1311,165 @@ day_zoom = 52.0
         assert_eq!(names(p.arrange(&moved)), ["Home"]);
         // Before any list is known, an entry is what it says.
         assert!(p.is_archived("/i/", &[]));
+    }
+
+    /// A list with `open` tasks to do and `done` completed.
+    fn counted(href: &str, name: &str, open: usize, done: usize) -> ListView {
+        ListView {
+            open,
+            done,
+            ..list(href, name)
+        }
+    }
+
+    /// What `split_lists` makes of `lists`, by name.
+    fn split_names(
+        p: &Prefs,
+        lists: &[ListView],
+        current: &Nav,
+    ) -> (Vec<String>, Vec<(String, Why)>) {
+        let split = p.split_lists(lists, current);
+        (
+            names(split.shown),
+            split
+                .hidden
+                .into_iter()
+                .map(|(l, why)| (l.name, why))
+                .collect(),
+        )
+    }
+
+    fn away(items: &[(&str, Why)]) -> Vec<(String, Why)> {
+        items
+            .iter()
+            .map(|(n, why)| ((*n).to_string(), *why))
+            .collect()
+    }
+
+    #[test]
+    fn finished_and_archived_lists_tuck_away_but_the_open_one_stays() {
+        let mut lists = vec![
+            ListView {
+                inbox: true,
+                ..counted("/i/", "Inbox", 0, 5)
+            },
+            counted("/a/", "asst", 6, 2),
+            counted("/b/", "battery-log", 0, 4),
+            counted("/n/", "new", 0, 0),
+            counted("/m/", "mail-digest", 0, 3),
+            counted("/w/", "Work", 1, 0),
+        ];
+        let mut p = Prefs {
+            archived: strings(&["/m/"]),
+            ..Prefs::default()
+        };
+        let nowhere = Nav::Day;
+
+        // The toggle is off: only the archived list is away. The inbox is
+        // the tile's, finished or not.
+        assert_eq!(
+            split_names(&p, &lists, &nowhere),
+            (
+                strings(&["asst", "battery-log", "new", "Work"]),
+                away(&[("mail-digest", Why::Archived)])
+            )
+        );
+        // It still says how many it would hide.
+        assert_eq!(p.finished_count(&lists, &nowhere), 1);
+
+        // On: the finished list joins it, in the sidebar's order. A list
+        // with no tasks yet is new, not finished.
+        p.hide_finished_lists = true;
+        assert_eq!(
+            split_names(&p, &lists, &nowhere),
+            (
+                strings(&["asst", "new", "Work"]),
+                away(&[
+                    ("battery-log", Why::Finished),
+                    ("mail-digest", Why::Archived)
+                ])
+            )
+        );
+        assert_eq!(p.finished_count(&lists, &nowhere), 1);
+
+        // The list on screen stays, so completing its last task does not
+        // take the row from under the cursor; the count leaves it out too.
+        let open = Nav::List("/b/".into());
+        assert_eq!(
+            split_names(&p, &lists, &open).0,
+            ["asst", "battery-log", "new", "Work"]
+        );
+        assert_eq!(p.finished_count(&lists, &open), 0);
+
+        // An archived list is archived however finished it is, and open.
+        let open = Nav::List("/m/".into());
+        assert_eq!(
+            split_names(&p, &lists, &open).1,
+            away(&[
+                ("battery-log", Why::Finished),
+                ("mail-digest", Why::Archived)
+            ])
+        );
+
+        // A task lands in the finished list (a new GitHub issue does the
+        // same): it is back, in its place.
+        lists[2].open = 1;
+        assert_eq!(
+            split_names(&p, &lists, &nowhere),
+            (
+                strings(&["asst", "battery-log", "new", "Work"]),
+                away(&[("mail-digest", Why::Archived)])
+            )
+        );
+        // The new list gets its first task and finishes it: now it goes.
+        lists[3].done = 1;
+        assert_eq!(
+            split_names(&p, &lists, &nowhere).1,
+            away(&[("mail-digest", Why::Archived), ("new", Why::Finished)])
+        );
+
+        // With the inbox tile hidden the inbox has a row, and no state
+        // takes it away.
+        p.hide_view(&Nav::Inbox);
+        assert!(
+            split_names(&p, &lists, &nowhere)
+                .0
+                .contains(&"Inbox".into())
+        );
+    }
+
+    #[test]
+    fn an_archived_inbox_is_shown() {
+        let lists = lists_with_inbox("/i/");
+        let mut p = Prefs {
+            archived: strings(&["/i/", "/w/"]),
+            hide_finished_lists: true,
+            ..Prefs::default()
+        };
+        p.hide_view(&Nav::Inbox);
+        // Archived before it became the inbox: the entry waits, the row is
+        // there, and only Work is under Hidden lists.
+        assert_eq!(
+            split_names(&p, &lists, &Nav::Day),
+            (
+                strings(&["Home", "Inbox"]),
+                away(&[("Work", Why::Archived)])
+            )
+        );
+        // The tile has it instead: no row, hidden or not.
+        p.show_view(Nav::Inbox, None);
+        assert_eq!(
+            split_names(&p, &lists, &Nav::Day),
+            (strings(&["Home"]), away(&[("Work", Why::Archived)]))
+        );
+        // Once another list is the inbox the old entry counts again.
+        assert_eq!(
+            split_names(&p, &lists_with_inbox("/h/"), &Nav::Day),
+            (
+                strings(&[]),
+                away(&[("Inbox", Why::Archived), ("Work", Why::Archived)])
+            )
+        );
     }
 
     #[test]
@@ -1459,6 +1709,7 @@ day_zoom = 52.0
             list_order: vec!["/b/".into(), "/a/".into()],
             list_icons: [("/a/".to_string(), "flask".to_string())].into(),
             archived: vec!["/a/".into(), "/b/".into()],
+            hide_finished_lists: false,
             remember_list: false,
             default_priority: 2,
             read_dates: false,
@@ -1533,25 +1784,9 @@ day_zoom = 52.0
                 true,
             ),
             (
-                PrefPatch::ListsByName(true),
+                PrefPatch::HideFinishedLists(true),
                 Prefs {
-                    lists_by_name: true,
-                    ..base.clone()
-                },
-                true,
-            ),
-            (
-                PrefPatch::Unarchive("/a/".into()),
-                Prefs {
-                    archived: vec!["/b/".into()],
-                    ..base.clone()
-                },
-                true,
-            ),
-            (
-                PrefPatch::SidebarViews(vec![Nav::Inbox, Nav::Day]),
-                Prefs {
-                    sidebar: Some(vec!["inbox".into(), "day".into()]),
+                    hide_finished_lists: true,
                     ..base.clone()
                 },
                 true,

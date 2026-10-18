@@ -5,8 +5,10 @@
 //! and what the lists do. Tasks dragged onto a tile or a list land there;
 //! lists dragged among themselves take a new order. The inbox list is the
 //! Inbox tile's, and has a row of its own only while that tile is hidden.
+//! Archived lists, and finished ones if asked, sit under one `Hidden lists`
+//! row at the foot of the lists.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use asst_core::api::{LinkView, ListView, StatusView, SyncState};
@@ -16,7 +18,7 @@ use relm4::gtk::{self, gdk, glib, pango};
 
 use crate::model::{self, Counts, Nav};
 use crate::pickers;
-use crate::prefs::{PrefPatch, Prefs};
+use crate::prefs::{PrefPatch, Prefs, Why};
 use crate::row::DRAG_PREFIX;
 use crate::ui::{self, Item};
 use crate::window::{Msg, Tx};
@@ -36,9 +38,12 @@ struct ListRow {
     /// The list as the row was built, for its menu.
     list: ListView,
     row: gtk::ListBoxRow,
+    /// The task count, or for a hidden list the words saying why it is.
     count: gtk::Label,
     /// Shown while the list is tied to a GitHub repo.
     link: gtk::Image,
+    /// Set for a row under Hidden lists.
+    hidden: Option<Why>,
 }
 
 /// What a dragged list carries.
@@ -246,6 +251,10 @@ struct Options {
     signed_in: bool,
     /// How many lists have a row, for Sort A-Z.
     lists: usize,
+    /// How many lists are finished right now, and whether those are put
+    /// away.
+    finished: usize,
+    hide_finished: bool,
 }
 
 /// A dim caption over a part of the `...` menu.
@@ -294,6 +303,22 @@ fn options_menu(o: &Options, tx: &Tx) -> gtk::Popover {
         sort.set_sensitive(o.lists > 1);
         items.push(sort.upcast());
     }
+    // Offered while there is something to hide, and while it is on, so it
+    // can be turned off.
+    if o.finished > 0 || o.hide_finished {
+        let (tx, on) = (tx.clone(), o.hide_finished);
+        let count = format!("({})", o.finished);
+        items.push(
+            Item::new(
+                Some("check-round-outline-whole-symbolic"),
+                "Hide finished lists",
+            )
+            .secondary(&count)
+            .checked(on)
+            .build(move || tx.emit(Msg::PatchPrefs(PrefPatch::HideFinishedLists(!on))))
+            .upcast(),
+        );
+    }
     {
         let (tx, on) = (tx.clone(), o.counts);
         items.push(
@@ -321,6 +346,18 @@ pub struct Sidebar {
     tiles: RefCell<Vec<Tile>>,
     tiles_key: RefCell<String>,
     lists_box: gtk::ListBox,
+    /// The `Hidden lists` row, and the rows it opens onto.
+    hidden_head: gtk::Button,
+    hidden_count: gtk::Label,
+    hidden_chevron: gtk::Image,
+    hidden_box: gtk::ListBox,
+    /// Whether the hidden lists are open: for this session only.
+    hidden_open: Cell<bool>,
+    /// The view `update` saw last. Moving onto a hidden list opens the
+    /// Hidden lists row once, so it can be shut again while that list is
+    /// on screen.
+    opened_for: RefCell<Nav>,
+    /// Every row, the shown ones first and then those under Hidden lists.
     rows: RefCell<Vec<ListRow>>,
     lists_key: RefCell<String>,
     /// `Not signed in`, under the Lists heading while that is so.
@@ -336,6 +373,10 @@ pub struct State<'a> {
     /// The lists that have a row (`Prefs::sidebar_lists`): the inbox is not
     /// among them while its tile shows.
     pub lists: &'a [ListView],
+    /// The lists under Hidden lists, and why each is.
+    pub hidden: &'a [(ListView, Why)],
+    /// How many lists are finished now (`Prefs::finished_count`).
+    pub finished: usize,
     /// The inbox list's href, which the Inbox view highlights if it has a row.
     pub inbox: Option<&'a str>,
     pub counts: &'a Counts,
@@ -436,7 +477,7 @@ impl Sidebar {
                 mb.set_popover(Some(&ui::menu(&[
                     Item::new(Some("settings-symbolic"), "Preferences")
                         .secondary("Ctrl+,")
-                        .build(move || a.emit(Msg::Preferences(None)))
+                        .build(move || a.emit(Msg::Preferences))
                         .upcast(),
                     Item::new(None, "Keyboard Shortcuts")
                         .secondary("?")
@@ -521,8 +562,36 @@ impl Sidebar {
         lists_box.add_css_class("sidebar-lists");
         lists_box.set_selection_mode(gtk::SelectionMode::None);
 
+        // Under the lists: the row that opens the hidden ones.
+        let hidden_count = ui::label("", &["caption", "dim-label"]);
+        let hidden_chevron = ui::icon("pan-end-symbolic", 12);
+        hidden_chevron.add_css_class("dim-label");
+        let hidden_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        hidden_line.add_css_class("list-line");
+        let hidden_title = ui::label("Hidden lists", &["dim-label"]);
+        hidden_title.set_hexpand(true);
+        hidden_line.append(&hidden_title);
+        hidden_line.append(&hidden_count);
+        hidden_line.append(&hidden_chevron);
+        let hidden_head = gtk::Button::builder().child(&hidden_line).build();
+        hidden_head.add_css_class("flat");
+        hidden_head.add_css_class("hidden-lists");
+        hidden_head.set_tooltip_text(Some(
+            "Archived lists, and lists with nothing left to do when \"Hide finished lists\" is on.",
+        ));
+        hidden_head.set_visible(false);
+        let hidden_box = gtk::ListBox::new();
+        hidden_box.add_css_class("sidebar-lists");
+        hidden_box.add_css_class("hidden-lists");
+        hidden_box.set_selection_mode(gtk::SelectionMode::None);
+        hidden_box.set_visible(false);
+
+        let lists_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        lists_body.append(&lists_box);
+        lists_body.append(&hidden_head);
+        lists_body.append(&hidden_box);
         let scroller = gtk::ScrolledWindow::builder()
-            .child(&lists_box)
+            .child(&lists_body)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
@@ -542,6 +611,12 @@ impl Sidebar {
             tiles: RefCell::default(),
             tiles_key: RefCell::default(),
             lists_box,
+            hidden_head,
+            hidden_count,
+            hidden_chevron,
+            hidden_box,
+            hidden_open: Cell::new(false),
+            opened_for: RefCell::new(Nav::Inbox),
             rows: RefCell::default(),
             lists_key: RefCell::default(),
             caption,
@@ -566,9 +641,9 @@ impl Sidebar {
                 }
             });
         }
-        {
+        for list in [&s.lists_box, &s.hidden_box] {
             let weak = Rc::downgrade(&s);
-            s.lists_box.connect_row_activated(move |_, row| {
+            list.connect_row_activated(move |_, row| {
                 if let Some(s) = weak.upgrade() {
                     let href = s
                         .rows
@@ -579,6 +654,14 @@ impl Sidebar {
                     if let Some(href) = href {
                         s.tx.emit(Msg::Navigate(Nav::List(href)));
                     }
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&s);
+            s.hidden_head.connect_clicked(move |_| {
+                if let Some(s) = weak.upgrade() {
+                    s.toggle_hidden();
                 }
             });
         }
@@ -611,24 +694,41 @@ impl Sidebar {
 
         let signed_in = st.status.is_some_and(|s| s.state != SyncState::NoAccount);
         let lists_key = format!(
-            "{:?}{:?}",
+            "{:?}{:?}{:?}",
             st.lists
                 .iter()
                 .map(|l| (&l.href, &l.name, &l.color, l.writable, l.inbox))
+                .collect::<Vec<_>>(),
+            st.hidden
+                .iter()
+                .map(|(l, why)| (&l.href, &l.name, &l.color, l.writable, l.inbox, *why))
                 .collect::<Vec<_>>(),
             st.prefs.list_icons
         );
         if *self.lists_key.borrow() != lists_key {
             *self.lists_key.borrow_mut() = lists_key;
-            self.build_lists(st.lists);
+            self.build_lists(st.lists, st.hidden);
         }
+        // Hidden lists open by themselves for a hidden list that has just
+        // come on screen, once: the row can still be closed after.
+        let on_hidden = st
+            .hidden
+            .iter()
+            .any(|(l, _)| *st.nav == Nav::List(l.href.clone()));
+        if on_hidden && *self.opened_for.borrow() != *st.nav {
+            self.hidden_open.set(true);
+        }
+        *self.opened_for.borrow_mut() = st.nav.clone();
+        self.show_hidden();
         for r in self.rows.borrow().iter() {
-            let n = st.counts.lists.get(&r.href).copied().unwrap_or(0);
-            r.count.set_text(&if n > 0 && st.prefs.show_counts {
-                n.to_string()
-            } else {
-                String::new()
-            });
+            if r.hidden.is_none() {
+                let n = st.counts.lists.get(&r.href).copied().unwrap_or(0);
+                r.count.set_text(&if n > 0 && st.prefs.show_counts {
+                    n.to_string()
+                } else {
+                    String::new()
+                });
+            }
             match st.links.iter().find(|l| l.list == r.href) {
                 Some(l) => {
                     r.link.set_visible(true);
@@ -659,6 +759,8 @@ impl Sidebar {
             counts: st.prefs.show_counts,
             signed_in,
             lists: st.lists.len(),
+            finished: st.finished,
+            hide_finished: st.prefs.hide_finished_lists,
         };
 
         let Some(s) = st.status else { return };
@@ -699,7 +801,8 @@ impl Sidebar {
         let rows = self.rows.borrow();
         if let Some(r) = rows.iter().find(|r| r.href == href) {
             let at = gdk::Rectangle::new(r.row.width() / 2, r.row.height() / 2, 1, 1);
-            crate::row::show_at(&list_menu(&r.list, false, &self.tx, false), &r.row, at);
+            let archived = r.hidden == Some(Why::Archived);
+            crate::row::show_at(&list_menu(&r.list, archived, &self.tx, false), &r.row, at);
         }
     }
 
@@ -821,31 +924,87 @@ impl Sidebar {
         *self.tiles.borrow_mut() = tiles;
     }
 
+    /// A click on the Hidden lists row: the lists under it open or shut.
+    pub fn toggle_hidden(&self) {
+        self.hidden_open.set(!self.hidden_open.get());
+        self.show_hidden();
+    }
+
+    /// The Hidden lists row and the rows under it, as `hidden_open` says. The
+    /// row is there while any list is hidden.
+    fn show_hidden(&self) {
+        let n = self
+            .rows
+            .borrow()
+            .iter()
+            .filter(|r| r.hidden.is_some())
+            .count();
+        let open = self.hidden_open.get() && n > 0;
+        self.hidden_head.set_visible(n > 0);
+        self.hidden_box.set_visible(open);
+        self.hidden_count.set_text(&n.to_string());
+        self.hidden_chevron.set_icon_name(Some(if open {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }));
+    }
+
+    /// A list's line: its mark, name, a lock when read-only, the link to a
+    /// repo, and `count` for the task count or the reason it is hidden.
+    fn list_line(l: &ListView) -> (gtk::Box, gtk::Label, gtk::Image) {
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        line.add_css_class("list-line");
+        line.append(&ui::list_mark(l, 18));
+        let name = ui::label(&l.name, &[]);
+        name.set_hexpand(true);
+        line.append(&name);
+        if !l.writable {
+            let lock = ui::icon("permissions-generic-symbolic", 12);
+            lock.add_css_class("dim-label");
+            lock.set_tooltip_text(Some("Read-only"));
+            line.append(&lock);
+        }
+        let link = ui::icon("chain-link-loose-symbolic", 12);
+        link.add_css_class("dim-label");
+        link.set_visible(false);
+        line.append(&link);
+        let count = ui::label("", &["caption", "dim-label"]);
+        line.append(&count);
+        (line, count, link)
+    }
+
+    /// A right-click opens the list's menu, with Archive or Unarchive as
+    /// the row's place says.
+    fn list_menu_on(&self, row: &gtk::ListBoxRow, list: &ListView, archived: bool) {
+        let menu_click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .build();
+        let tx = self.tx.clone();
+        let list = list.clone();
+        let row_weak = row.downgrade();
+        menu_click.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let menu = list_menu(&list, archived, &tx, false);
+            crate::row::show_at(&menu, &row, gdk::Rectangle::new(x as i32, y as i32, 1, 1));
+        });
+        row.add_controller(menu_click);
+    }
+
     /// Dragging a row works whether the lists were last put in order by hand
-    /// or by name: a drop sets the order down and the by-name flag off.
-    fn build_lists(&self, lists: &[ListView]) {
+    /// or by name: a drop sets the order down and the by-name flag off. The
+    /// hidden lists have rows too, dimmed and with the reason beside them;
+    /// they take a click and a menu, and no drag.
+    fn build_lists(&self, lists: &[ListView], hidden: &[(ListView, Why)]) {
         self.lists_box.remove_all();
+        self.hidden_box.remove_all();
         let mut rows = Vec::new();
         let order: Rc<Vec<String>> = Rc::new(lists.iter().map(|l| l.href.clone()).collect());
         for l in lists {
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            line.add_css_class("list-line");
-            line.append(&ui::list_mark(l, 18));
-            let name = ui::label(&l.name, &[]);
-            name.set_hexpand(true);
-            line.append(&name);
-            if !l.writable {
-                let lock = ui::icon("permissions-generic-symbolic", 12);
-                lock.add_css_class("dim-label");
-                lock.set_tooltip_text(Some("Read-only"));
-                line.append(&lock);
-            }
-            let link = ui::icon("chain-link-loose-symbolic", 12);
-            link.add_css_class("dim-label");
-            link.set_visible(false);
-            line.append(&link);
-            let count = ui::label("", &["caption", "dim-label"]);
-            line.append(&count);
+            let (line, count, link) = Sidebar::list_line(l);
             let row = gtk::ListBoxRow::new();
             row.add_css_class("list-row");
             row.set_child(Some(&line));
@@ -862,23 +1021,7 @@ impl Sidebar {
             });
             row.add_controller(drag);
             self.list_drops(&row, l, order.clone());
-            let menu_click = gtk::GestureClick::builder()
-                .button(gdk::BUTTON_SECONDARY)
-                .build();
-            {
-                let tx = self.tx.clone();
-                let list = l.clone();
-                let row_weak = row.downgrade();
-                menu_click.connect_pressed(move |g, _, x, y| {
-                    g.set_state(gtk::EventSequenceState::Claimed);
-                    let Some(row) = row_weak.upgrade() else {
-                        return;
-                    };
-                    let menu = list_menu(&list, false, &tx, false);
-                    crate::row::show_at(&menu, &row, gdk::Rectangle::new(x as i32, y as i32, 1, 1));
-                });
-            }
-            row.add_controller(menu_click);
+            self.list_menu_on(&row, l, false);
             self.lists_box.append(&row);
             rows.push(ListRow {
                 href: l.href.clone(),
@@ -886,6 +1029,25 @@ impl Sidebar {
                 row,
                 count,
                 link,
+                hidden: None,
+            });
+        }
+        for (l, why) in hidden {
+            let (line, count, link) = Sidebar::list_line(l);
+            count.set_text(why.caption());
+            let row = gtk::ListBoxRow::new();
+            row.add_css_class("list-row");
+            row.add_css_class("hidden-list");
+            row.set_child(Some(&line));
+            self.list_menu_on(&row, l, *why == Why::Archived);
+            self.hidden_box.append(&row);
+            rows.push(ListRow {
+                href: l.href.clone(),
+                list: l.clone(),
+                row,
+                count,
+                link,
+                hidden: Some(*why),
             });
         }
         *self.rows.borrow_mut() = rows;

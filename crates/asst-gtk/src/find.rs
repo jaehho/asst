@@ -172,27 +172,31 @@ fn task_row(t: &TaskView, q: &str, sub: &str) -> gtk::ListBoxRow {
 }
 
 /// The lists `q` (trimmed, lowercase) finds, each with the caption under
-/// it. An empty query offers what the sidebar shows, so archived lists
-/// stay out, and so does the inbox while its tile shows; a typed one finds
-/// archived lists too, captioned `Archived`. The inbox list is found as the
-/// Inbox view (`inbox_alias`), never twice.
-fn list_hits<'a>(
-    lists: &'a [ListView],
+/// it. An empty query offers the sidebar's rows, so nothing under Hidden
+/// lists, and not the inbox while its tile shows; a typed one finds the
+/// hidden lists too, after the rest, captioned as they are there
+/// (`Archived`, `All done`). The inbox list is found as the Inbox view
+/// (`inbox_alias`), never twice. `current` is the view on screen, whose
+/// list the sidebar never puts away.
+fn list_hits(
+    lists: &[ListView],
     q: &str,
     prefs: &Prefs,
-) -> Vec<(&'a ListView, Option<&'static str>)> {
-    let inbox = model::inbox(lists).map(|l| l.href.as_str());
-    let on_tile = prefs.inbox_on_tile(lists);
-    lists
-        .iter()
-        .filter_map(|l| {
-            let gone = prefs.is_archived(&l.href, lists);
-            if q.is_empty() {
-                return (!gone && Some(l.href.as_str()) != on_tile).then_some((l, None));
-            }
-            (Some(l.href.as_str()) != inbox && l.name.to_lowercase().contains(q))
-                .then_some((l, gone.then_some("Archived")))
-        })
+    current: &Nav,
+) -> Vec<(ListView, Option<&'static str>)> {
+    let split = prefs.split_lists(lists, current);
+    let shown = split.shown.into_iter().map(|l| (l, None));
+    if q.is_empty() {
+        return shown.collect();
+    }
+    let inbox = model::inbox(lists).map(|l| l.href.clone());
+    let hidden = split
+        .hidden
+        .into_iter()
+        .map(|(l, why)| (l, Some(why.caption())));
+    shown
+        .chain(hidden)
+        .filter(|(l, _)| Some(&l.href) != inbox.as_ref() && l.name.to_lowercase().contains(q))
         .collect()
 }
 
@@ -209,6 +213,7 @@ pub fn open(
     lists: &[ListView],
     open: &[TaskView],
     prefs: &Prefs,
+    current: &Nav,
     text: &str,
     tx: Tx,
 ) {
@@ -246,6 +251,7 @@ pub fn open(
     let lists = lists.to_vec();
     let open = open.to_vec();
     let prefs = prefs.clone();
+    let current = current.clone();
     // The sidebar's views first; typing finds the hidden ones too.
     let shown = prefs.sidebar_views();
     let mut navs = shown.clone();
@@ -304,12 +310,12 @@ pub fn open(
                     );
                 }
             }
-            let found_lists = list_hits(&lists, &q, &prefs);
+            let found_lists = list_hits(&lists, &q, &prefs, &current);
             if !found_lists.is_empty() {
                 results.append(&header("Lists"));
                 for (l, sub) in found_lists {
                     add(
-                        result_row(ui::list_mark(l, 16), &bold(&l.name, &q), sub, None),
+                        result_row(ui::list_mark(&l, 16), &bold(&l.name, &q), sub, None),
                         Hit::Nav(Nav::List(l.href.clone())),
                     );
                 }
@@ -540,7 +546,7 @@ mod tests {
     }
 
     fn hits(lists: &[ListView], q: &str, prefs: &Prefs) -> Vec<(String, Option<&'static str>)> {
-        list_hits(lists, q, prefs)
+        list_hits(lists, q, prefs, &Nav::Day)
             .into_iter()
             .map(|(l, caption)| (l.name.clone(), caption))
             .collect()
@@ -567,13 +573,15 @@ mod tests {
         ];
         let mut prefs = without_the_tile();
         prefs.archived.push("/m/".into());
+        // In the sidebar's order, which is by name until a drag says other.
         assert_eq!(
             hits(&lists, "", &prefs),
-            [hit("Inbox", None), hit("Work", None), hit("Mailbox", None)]
+            [hit("Inbox", None), hit("Mailbox", None), hit("Work", None)]
         );
+        // A typed query finds it after the lists that are not hidden.
         assert_eq!(
             hits(&lists, "mail", &prefs),
-            [hit("mail-digest", Some("Archived")), hit("Mailbox", None)]
+            [hit("Mailbox", None), hit("mail-digest", Some("Archived"))]
         );
         assert_eq!(
             hits(&lists, "dig", &prefs),
@@ -584,6 +592,47 @@ mod tests {
             hits(&lists, "", &without_the_tile()).len(),
             4,
             "nothing archived: all of them"
+        );
+    }
+
+    #[test]
+    fn finished_lists_are_found_by_name_and_say_so() {
+        let counted = |href: &str, name: &str, open, done| ListView {
+            open,
+            done,
+            ..list(href, name)
+        };
+        let lists = [
+            inbox("/i/", "Inbox"),
+            counted("/b/", "battery-log", 0, 4),
+            counted("/a/", "asst", 3, 1),
+            counted("/m/", "mail-digest", 0, 3),
+        ];
+        let mut prefs = Prefs::default();
+        prefs.archived.push("/m/".into());
+        // The toggle off: a finished list is a list like the others.
+        assert_eq!(
+            hits(&lists, "", &prefs),
+            [hit("asst", None), hit("battery-log", None)]
+        );
+        prefs.hide_finished_lists = true;
+        assert_eq!(hits(&lists, "", &prefs), [hit("asst", None)]);
+        assert_eq!(
+            hits(&lists, "a", &prefs),
+            [
+                hit("asst", None),
+                hit("battery-log", Some("All done")),
+                hit("mail-digest", Some("Archived"))
+            ]
+        );
+        // The one on screen is not put away, so it has no caption.
+        let open = Nav::List("/b/".into());
+        let got = list_hits(&lists, "batt", &prefs, &open);
+        assert_eq!(
+            got.iter()
+                .map(|(l, c)| (l.name.as_str(), *c))
+                .collect::<Vec<_>>(),
+            [("battery-log", None)]
         );
     }
 
@@ -599,15 +648,15 @@ mod tests {
         // The tile is the inbox: no row among the lists.
         assert_eq!(
             hits(&lists, "", &tile),
-            [hit("Work", None), hit("Inbox backlog", None)]
+            [hit("Inbox backlog", None), hit("Work", None)]
         );
         // Without the tile the list has its row, as the sidebar does.
         assert_eq!(
             hits(&lists, "", &no_tile),
             [
                 hit("Inbox", None),
-                hit("Work", None),
-                hit("Inbox backlog", None)
+                hit("Inbox backlog", None),
+                hit("Work", None)
             ]
         );
         // Typing finds it as the Inbox view (the Views group), never

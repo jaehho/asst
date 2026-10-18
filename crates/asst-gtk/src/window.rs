@@ -249,8 +249,7 @@ pub enum Msg {
     QuickFind,
     /// Go to where a task lives and open it.
     Reveal(String),
-    /// On the page named, or the first.
-    Preferences(Option<&'static str>),
+    Preferences,
     Shortcuts,
     About,
     /// One preference changed in the dialog (see `PrefPatch`).
@@ -1883,7 +1882,7 @@ impl Component for Window {
             }
             Msg::SortLists => {
                 let (order, by_name) = (self.prefs.list_order.clone(), self.prefs.lists_by_name);
-                let shown = self.prefs.sidebar_lists(&self.lists);
+                let shown = self.prefs.sidebar_lists(&self.lists, &self.nav);
                 self.prefs.sort_lists_by_name(&self.lists, &shown);
                 self.prefs.save();
                 self.undo_toast(
@@ -1916,17 +1915,16 @@ impl Component for Window {
                     return;
                 }
                 self.prefs.save();
-                self.undo_toast(
-                    w,
-                    &tx,
-                    &format!(
-                        "{} {}",
-                        if on { "Archived" } else { "Unarchived" },
-                        quoted(&name)
-                    ),
-                    Msg::Archive(href, !on),
-                    4,
-                );
+                // The card stops offering it, or starts again.
+                w.add_card
+                    .set_lists(&self.lists, &self.prefs.archived, self.prefs.sunday_first);
+                // Said where it went, since the row is gone from the lists.
+                let text = if on {
+                    format!("Archived {}. Find it under Hidden lists.", quoted(&name))
+                } else {
+                    format!("Unarchived {}.", quoted(&name))
+                };
+                self.undo_toast(w, &tx, &text, Msg::Archive(href, !on), UNDO_SECS);
             }
             Msg::UseAsInbox(href) => {
                 let Some(name) = self
@@ -2021,6 +2019,7 @@ impl Component for Window {
                     &self.lists,
                     &self.visible_open(),
                     &self.prefs,
+                    &self.nav,
                     "",
                     tx.clone(),
                 );
@@ -2044,7 +2043,7 @@ impl Component for Window {
                     sender.oneshot_command(async move { Cmd::Opened(client::get(&href).await) });
                 }
             }
-            Msg::Preferences(page) => {
+            Msg::Preferences => {
                 settings::open(
                     &w.window,
                     settings::Ctx {
@@ -2052,7 +2051,6 @@ impl Component for Window {
                         lists: self.lists.clone(),
                         status: w.status.clone(),
                         prefs: self.prefs.clone(),
-                        page,
                     },
                     tx.clone(),
                 );
@@ -2209,7 +2207,11 @@ impl Component for Window {
                         self.status = Some(l.status);
                         self.links = l.links;
                         self.settle();
-                        w.add_card.set_lists(&self.lists, self.prefs.sunday_first);
+                        w.add_card.set_lists(
+                            &self.lists,
+                            &self.prefs.archived,
+                            self.prefs.sunday_first,
+                        );
                         // The view saved on quitting may be the inbox list.
                         self.nav = model::canonical_nav(self.nav.clone(), &self.lists);
                         if let Nav::List(href) = &self.nav
@@ -2551,13 +2553,7 @@ impl Window {
     /// first and archived ones after, and tasks not deleted a moment ago
     /// nor in an archived list, unless it is the list on view.
     fn view_data(&self) -> (Vec<ListView>, Vec<TaskView>, Option<Vec<TaskView>>) {
-        let mut lists = self.prefs.arrange(&self.lists);
-        lists.extend(
-            self.lists
-                .iter()
-                .filter(|l| self.prefs.is_archived(&l.href, &self.lists))
-                .cloned(),
-        );
+        let lists = self.ordered_lists();
         let kept = |t: &&TaskView| {
             !self.hidden.contains(&t.href)
                 && (!self.prefs.is_archived(&t.list, &self.lists)
@@ -2569,6 +2565,28 @@ impl Window {
             .as_ref()
             .map(|c| c.iter().filter(kept).cloned().collect());
         (lists, open, completed)
+    }
+
+    /// The sidebar's lists in its order, the archived ones after.
+    fn ordered_lists(&self) -> Vec<ListView> {
+        let mut lists = self.prefs.arrange(&self.lists);
+        lists.extend(
+            self.lists
+                .iter()
+                .filter(|l| self.prefs.is_archived(&l.href, &self.lists))
+                .cloned(),
+        );
+        lists
+    }
+
+    /// `ordered_lists` less the archived ones, but for the list on view: a
+    /// task there can stay in it, and its menu and title need it.
+    fn view_pickable(&self) -> Vec<ListView> {
+        let on_view = match &self.nav {
+            Nav::List(href) => Some(href.as_str()),
+            _ => None,
+        };
+        model::pickable_lists(&self.ordered_lists(), &self.prefs.archived, on_view)
     }
 
     /// Open tasks, but for those deleted a moment ago.
@@ -2789,7 +2807,8 @@ impl Window {
             gtk::prelude::GtkWindowExt::set_focus(&w.window, None::<&gtk::Widget>);
         }
         w.editor.fold();
-        w.editor.show(&t, &self.lists, self.prefs.sunday_first);
+        w.editor
+            .show(&t, &self.pickable(Some(&t.list)), self.prefs.sunday_first);
         self.editing = Some(href);
         self.expand = true;
         self.refocus = Refocus::Editor;
@@ -3107,10 +3126,16 @@ impl Window {
         self.edit_toast(w, toast);
     }
 
+    /// The lists a task can go to: not the archived ones, but for the list
+    /// that holds the task (see `model::pickable_lists`).
+    fn pickable(&self, holding: Option<&str>) -> Vec<ListView> {
+        model::pickable_lists(&self.lists, &self.prefs.archived, holding)
+    }
+
     /// The lists with a row in the sidebar, top to bottom.
     fn shown_list_hrefs(&self) -> Vec<String> {
         self.prefs
-            .sidebar_lists(&self.lists)
+            .sidebar_lists(&self.lists, &self.nav)
             .into_iter()
             .map(|l| l.href)
             .collect()
@@ -3119,7 +3144,7 @@ impl Window {
     fn nav_order(&self) -> Vec<Nav> {
         model::cycle_order(
             &self.prefs.sidebar_views(),
-            &self.prefs.sidebar_lists(&self.lists),
+            &self.prefs.sidebar_lists(&self.lists, &self.nav),
             &self.lists,
         )
     }
@@ -3162,7 +3187,7 @@ impl Window {
             Key::Sync => sender.input(Msg::SyncNow),
             Key::NewList => sender.input(Msg::NewList),
             Key::Shortcuts => sender.input(Msg::Shortcuts),
-            Key::Preferences => sender.input(Msg::Preferences(None)),
+            Key::Preferences => sender.input(Msg::Preferences),
             Key::Sidebar => sender.input(Msg::ToggleSidebar),
             Key::Close => sender.input(Msg::CloseWindow),
             Key::Quit => sender.input(Msg::Quit),
@@ -3194,7 +3219,7 @@ impl Window {
                     Nav0::Scheduled => Some(Nav::Scheduled),
                     Nav0::List(i) => self
                         .prefs
-                        .sidebar_lists(&self.lists)
+                        .sidebar_lists(&self.lists, &self.nav)
                         .get(i)
                         .map(|l| Nav::List(l.href.clone())),
                 };
@@ -3367,9 +3392,12 @@ impl Window {
                 today: counts.today - counts.overdue,
             });
         }
+        let split = self.prefs.split_lists(&self.lists, &self.nav);
         w.sidebar.update(&sidebar::State {
             nav: &self.nav,
-            lists: &self.prefs.sidebar_lists(&self.lists),
+            lists: &split.shown,
+            hidden: &split.hidden,
+            finished: self.prefs.finished_count(&self.lists, &self.nav),
             inbox: model::inbox(&self.lists).map(|l| l.href.as_str()),
             counts: &counts,
             status: self.status.as_ref(),
@@ -3408,7 +3436,8 @@ impl Window {
 
         let opts = self.prefs.view_opts(&self.nav);
         CURRENT_VIEW.with(|c| *c.borrow_mut() = Some((self.nav.clone(), opts.clone())));
-        CURRENT_LISTS.with(|c| *c.borrow_mut() = lists.clone());
+        let pickable = self.view_pickable();
+        CURRENT_LISTS.with(|c| *c.borrow_mut() = pickable.clone());
         CURRENT_ARCHIVED.with(|c| {
             *c.borrow_mut() = self
                 .lists
@@ -3424,7 +3453,8 @@ impl Window {
         // view (done elsewhere, moved, filtered out, deleted).
         if let Some(href) = self.editing.clone() {
             if let Some(t) = self.find(&href).cloned() {
-                w.editor.show(&t, &self.lists, self.prefs.sunday_first);
+                w.editor
+                    .show(&t, &self.pickable(Some(&t.list)), self.prefs.sunday_first);
             }
             let here = sections
                 .iter()
@@ -3465,6 +3495,14 @@ impl Window {
             comp.hash(&mut h);
             for l in &self.lists {
                 (&l.href, &l.name, &l.color, l.inbox).hash(&mut h);
+            }
+            // An empty list says whether anything was ever done in it.
+            if let Nav::List(href) = &self.nav {
+                self.lists
+                    .iter()
+                    .find(|l| &l.href == href)
+                    .map(|l| (l.open == 0, l.done > 0))
+                    .hash(&mut h);
             }
             // Day's chips come from `blocks` and the window's slots, not
             // from task sections.
@@ -3562,7 +3600,7 @@ impl Window {
                 &sections,
                 &Opts {
                     nav: &self.nav,
-                    lists: &self.lists,
+                    lists: &pickable,
                     blocks: &self.blocks,
                     plan: &day,
                     no_date_open: self.no_date_open,
@@ -3709,8 +3747,9 @@ impl Window {
     /// `menu <words>`, `popup date|list|link|priority|reminders|menu|view|more`,
     /// `popdown`, `search <text>` and `searchfocus` (the open popover's search field),
     /// `title <text>`, `notes <text>`, `add`, `type <text>`,
-    /// `submit`, `select <words>`, `prefs [sidebar]`, `hide <view>`, `show <view>`,
+    /// `submit`, `select <words>`, `prefs`, `hide <view>`, `show <view>`,
     /// `tile-menu <view>`, `lists-menu` (the sidebar's `...`), `sort-lists`,
+    /// `hidden-lists` (the Hidden lists row),
     /// `undo` (the toast's button), `find [text]`,
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
@@ -3994,7 +4033,7 @@ impl Window {
                 let tx: Tx = sender.input_sender().clone();
                 let menu = crate::row::task_menu(
                     &t,
-                    &self.lists,
+                    &self.view_pickable(),
                     self.now(),
                     self.prefs.sunday_first,
                     row.upcast_ref(),
@@ -4111,7 +4150,7 @@ impl Window {
             "title" => w.editor.type_title(arg),
             "notes" => w.editor.type_notes(arg),
             "close" => sender.input(Msg::CloseEditor),
-            "prefs" => sender.input(Msg::Preferences((arg == "sidebar").then_some("sidebar"))),
+            "prefs" => sender.input(Msg::Preferences),
             "hide" => {
                 if let Some(n) = Nav::from_key(arg) {
                     sender.input(Msg::HideView(n));
@@ -4124,6 +4163,8 @@ impl Window {
             }
             // The `...` menu by the Lists heading; `pick` then chooses a row.
             "lists-menu" => w.sidebar.open_lists_menu(),
+            // A click on the Hidden lists row.
+            "hidden-lists" => w.sidebar.toggle_hidden(),
             // A tile's menu, as its right-click opens it; `pick` then
             // chooses a row.
             "tile-menu" => match Nav::from_key(arg) {
@@ -4241,6 +4282,7 @@ impl Window {
                 &self.lists,
                 &self.visible_open(),
                 &self.prefs,
+                &self.nav,
                 arg,
                 sender.input_sender().clone(),
             ),

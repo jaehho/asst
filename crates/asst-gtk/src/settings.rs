@@ -1,17 +1,17 @@
 //! Preferences: the account, what the daemon does (inbox, reminders, how
-//! often it checks, where linked notes are), how the window behaves, and
-//! which views the sidebar shows in what order.
+//! often it checks, where linked notes are), and how the window behaves. The
+//! sidebar is edited on the sidebar, not here.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
 use asst_core::api::{ListView, Settings, SettingsChange, StatusView, SyncState};
 use relm4::adw;
 use relm4::adw::prelude::*;
-use relm4::gtk::{self, gdk, glib};
+use relm4::gtk::{self, glib};
 
-use crate::model::{self, Nav};
+use crate::model;
 use crate::prefs::{PrefPatch, Prefs};
 use crate::window::{Msg, Tx};
 use crate::{autostart, pickers};
@@ -22,8 +22,6 @@ pub struct Ctx {
     /// The daemon's status as the window last heard it, kept current.
     pub status: Rc<RefCell<Option<StatusView>>>,
     pub prefs: Prefs,
-    /// `sidebar` to open on that page.
-    pub page: Option<&'static str>,
 }
 
 /// Sends one change to the window, which applies it to its own `Prefs`. The
@@ -38,9 +36,6 @@ const INTERVALS: [(u64, &str); 5] = [
     (900, "Every 15 minutes"),
 ];
 
-/// What a dragged view row carries.
-const VIEW_PREFIX: &str = "asst-view:";
-
 pub fn open(parent: &impl IsA<gtk::Widget>, ctx: Ctx, tx: Tx) {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_search_enabled(false);
@@ -49,10 +44,6 @@ pub fn open(parent: &impl IsA<gtk::Widget>, ctx: Ctx, tx: Tx) {
         Rc::new(move |p| tx.emit(Msg::PatchPrefs(p)))
     };
     dialog.add(&general_page(&dialog, &ctx, &tx, &patch));
-    dialog.add(&sidebar_page(&ctx.lists, &ctx.prefs, &patch));
-    if let Some(page) = ctx.page {
-        dialog.set_visible_page_name(page);
-    }
     dialog.present(Some(parent));
 }
 
@@ -438,45 +429,6 @@ fn snooze_group(
     group
 }
 
-/// Lists put away, each with a way back.
-fn archived_group(lists: &[ListView], prefs: &Prefs, patch: &Patch) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Archived Lists")
-        .description("Out of the sidebar, the views and the counts. They still sync, and their reminders still ring.")
-        .build();
-    let archived: Vec<&ListView> = lists
-        .iter()
-        .filter(|l| prefs.is_archived(&l.href, lists))
-        .collect();
-    let left = Rc::new(Cell::new(archived.len()));
-    let none = adw::ActionRow::builder()
-        .title("None")
-        .subtitle("Archive a list from its menu")
-        .visible(archived.is_empty())
-        .build();
-    none.add_css_class("dim-label");
-    group.add(&none);
-    for l in archived {
-        let row = adw::ActionRow::builder().title(&l.name).build();
-        row.add_prefix(&crate::ui::list_mark(l, 16));
-        let restore = gtk::Button::with_label("Unarchive");
-        restore.set_valign(gtk::Align::Center);
-        let (patch, href, left) = (patch.clone(), l.href.clone(), left.clone());
-        let (row_weak, none) = (row.downgrade(), none.clone());
-        restore.connect_clicked(move |_| {
-            patch(PrefPatch::Unarchive(href.clone()));
-            if let Some(row) = row_weak.upgrade() {
-                row.set_visible(false);
-            }
-            left.set(left.get().saturating_sub(1));
-            none.set_visible(left.get() == 0);
-        });
-        row.add_suffix(&restore);
-        group.add(&row);
-    }
-    group
-}
-
 /// "Run in background" and "Run on startup", in the tray.
 fn background_group(
     dialog: &adw::PreferencesDialog,
@@ -539,166 +491,4 @@ fn background_group(
     }
     group.add(&login);
     group
-}
-
-/// The sidebar page: every view with a switch, dragged into order;
-/// how lists are ordered, and the ones archived.
-fn sidebar_page(lists: &[ListView], prefs: &Prefs, patch: &Patch) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Sidebar")
-        .name("sidebar")
-        .icon_name("dock-left-symbolic")
-        .build();
-
-    let general = adw::PreferencesGroup::new();
-    general.add(&switch_row(
-        ("Show task counts", "Beside views and lists"),
-        prefs.show_counts,
-        patch,
-        PrefPatch::ShowCounts,
-    ));
-    let order = adw::ComboRow::builder()
-        .title("Lists")
-        .subtitle("Drag a list in the sidebar to move it")
-        .model(&gtk::StringList::new(&["In the order dragged", "By name"]))
-        .selected(u32::from(prefs.lists_by_name))
-        .build();
-    {
-        let patch = patch.clone();
-        order.connect_selected_notify(move |c| patch(PrefPatch::ListsByName(c.selected() == 1)));
-    }
-    general.add(&order);
-    page.add(&general);
-    page.add(&archived_group(lists, prefs, patch));
-
-    let group = adw::PreferencesGroup::builder()
-        .title("Views")
-        .description("Shown above your lists. Drag a view to move it.")
-        .build();
-    let listbox = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .build();
-    listbox.add_css_class("boxed-list");
-    listbox.add_css_class("sidebar-views");
-    group.add(&listbox);
-    page.add(&group);
-
-    let shown = prefs.sidebar_views();
-    let mut order = shown.clone();
-    order.extend(Nav::filters().into_iter().filter(|n| !shown.contains(n)));
-
-    type ViewRow = (Nav, adw::ActionRow, gtk::Switch);
-    let rows: Rc<RefCell<Vec<ViewRow>>> = Rc::default();
-    // The switched-on views, in the order the rows are in.
-    let store: Rc<dyn Fn()> = {
-        let (listbox, rows, patch) = (listbox.clone(), rows.clone(), patch.clone());
-        Rc::new(move || {
-            let visible: Vec<Nav> = {
-                let rows = rows.borrow();
-                let mut out = Vec::new();
-                let mut i = 0;
-                while let Some(r) = listbox.row_at_index(i) {
-                    if let Some((nav, _, switch)) = rows
-                        .iter()
-                        .find(|(_, row, _)| row.upcast_ref::<gtk::ListBoxRow>() == &r)
-                        && switch.is_active()
-                    {
-                        out.push(nav.clone());
-                    }
-                    i += 1;
-                }
-                out
-            };
-            patch(PrefPatch::SidebarViews(visible));
-        })
-    };
-
-    for nav in order {
-        let row = adw::ActionRow::builder()
-            .title(nav.title(&[]))
-            .subtitle(nav.about())
-            .build();
-        // Prefixes stack leftward: the handle goes in last to sit first.
-        let icon = gtk::Image::from_icon_name(nav.icon());
-        icon.add_css_class(nav.tint());
-        row.add_prefix(&icon);
-        let handle = gtk::Image::from_icon_name("list-drag-handle-symbolic");
-        handle.add_css_class("dim-label");
-        row.add_prefix(&handle);
-        let switch = gtk::Switch::builder()
-            .valign(gtk::Align::Center)
-            .active(shown.contains(&nav))
-            .build();
-        row.add_suffix(&switch);
-        row.set_activatable_widget(Some(&switch));
-        {
-            let store = store.clone();
-            switch.connect_active_notify(move |_| store());
-        }
-
-        let drag = gtk::DragSource::new();
-        drag.set_actions(gdk::DragAction::MOVE);
-        let payload = format!("{VIEW_PREFIX}{}", nav.key());
-        drag.connect_prepare(move |_, _, _| {
-            Some(gdk::ContentProvider::for_value(&payload.to_value()))
-        });
-        drag.connect_drag_begin(|src, _| {
-            if let Some(w) = src.widget() {
-                src.set_icon(Some(&gtk::WidgetPaintable::new(Some(&w))), 24, 24);
-            }
-        });
-        row.add_controller(drag);
-
-        let target = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
-        let lower_half = |t: &gtk::DropTarget, y: f64| {
-            t.widget().is_some_and(|w| y > f64::from(w.height()) / 2.0)
-        };
-        target.connect_motion(move |t, _, y| {
-            if let Some(w) = t.widget() {
-                let below = lower_half(t, y);
-                w.remove_css_class(if below { "drop-above" } else { "drop-below" });
-                w.add_css_class(if below { "drop-below" } else { "drop-above" });
-            }
-            gdk::DragAction::MOVE
-        });
-        target.connect_leave(|t| {
-            if let Some(w) = t.widget() {
-                w.remove_css_class("drop-above");
-                w.remove_css_class("drop-below");
-            }
-        });
-        {
-            let (listbox, rows, store) = (listbox.clone(), rows.clone(), store.clone());
-            target.connect_drop(move |t, value, _, y| {
-                let Some(on) = t.widget().and_downcast::<gtk::ListBoxRow>() else {
-                    return false;
-                };
-                on.remove_css_class("drop-above");
-                on.remove_css_class("drop-below");
-                let Some(key) = value
-                    .get::<String>()
-                    .ok()
-                    .and_then(|v| v.strip_prefix(VIEW_PREFIX).map(str::to_string))
-                else {
-                    return false;
-                };
-                let moved = rows
-                    .borrow()
-                    .iter()
-                    .find(|(n, _, _)| n.key() == key)
-                    .map(|(_, r, _)| r.clone());
-                let Some(moved) = moved.filter(|m| m.upcast_ref::<gtk::ListBoxRow>() != &on) else {
-                    return false;
-                };
-                listbox.remove(&moved);
-                listbox.insert(&moved, on.index() + i32::from(lower_half(t, y)));
-                store();
-                true
-            });
-        }
-        row.add_controller(target);
-        listbox.append(&row);
-        rows.borrow_mut().push((nav, row, switch));
-    }
-    page
 }

@@ -82,6 +82,8 @@ pub struct AddCard {
     chosen: RefCell<Chosen>,
     target: RefCell<Target>,
     lists: RefCell<Vec<ListView>>,
+    /// Hrefs of the archived lists: known by name, but not offered.
+    archived: RefCell<Vec<String>>,
     sunday_first: Cell<bool>,
     /// 1 to 4: what a task gets when neither the text nor a button says.
     default_priority: Cell<u8>,
@@ -253,6 +255,7 @@ impl AddCard {
             chosen: RefCell::default(),
             target: RefCell::new(Target::Anywhere),
             lists: RefCell::default(),
+            archived: RefCell::default(),
             sunday_first: Cell::new(false),
             default_priority: Cell::new(4),
             read_dates: Cell::new(true),
@@ -465,7 +468,7 @@ impl AddCard {
             list_button.set_create_popup_func(move |mb| {
                 let Some(c) = weak.upgrade() else { return };
                 let current = c.list_href();
-                let lists = c.lists.borrow().clone();
+                let lists = c.pickable();
                 let weak = Rc::downgrade(&c);
                 let create = c.on_create.borrow().is_some().then(|| {
                     let weak = Rc::downgrade(&c);
@@ -505,8 +508,11 @@ impl AddCard {
         self.notes.buffer().set_text(rest.trim());
     }
 
-    pub fn set_lists(&self, lists: &[ListView], sunday_first: bool) {
+    /// `archived` lists stay known, so a `#name` typed out in full still
+    /// finds one, but are not suggested or offered in the picker.
+    pub fn set_lists(&self, lists: &[ListView], archived: &[String], sunday_first: bool) {
         *self.lists.borrow_mut() = lists.to_vec();
+        *self.archived.borrow_mut() = archived.to_vec();
         self.sunday_first.set(sunday_first);
         // A `#word` may name a list now, and then it is not the title.
         self.parse();
@@ -636,6 +642,16 @@ impl AddCard {
         self.suggest.is_visible()
     }
 
+    /// The lists to offer: not the archived ones, but for the one the task is
+    /// going to.
+    fn pickable(&self) -> Vec<ListView> {
+        model::pickable_lists(
+            &self.lists.borrow(),
+            &self.archived.borrow(),
+            self.list_href().as_deref(),
+        )
+    }
+
     fn list_href(&self) -> Option<String> {
         let lists = self.lists.borrow();
         self.chosen
@@ -763,9 +779,10 @@ impl AddCard {
         };
         let word = self.hash_word().map(|(_, _, w)| w);
         let lower = word.as_deref().map(str::to_lowercase);
+        let offered = self.pickable();
         let lists = self.lists.borrow();
         let matches: Vec<ListView> = match &lower {
-            Some(word) => lists
+            Some(word) => offered
                 .iter()
                 .filter(|l| l.writable && squash(&l.name).contains(word))
                 .filter(|l| squash(&l.name) != *word)

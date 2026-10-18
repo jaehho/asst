@@ -91,23 +91,6 @@ impl Nav {
         matches!(self, Nav::Inbox | Nav::List(_) | Nav::All | Nav::Repeating)
     }
 
-    /// What a smart view holds, in a few words.
-    pub fn about(&self) -> &'static str {
-        match self {
-            Nav::Inbox => "The inbox list",
-            Nav::Today => "Due today, and overdue",
-            Nav::Day => "Tracked time and the plan, side by side",
-            Nav::Matrix => "Important and urgent, in four boxes",
-            Nav::Scheduled => "Everything with a date, by day",
-            Nav::Completed => "Done, by the day",
-            Nav::Tomorrow => "Due tomorrow",
-            Nav::Anytime => "Tasks with no date",
-            Nav::Repeating => "Tasks that repeat",
-            Nav::All => "Every open task, by list",
-            Nav::List(_) => "A list",
-        }
-    }
-
     pub fn icon(&self) -> &'static str {
         match self {
             Nav::Inbox => "mailbox-symbolic",
@@ -487,6 +470,26 @@ pub fn canonical_nav(nav: Nav, lists: &[ListView]) -> Nav {
         Nav::List(href) if inbox(lists).is_some_and(|l| l.href == href) => Nav::Inbox,
         nav => nav,
     }
+}
+
+/// The lists a task can be put in, in the order given. An archived list is
+/// out of reach as it is out of sight, but for the one already holding the
+/// task (its ring and name show, and a checkmark in the picker) and the
+/// inbox list, which is never archived whatever `archived` holds.
+pub fn pickable_lists(
+    lists: &[ListView],
+    archived: &[String],
+    holding: Option<&str>,
+) -> Vec<ListView> {
+    let home = inbox(lists).map(|l| l.href.as_str());
+    lists
+        .iter()
+        .filter(|l| {
+            let href = Some(l.href.as_str());
+            !archived.contains(&l.href) || href == holding || href == home
+        })
+        .cloned()
+        .collect()
 }
 
 /// The views `]` and Ctrl+PgDn step through: the tiles, then the rows of
@@ -1994,6 +1997,28 @@ mod tests {
             canonical_nav(Nav::List("/b/".into()), &[]),
             Nav::List("/b/".into())
         );
+    }
+
+    #[test]
+    fn pickable_lists_drop_archived_but_keep_the_tasks_own() {
+        let lists = lists();
+        let all = |archived: &[&str], holding: Option<&str>| -> Vec<String> {
+            let archived: Vec<String> = archived.iter().map(|h| (*h).to_string()).collect();
+            pickable_lists(&lists, &archived, holding)
+                .into_iter()
+                .map(|l| l.href)
+                .collect()
+        };
+        assert_eq!(all(&[], None), ["/a/", "/b/"]);
+        // Out of reach...
+        assert_eq!(all(&["/a/"], None), ["/b/"]);
+        // ...unless it holds the task, whose list has to show.
+        assert_eq!(all(&["/a/"], Some("/a/")), ["/a/", "/b/"]);
+        assert_eq!(all(&["/a/"], Some("/b/")), ["/b/"]);
+        // The inbox is never archived, whatever the entry says.
+        assert_eq!(all(&["/a/", "/b/"], None), ["/b/"]);
+        // Nothing known yet, nothing offered.
+        assert!(pickable_lists(&[], &["/a/".into()], Some("/a/")).is_empty());
     }
 
     #[test]

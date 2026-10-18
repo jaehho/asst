@@ -196,6 +196,20 @@ list.sidebar-lists > row.list-row.drop-below:drop(active) {
   padding: 6px 9px;
 }
 
+/* The row that opens the lists put away, under the lists. */
+button.hidden-lists {
+  margin: 0 12px 6px 12px;
+  padding: 0;
+  border-radius: 9px;
+  min-height: 0;
+  font-weight: normal;
+}
+
+/* Those lists, dimmed: a way to reach them, not a place to work. */
+list.sidebar-lists > row.list-row.hidden-list .list-line {
+  opacity: 0.7;
+}
+
 .sync-button.spinning image {
   animation: spin 1s linear infinite;
 }
@@ -641,16 +655,6 @@ button.editor-clear {
 
 .menu-info {
   margin: 3px 9px 6px 9px;
-}
-
-/* -- preferences --------------------------------------------------------- */
-
-list.sidebar-views > row.drop-above {
-  box-shadow: inset 0 2px 0 0 var(--accent-color);
-}
-
-list.sidebar-views > row.drop-below {
-  box-shadow: inset 0 -2px 0 0 var(--accent-color);
 }
 
 /* -- menus and pickers --------------------------------------------------- */

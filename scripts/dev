@@ -21,7 +21,8 @@
 #   scripts/dev texts [FILE]       what the window, an open dialog and popover show, as JSON:
 #                                  labels, entries, buttons, icons, tooltips, and whether each takes input
 #                                  (default $DEV/texts.json)
-#   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
+#   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>), a finished
+#                                  list (Shipped) and an archived one (Parked)
 #   scripts/dev reset              wipe this instance's state, then up and seed
 #   scripts/dev down [--all]       stop this instance's window, tray, asstd and bus, found on its
 #                                  bus, so other instances keep running. --all is the broom for
@@ -53,11 +54,13 @@ build() {
 }
 
 # Fixture tasks for `seed`: key, title, due, priority, repeat, optional
-# plan placement as "HH:MM minutes" on today, optional source stamp.
+# plan placement as "HH:MM minutes" on today, optional source stamp,
+# optional list (by name; else the inbox) and `done` to complete it.
 # Empty fields are skipped. The source defaults to `dev:<key>`, which keeps
 # a re-run from duplicating; the same keys own their plan slots. A
 # `steno:` or `gh:` stamp gives the row an origin caption (the rest get
-# none).
+# none). Shipped ends with only done tasks (a finished list); Parked is
+# archived by `archive_lists` and keeps one open task out of the views.
 seed_list() {
   local past next_mon
   past="$(date -d '2 days ago' +%F)"
@@ -72,6 +75,9 @@ someday-gym|Gym||||
 week-meeting|Team meeting|$next_mon||every monday|
 steno-notes|Send the meeting notes|||||steno:dev/notes
 gh-issue|Fix the sync bug|||||gh:dev/1
+shipped-first|Ship the first release||||||Shipped|done
+shipped-docs|Write the release notes||||||Shipped|done
+parked-idea|Think about a plugin API||||||Parked|
 SEED
 }
 
@@ -92,26 +98,49 @@ path.write_text(tomli_w.dumps(data))
 ' "$toml"
 }
 
+# Put lists (by name) in window.toml's `archived`, as Archive in the window
+# does. Like place_slots, for before the window runs: it rewrites the file
+# whole from what it read, and a running window would write its own over it.
+archive_lists() {
+  local toml="$DEV/config/asst/window.toml"
+  mkdir -p "$(dirname "$toml")"
+  "$BIN/asst" --json lists | uv run --no-project --with tomli-w python -c '
+import json, sys, tomllib, tomli_w
+from pathlib import Path
+path = Path(sys.argv[1])
+want = {name.lower() for name in sys.argv[2:]}
+hrefs = [l["href"] for l in json.load(sys.stdin) if l["name"].lower() in want]
+data = tomllib.loads(path.read_text()) if path.exists() else {}
+data["archived"] = sorted(set(data.get("archived", [])) | set(hrefs))
+path.write_text(tomli_w.dumps(data))
+' "$toml" "$@"
+}
+
 # Lists the fixtures go to, created on first seed.
 seed_lists() {
   local have
   have="$("$BIN/asst" --json lists | python3 -c 'import json,sys; print("\n".join(l["name"].lower() for l in json.load(sys.stdin)))')"
-  for name in Inbox Work Errands; do
+  for name in Inbox Work Errands Shipped Parked; do
     grep -qx "$(echo "$name" | tr '[:upper:]' '[:lower:]')" <<<"$have" || "$BIN/asst" list new "$name"
   done
 }
 
 seed_tasks() {
-  local slots="[]" key title due prio repeat plan uid json
+  local slots="[]" key title due prio repeat plan source list done uid json
   local -a args
-  while IFS='|' read -r key title due prio repeat plan source; do
+  while IFS='|' read -r key title due prio repeat plan source list done; do
     [ -n "$key" ] || continue
     args=(--json add --source "${source:-dev:$key}" --literal)
+    if [ -n "$list" ]; then args+=(--list "$list"); fi
     if [ -n "$due" ]; then args+=(--due "$due"); fi
     if [ -n "$prio" ]; then args+=(--priority "$prio"); fi
     if [ -n "$repeat" ]; then args+=(--repeat "$repeat"); fi
     json="$("$BIN/asst" "${args[@]}" "$title")"
     uid="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["uid"])' <<<"$json")"
+    # Only an open task: a re-run finds it done already.
+    if [ -n "$done" ] && python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["status"] == "needs-action" else 1)' <<<"$json"; then
+      "$BIN/asst" --json done "$uid" > /dev/null
+    fi
     if [ -n "$plan" ]; then
       slots="$(python3 -c '
 import json, sys
@@ -382,6 +411,7 @@ CONF
     on_bus
     seed_lists
     seed_tasks
+    archive_lists Parked
     ;;
   reset)
     # Not `down --all`: Radicale and the other instances stay as they are.
