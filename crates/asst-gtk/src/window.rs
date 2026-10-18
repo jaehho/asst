@@ -3484,7 +3484,7 @@ impl Window {
             nav: &self.nav,
             lists: &split.shown,
             hidden: &split.hidden,
-            finished: self.prefs.finished_count(&self.lists, &self.nav),
+            finished: self.prefs.finished_count(&self.lists),
             inbox: model::inbox(&self.lists).map(|l| l.href.as_str()),
             counts: &counts,
             status: self.status.as_ref(),
