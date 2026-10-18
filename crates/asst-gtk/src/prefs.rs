@@ -409,6 +409,12 @@ impl Prefs {
         }
     }
 
+    /// Whether the sidebar shows the default views in the default order,
+    /// saved or not: a reset would change nothing.
+    pub fn is_default_sidebar(&self) -> bool {
+        self.sidebar_views() == DEFAULT_SIDEBAR
+    }
+
     /// Back to the default sidebar. What `sidebar` held, as saved, for the
     /// Undo to write back.
     pub fn reset_sidebar(&mut self) -> Option<Vec<String>> {
@@ -514,29 +520,28 @@ impl Prefs {
 
     /// Whether the list has nothing left to do: tasks once, none open now.
     /// A list with no tasks at all is new, not finished. Never the inbox
-    /// list, an archived one, or the one on screen (completing its last task
-    /// would take the row from under the cursor).
-    fn is_finished(&self, l: &ListView, all: &[ListView], current: &Nav) -> bool {
+    /// list or an archived one.
+    fn is_finished(&self, l: &ListView, all: &[ListView]) -> bool {
         l.open == 0
             && l.done > 0
             && !self.is_archived(&l.href, all)
             && !crate::model::inbox(all).is_some_and(|i| i.href == l.href)
-            && *current != Nav::List(l.href.clone())
     }
 
     /// How many lists are finished right now, whether or not they are put
-    /// away: what the toggle offers to hide.
-    pub fn finished_count(&self, all: &[ListView], current: &Nav) -> usize {
-        all.iter()
-            .filter(|l| self.is_finished(l, all, current))
-            .count()
+    /// away: what the toggle offers to hide. The one on screen counts, as
+    /// it is not kept out of `split_lists` for being any less finished.
+    pub fn finished_count(&self, all: &[ListView]) -> usize {
+        all.iter().filter(|l| self.is_finished(l, all)).count()
     }
 
     /// The sidebar's lists, in its order, split into the rows and what goes
     /// under Hidden lists: the archived ones, and the finished ones while
-    /// `hide_finished_lists` is on. A finished list returns by itself when a
-    /// task lands in it, a new GitHub issue too. The inbox list has no row
-    /// while its tile shows, and is never hidden.
+    /// `hide_finished_lists` is on, but for the one on screen (completing
+    /// its last task would take the row from under the cursor). A finished
+    /// list returns by itself when a task lands in it, a new GitHub issue
+    /// too. The inbox list has no row while its tile shows, and is never
+    /// hidden.
     pub fn split_lists(&self, all: &[ListView], current: &Nav) -> SplitLists {
         let on_tile = self.inbox_on_tile(all);
         let mut split = SplitLists::default();
@@ -547,8 +552,10 @@ impl Prefs {
             let why = if self.is_archived(&l.href, all) {
                 Some(Why::Archived)
             } else {
-                (self.hide_finished_lists && self.is_finished(&l, all, current))
-                    .then_some(Why::Finished)
+                (self.hide_finished_lists
+                    && self.is_finished(&l, all)
+                    && *current != Nav::List(l.href.clone()))
+                .then_some(Why::Finished)
             };
             match why {
                 Some(why) => split.hidden.push((l, why)),
@@ -993,6 +1000,27 @@ day_zoom = 52.0
     }
 
     #[test]
+    fn a_sidebar_that_shows_the_default_needs_no_reset() {
+        let mut p = Prefs::default();
+        assert!(p.is_default_sidebar());
+        // Saved as the default, it is the default all the same.
+        p.sidebar = Some(keys(&DEFAULT_SIDEBAR));
+        assert!(p.is_default_sidebar());
+        // A different set, a different order, or none at all is not.
+        for views in [
+            vec![Nav::Inbox],
+            vec![Nav::Day, Nav::Inbox],
+            vec![Nav::Inbox, Nav::Day, Nav::Today],
+            vec![],
+        ] {
+            p.set_sidebar_views(&views);
+            assert!(!p.is_default_sidebar(), "{views:?}");
+        }
+        p.reset_sidebar();
+        assert!(p.is_default_sidebar());
+    }
+
+    #[test]
     fn each_hide_undo_restores_only_its_own_view() {
         let mut p = Prefs::default();
         p.set_sidebar_views(&[Nav::Inbox, Nav::Today, Nav::Day, Nav::Matrix]);
@@ -1375,7 +1403,7 @@ day_zoom = 52.0
             )
         );
         // It still says how many it would hide.
-        assert_eq!(p.finished_count(&lists, &nowhere), 1);
+        assert_eq!(p.finished_count(&lists), 1);
 
         // On: the finished list joins it, in the sidebar's order. A list
         // with no tasks yet is new, not finished.
@@ -1390,16 +1418,17 @@ day_zoom = 52.0
                 ])
             )
         );
-        assert_eq!(p.finished_count(&lists, &nowhere), 1);
+        assert_eq!(p.finished_count(&lists), 1);
 
         // The list on screen stays, so completing its last task does not
-        // take the row from under the cursor; the count leaves it out too.
+        // take the row from under the cursor. It is still finished, so the
+        // count does not change with where you are.
         let open = Nav::List("/b/".into());
         assert_eq!(
             split_names(&p, &lists, &open).0,
             ["asst", "battery-log", "new", "Work"]
         );
-        assert_eq!(p.finished_count(&lists, &open), 0);
+        assert_eq!(p.finished_count(&lists), 1);
 
         // An archived list is archived however finished it is, and open.
         let open = Nav::List("/m/".into());

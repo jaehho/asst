@@ -2107,14 +2107,17 @@ impl Component for Window {
                     return;
                 };
                 self.prefs.save();
+                // With no tile left there is none to right-click.
+                let way_back = if self.prefs.sidebar_views().is_empty() {
+                    "Add it back from the … menu next to Lists."
+                } else {
+                    "Right-click a tile to add it back."
+                };
                 // Its Undo puts back this view alone, at the place it had.
                 self.undo_toast(
                     w,
                     &tx,
-                    &format!(
-                        "{} hidden. Right-click a tile to add it back.",
-                        nav.title(&[])
-                    ),
+                    &format!("{} hidden. {way_back}", nav.title(&[])),
                     Msg::ShowView(nav, Some(at)),
                     UNDO_SECS,
                 );
@@ -2128,6 +2131,11 @@ impl Component for Window {
                 self.prefs.save();
             }
             Msg::ResetSidebar => {
+                // An Undo that puts back what is there would do nothing.
+                if self.prefs.is_default_sidebar() {
+                    toast(w, "The sidebar already shows Inbox and Day.");
+                    return;
+                }
                 let old = self.prefs.reset_sidebar();
                 self.prefs.save();
                 self.undo_toast(
@@ -2346,7 +2354,9 @@ impl Component for Window {
                     tx.clone(),
                 ));
             }
-            Cmd::Refused(why, daemon) => {
+            Cmd::Refused(raw, daemon) => {
+                eprintln!("asst-gtk: asstd refused a setting: {raw}");
+                let why = settings::plain_refusal(&raw);
                 if let Some(s) = daemon {
                     self.take_settings(s, &sender);
                 }
@@ -3484,7 +3494,7 @@ impl Window {
             nav: &self.nav,
             lists: &split.shown,
             hidden: &split.hidden,
-            finished: self.prefs.finished_count(&self.lists, &self.nav),
+            finished: self.prefs.finished_count(&self.lists),
             inbox: model::inbox(&self.lists).map(|l| l.href.as_str()),
             counts: &counts,
             status: self.status.as_ref(),
