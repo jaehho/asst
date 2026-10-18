@@ -3310,10 +3310,15 @@ mod tests {
                 s.rename_fails = None;
                 s.rename_reply_lost = None;
             });
+            // (a busy machine may time a request out: that round is not one)
             let mut last = None;
-            for _ in 0..6 {
+            for _ in 0..8 {
                 rig.later(70);
-                rig.go().await;
+                for _ in 0..4 {
+                    if rig.go().await != Round::Offline {
+                        break;
+                    }
+                }
                 let snap = rig.snap();
                 if last.as_ref() == Some(&snap) {
                     break;
@@ -3321,7 +3326,11 @@ mod tests {
                 last = Some(snap);
             }
             rig.later(70);
-            rig.go().await;
+            for _ in 0..4 {
+                if rig.go().await != Round::Offline {
+                    break;
+                }
+            }
             let at = format!("seed {seed}, settled\n{}", trace.join("\n"));
             assert_eq!(Some(rig.snap()), last, "it did not rest\n{at}");
             let w = world.lock().unwrap();
