@@ -110,7 +110,8 @@ pub struct Shown {
     /// `window`, `dialog`, `popover` or `toplevel` (a window of its own):
     /// which root it was found under.
     pub root: &'static str,
-    /// `label`, `entry`, `text`, `button` or `icon`.
+    /// `label`, `entry`, `text`, `button`, `icon` or `tile` (a view's tile
+    /// in the sidebar, named by its title).
     pub kind: &'static str,
     /// The words (a button's own label, an entry's text, a label's text).
     pub text: String,
@@ -127,7 +128,8 @@ pub struct Shown {
 }
 
 /// Every mapped label, entry, text view, labelled or icon button (and a
-/// menu item that has a tooltip) and icon under `roots`, in tree order.
+/// menu item that has a tooltip), icon and sidebar tile that has a tooltip
+/// under `roots`, in tree order.
 pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
     let mut out = Vec::new();
     for (root, widget) in roots {
@@ -174,6 +176,10 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
                 let b = t.buffer();
                 let text = b.text(&b.start_iter(), &b.end_iter(), false);
                 out.push(item("text", text.to_string(), None));
+            } else if w.is::<gtk::FlowBoxChild>() && w.tooltip_text().is_some() {
+                // The keys a tile's tooltip names are worth asserting on.
+                let title = label_with_class(&w, "tile-title").unwrap_or_default();
+                out.push(item("tile", title, None));
             }
             // Last child first, so the stack pops them in tree order.
             let mut child = w.last_child();
@@ -184,6 +190,23 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
         }
     }
     out
+}
+
+/// The text of the first label under `w` that has the CSS class `class`.
+fn label_with_class(w: &gtk::Widget, class: &str) -> Option<String> {
+    if let Some(l) = w.downcast_ref::<gtk::Label>()
+        && l.has_css_class(class)
+    {
+        return Some(l.text().to_string());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(text) = label_with_class(&c, class) {
+            return Some(text);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 /// The text of the first label under `w`, in tree order.

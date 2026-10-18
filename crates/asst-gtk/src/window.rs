@@ -320,8 +320,9 @@ pub enum Key {
     Today,
     Tomorrow,
     NextWeek,
-    PrevView,
-    NextView,
+    /// Go `i32` places (1 or -1) on in the walk, wrapping: `[ ]` through the
+    /// tiles, `{ }` through the lists, Ctrl+PgUp/PgDn through both.
+    Step(Walk, i32),
     Sync,
     Select,
     Escape,
@@ -340,7 +341,19 @@ pub enum Nav0 {
     Inbox,
     Today,
     Scheduled,
+    /// The Nth shown tile (Alt+N), counting from 0.
+    Tile(usize),
+    /// The Nth shown list (Ctrl+N), counting from 0.
     List(usize),
+}
+
+/// What a step key goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    Tiles,
+    Lists,
+    /// The tiles, then the lists.
+    Both,
 }
 
 pub struct Loaded {
@@ -3202,21 +3215,27 @@ impl Window {
                     w.add_card.leave();
                 }
             }
-            Key::PrevView | Key::NextView => {
-                let order = self.nav_order();
-                if order.is_empty() {
-                    return;
+            Key::Step(walk, step) => {
+                let next = match walk {
+                    Walk::Tiles => model::tile_cycle(&self.prefs.sidebar_views(), &self.nav, step),
+                    Walk::Lists => model::list_cycle(
+                        &self.prefs.sidebar_lists(&self.lists, &self.nav),
+                        &self.lists,
+                        &self.nav,
+                        step,
+                    ),
+                    Walk::Both => model::cycle_from(&self.nav_order(), &self.nav, step),
+                };
+                if let Some(nav) = next {
+                    sender.input(Msg::Navigate(nav));
                 }
-                let at = order.iter().position(|n| *n == self.nav).unwrap_or(0) as i32;
-                let step = if matches!(key, Key::NextView) { 1 } else { -1 };
-                let next = (at + step).rem_euclid(order.len() as i32) as usize;
-                sender.input(Msg::Navigate(order[next].clone()));
             }
             Key::Go(target) => {
                 let nav = match target {
                     Nav0::Inbox => Some(Nav::Inbox),
                     Nav0::Today => Some(Nav::Today),
                     Nav0::Scheduled => Some(Nav::Scheduled),
+                    Nav0::Tile(i) => self.prefs.sidebar_views().get(i).cloned(),
                     Nav0::List(i) => self
                         .prefs
                         .sidebar_lists(&self.lists, &self.nav)
@@ -4730,8 +4749,10 @@ fn vim_key(key: gdk::Key) -> Option<Key> {
         gdk::Key::t => Key::Today,
         gdk::Key::m => Key::Tomorrow,
         gdk::Key::w => Key::NextWeek,
-        gdk::Key::bracketleft | gdk::Key::H => Key::PrevView,
-        gdk::Key::bracketright | gdk::Key::L => Key::NextView,
+        gdk::Key::bracketleft | gdk::Key::H => Key::Step(Walk::Tiles, -1),
+        gdk::Key::bracketright | gdk::Key::L => Key::Step(Walk::Tiles, 1),
+        gdk::Key::braceleft => Key::Step(Walk::Lists, -1),
+        gdk::Key::braceright => Key::Step(Walk::Lists, 1),
         gdk::Key::s => Key::Sync,
         gdk::Key::v => Key::Select,
         gdk::Key::p => Key::NewList,
@@ -4766,8 +4787,7 @@ fn acts_on_task(key: Key) -> bool {
         | Key::Find
         | Key::ZoomIn
         | Key::ZoomOut
-        | Key::PrevView
-        | Key::NextView
+        | Key::Step(..)
         | Key::Sync
         | Key::Select
         | Key::Escape
@@ -4794,6 +4814,42 @@ fn routes_to_tasks(scope: Scope, key: gdk::Key) -> bool {
     }
 }
 
+/// The place a digit key stands for, counting from 0: `1` is the first,
+/// `9` the ninth.
+fn digit_index(key: gdk::Key) -> Option<usize> {
+    key.to_unicode()
+        .and_then(|c| c.to_digit(10))
+        .filter(|d| (1..=9).contains(d))
+        .map(|d| d as usize - 1)
+}
+
+/// The chords that act wherever the keyboard is, in a field too: Ctrl keys,
+/// and Alt+N for the Nth tile. Hyprland only binds Super+Alt+digit, so the
+/// window gets the Alt ones.
+fn chord(key: gdk::Key, state: gdk::ModifierType) -> Option<Key> {
+    if state.contains(gdk::ModifierType::CONTROL_MASK) {
+        return match key {
+            gdk::Key::f => Some(Key::Find),
+            gdk::Key::i => Some(Key::Go(Nav0::Inbox)),
+            gdk::Key::t => Some(Key::Go(Nav0::Today)),
+            gdk::Key::u => Some(Key::Go(Nav0::Scheduled)),
+            gdk::Key::comma => Some(Key::Preferences),
+            gdk::Key::b => Some(Key::Sidebar),
+            gdk::Key::w => Some(Key::Close),
+            gdk::Key::q => Some(Key::Quit),
+            gdk::Key::Page_Up => Some(Key::Step(Walk::Both, -1)),
+            gdk::Key::Page_Down => Some(Key::Step(Walk::Both, 1)),
+            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(Key::ZoomIn),
+            gdk::Key::minus | gdk::Key::KP_Subtract => Some(Key::ZoomOut),
+            k => digit_index(k).map(|i| Key::Go(Nav0::List(i))),
+        };
+    }
+    if state.contains(gdk::ModifierType::ALT_MASK) {
+        return digit_index(key).map(|i| Key::Go(Nav0::Tile(i)));
+    }
+    None
+}
+
 /// Vim keys and shortcuts; typing in a field is left alone.
 fn key_action(
     window: &adw::ApplicationWindow,
@@ -4806,31 +4862,7 @@ fn key_action(
     if inside(adw::Dialog::static_type()) || inside(gtk::Popover::static_type()) {
         return glib::Propagation::Proceed;
     }
-    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-    let action = if ctrl {
-        match key {
-            gdk::Key::f => Some(Key::Find),
-            gdk::Key::i => Some(Key::Go(Nav0::Inbox)),
-            gdk::Key::t => Some(Key::Go(Nav0::Today)),
-            gdk::Key::u => Some(Key::Go(Nav0::Scheduled)),
-            gdk::Key::comma => Some(Key::Preferences),
-            gdk::Key::b => Some(Key::Sidebar),
-            gdk::Key::w => Some(Key::Close),
-            gdk::Key::q => Some(Key::Quit),
-            gdk::Key::Page_Up => Some(Key::PrevView),
-            gdk::Key::Page_Down => Some(Key::NextView),
-            gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(Key::ZoomIn),
-            gdk::Key::minus | gdk::Key::KP_Subtract => Some(Key::ZoomOut),
-            k => k
-                .to_unicode()
-                .and_then(|c| c.to_digit(10))
-                .filter(|d| (1..=9).contains(d))
-                .map(|d| Key::Go(Nav0::List(d as usize - 1))),
-        }
-    } else {
-        None
-    };
-    if let Some(a) = action {
+    if let Some(a) = chord(key, state) {
         tx.emit(Msg::Key(a));
         return glib::Propagation::Stop;
     }
@@ -4846,6 +4878,7 @@ fn key_action(
         return glib::Propagation::Proceed;
     }
     // Outside a field, what is pasted becomes a task.
+    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
     if ctrl && matches!(key, gdk::Key::v | gdk::Key::V) {
         tx.emit(Msg::Key(Key::Paste));
         return glib::Propagation::Stop;
@@ -4905,6 +4938,8 @@ mod tests {
             K::question,
             K::bracketleft,
             K::bracketright,
+            K::braceleft,
+            K::braceright,
             K::Escape,
         ];
         for scope in [Scope::Sidebar, Scope::Native] {
@@ -4919,6 +4954,63 @@ mod tests {
             assert!(routes_to_tasks(Scope::Content, key), "{key:?}");
             assert!(!routes_to_tasks(Scope::Typing, key), "{key:?}");
         }
+    }
+
+    #[test]
+    fn alt_digits_map_to_tile_index() {
+        use gdk::Key as K;
+        let (alt, ctrl) = (gdk::ModifierType::ALT_MASK, gdk::ModifierType::CONTROL_MASK);
+        let digits = [
+            K::_1,
+            K::_2,
+            K::_3,
+            K::_4,
+            K::_5,
+            K::_6,
+            K::_7,
+            K::_8,
+            K::_9,
+        ];
+        // Alt+N is the Nth tile and Ctrl+N the Nth list, counting from 0.
+        for (i, key) in digits.into_iter().enumerate() {
+            assert!(matches!(chord(key, alt), Some(Key::Go(Nav0::Tile(n))) if n == i));
+            assert!(matches!(chord(key, ctrl), Some(Key::Go(Nav0::List(n))) if n == i));
+            assert!(chord(key, gdk::ModifierType::empty()).is_none());
+        }
+        // Zero is no place; and a lock key held makes no difference.
+        assert!(chord(K::_0, alt).is_none());
+        assert!(matches!(
+            chord(K::_2, alt | gdk::ModifierType::LOCK_MASK),
+            Some(Key::Go(Nav0::Tile(1)))
+        ));
+        // Alt with a letter, or an arrow (it moves a focused tile), is the
+        // focused widget's.
+        for key in [K::i, K::Left, K::Right, K::bracketright] {
+            assert!(chord(key, alt).is_none(), "{key:?}");
+        }
+        // Ctrl+PgUp/PgDn walk the tiles then the lists; `[ ]` only the tiles
+        // and `{ }` only the lists.
+        assert!(matches!(
+            chord(K::Page_Down, ctrl),
+            Some(Key::Step(Walk::Both, 1))
+        ));
+        assert!(matches!(
+            chord(K::Page_Up, ctrl),
+            Some(Key::Step(Walk::Both, -1))
+        ));
+        assert!(matches!(
+            vim_key(K::bracketright),
+            Some(Key::Step(Walk::Tiles, 1))
+        ));
+        assert!(matches!(vim_key(K::H), Some(Key::Step(Walk::Tiles, -1))));
+        assert!(matches!(
+            vim_key(K::braceleft),
+            Some(Key::Step(Walk::Lists, -1))
+        ));
+        assert!(matches!(
+            vim_key(K::braceright),
+            Some(Key::Step(Walk::Lists, 1))
+        ));
     }
 
     #[test]

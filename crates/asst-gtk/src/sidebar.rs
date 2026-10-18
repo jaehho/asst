@@ -230,9 +230,7 @@ fn view_choices(shown: &[Nav], hidden: &[Nav]) -> Vec<ViewChoice> {
     let tiles = shown.iter().enumerate().map(|(at, nav)| ViewChoice {
         nav: nav.clone(),
         shown: true,
-        hint: (at < 9)
-            .then(|| format!("Alt+{}", at + 1))
-            .or_else(|| nav.chord().map(String::from)),
+        hint: model::alt_chord(at).or_else(|| nav.chord().map(String::from)),
     });
     let rest = hidden.iter().map(|nav| ViewChoice {
         nav: nav.clone(),
@@ -818,7 +816,7 @@ impl Sidebar {
             .map(|(at, t)| (t.nav.clone(), at));
         self.tiles_box.remove_all();
         let mut tiles = Vec::new();
-        for nav in shown {
+        for (at, nav) in shown.iter().enumerate() {
             let grid = gtk::Grid::builder()
                 .column_spacing(6)
                 .row_spacing(6)
@@ -857,8 +855,9 @@ impl Sidebar {
             child.set_child(Some(&grid));
             child.add_css_class("filter-tile");
             child.add_css_class(nav.tint());
-            if let Some(keys) = nav.chord() {
-                ui::tip(&child, &nav.title(&[]), keys);
+            let keys = model::tile_keys(nav, at);
+            if !keys.is_empty() {
+                ui::tip(&child, &nav.title(&[]), &keys);
             }
             if !matches!(
                 nav,

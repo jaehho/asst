@@ -284,19 +284,35 @@ pub fn delete_completed_dialog(
 
 pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
     let dialog = adw::ShortcutsDialog::new();
-    let sections: [(&str, &[(&str, &str)]); 5] = [
+    let sections: [(&str, &[(&str, &str)]); 6] = [
         (
             "Moving around",
             &[
                 ("Next / previous task", "j k Down Up"),
                 ("First / last task", "g <Shift>g"),
                 ("Previous / next view", "bracketleft bracketright"),
+                (
+                    "Previous / next list",
+                    "<Shift>bracketleft <Shift>bracketright",
+                ),
+                ("A view in the sidebar", "<Alt>1...<Alt>9"),
                 ("Inbox", "<Control>i"),
                 ("Today", "<Control>t"),
                 ("Scheduled", "<Control>u"),
                 ("A list in the sidebar", "<Control>1...<Control>9"),
+                (
+                    "Through the views, then the lists",
+                    "<Control>Page_Up <Control>Page_Down",
+                ),
                 ("Quick Find", "<Control>f slash"),
                 ("Show or hide the sidebar", "<Control>b"),
+            ],
+        ),
+        (
+            "Sidebar",
+            &[
+                ("Move the focused view", "<Alt>Left <Alt>Right"),
+                ("Context menu", "Menu <Shift>F10"),
             ],
         ),
         (
@@ -357,6 +373,14 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
     // no accelerator, and Adwaita warns and stops drawing at one. And the
     // focus rule, which the task keys on the sheet all follow.
     let notes = [
+        (
+            "A view in the sidebar",
+            "Alt+1 is the first tile. It works in a field too",
+        ),
+        (
+            "Move the focused view",
+            "With the keyboard on a tile (Tab to it). Delete hides it",
+        ),
         ("Zoom the day grid", "Or hold Ctrl and scroll"),
         (
             "Complete or reopen",

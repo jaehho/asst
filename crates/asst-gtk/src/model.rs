@@ -492,8 +492,8 @@ pub fn pickable_lists(
         .collect()
 }
 
-/// The views `]` and Ctrl+PgDn step through: the tiles, then the rows of
-/// the lists (`all` tells which of them is the inbox). Each view once.
+/// The views Ctrl+PgUp and Ctrl+PgDn step through: the tiles, then the rows
+/// of the lists (`all` tells which of them is the inbox). Each view once.
 pub fn cycle_order(tiles: &[Nav], rows: &[ListView], all: &[ListView]) -> Vec<Nav> {
     let mut order: Vec<Nav> = Vec::new();
     let lists = rows
@@ -505,6 +505,51 @@ pub fn cycle_order(tiles: &[Nav], rows: &[ListView], all: &[ListView]) -> Vec<Na
         }
     }
     order
+}
+
+/// The view `step` places (1 or -1) from `current` in `order`, wrapping at
+/// the ends. From a view that is not in `order` (a list while walking the
+/// tiles, a view with no tile) a step on goes to the first, a step back to
+/// the last. `None` for an empty walk.
+pub fn cycle_from(order: &[Nav], current: &Nav, step: i32) -> Option<Nav> {
+    let len = order.len() as i32;
+    let at = match order.iter().position(|n| n == current) {
+        Some(at) => (at as i32 + step).rem_euclid(len),
+        None if step > 0 => 0,
+        None => len - 1,
+    };
+    order.get(usize::try_from(at).ok()?).cloned()
+}
+
+/// `]` and `[`: the next or previous tile, the first or the last from
+/// anywhere else.
+pub fn tile_cycle(tiles: &[Nav], current: &Nav, step: i32) -> Option<Nav> {
+    cycle_from(tiles, current, step)
+}
+
+/// `}` and `{`: the same through the lists that have a row (`all` tells
+/// which of them is the inbox, which is the Inbox view once it has a row).
+pub fn list_cycle(rows: &[ListView], all: &[ListView], current: &Nav, step: i32) -> Option<Nav> {
+    let navs: Vec<Nav> = rows
+        .iter()
+        .map(|l| canonical_nav(Nav::List(l.href.clone()), all))
+        .collect();
+    cycle_from(&navs, current, step)
+}
+
+/// The Alt chord for the tile at `index`: `Alt+1` to `Alt+9`.
+pub fn alt_chord(index: usize) -> Option<String> {
+    (index < 9).then(|| format!("Alt+{}", index + 1))
+}
+
+/// What a tile's tooltip says opens it: its Alt chord by place, and its Ctrl
+/// chord if the view has one (empty for neither).
+pub fn tile_keys(nav: &Nav, index: usize) -> String {
+    let keys: Vec<String> = alt_chord(index)
+        .into_iter()
+        .chain(nav.chord().map(String::from))
+        .collect();
+    keys.join(" or ")
 }
 
 /// What a view shows, top to bottom.
@@ -2048,6 +2093,82 @@ mod tests {
             cycle_order(&tiles, &rows(&["/a/", "/b/"]), &lists),
             [Nav::Inbox, Nav::Day, Nav::List("/a/".into())]
         );
+    }
+
+    #[test]
+    fn tiles_cycle_and_a_list_steps_into_them() {
+        let tiles = [Nav::Inbox, Nav::Day, Nav::Today];
+        let at = |nav: &Nav, step| tile_cycle(&tiles, nav, step);
+        // Wrapping, both ways.
+        assert_eq!(at(&Nav::Inbox, 1), Some(Nav::Day));
+        assert_eq!(at(&Nav::Today, 1), Some(Nav::Inbox));
+        assert_eq!(at(&Nav::Inbox, -1), Some(Nav::Today));
+        // A list, or a view with no tile, is stepped into from outside:
+        // `]` is the first tile, `[` the last.
+        let list = Nav::List("/a/".into());
+        for outside in [&list, &Nav::Matrix] {
+            assert_eq!(at(outside, 1), Some(Nav::Inbox));
+            assert_eq!(at(outside, -1), Some(Nav::Today));
+        }
+        // The default sidebar: `]` toggles Inbox and Day, `[` the same.
+        let two = [Nav::Inbox, Nav::Day];
+        assert_eq!(tile_cycle(&two, &Nav::Inbox, 1), Some(Nav::Day));
+        assert_eq!(tile_cycle(&two, &Nav::Day, 1), Some(Nav::Inbox));
+        assert_eq!(tile_cycle(&two, &Nav::Day, -1), Some(Nav::Inbox));
+        // One tile steps to itself; none, nowhere.
+        assert_eq!(tile_cycle(&[Nav::Day], &Nav::Day, 1), Some(Nav::Day));
+        assert_eq!(tile_cycle(&[], &Nav::Day, 1), None);
+        assert_eq!(tile_cycle(&[], &Nav::Day, -1), None);
+    }
+
+    #[test]
+    fn lists_cycle_through_their_rows_and_a_tile_steps_into_them() {
+        let lists = lists();
+        let rows = |hrefs: &[&str]| -> Vec<ListView> {
+            hrefs
+                .iter()
+                .filter_map(|h| lists.iter().find(|l| l.href == *h).cloned())
+                .collect()
+        };
+        let a = Nav::List("/a/".into());
+        // "/b/" is the inbox list: with its tile shown it has no row.
+        let step = |hrefs: &[&str], from: &Nav, by| list_cycle(&rows(hrefs), &lists, from, by);
+        assert_eq!(step(&["/a/"], &a, 1), Some(a.clone()));
+        assert_eq!(step(&["/a/"], &Nav::Day, 1), Some(a.clone()));
+        assert_eq!(step(&["/a/"], &Nav::Day, -1), Some(a.clone()));
+        assert_eq!(step(&[], &Nav::Day, 1), None);
+        // With the tile hidden the row is the Inbox view, so the walk
+        // finds the view the window is on.
+        assert_eq!(step(&["/a/", "/b/"], &a, 1), Some(Nav::Inbox));
+        assert_eq!(step(&["/a/", "/b/"], &Nav::Inbox, 1), Some(a.clone()));
+        assert_eq!(step(&["/a/", "/b/"], &a, -1), Some(Nav::Inbox));
+        // From a tile, `}` is the first row and `{` the last.
+        assert_eq!(step(&["/a/", "/b/"], &Nav::Today, 1), Some(a));
+        assert_eq!(step(&["/a/", "/b/"], &Nav::Today, -1), Some(Nav::Inbox));
+    }
+
+    #[test]
+    fn tile_keys_match_position() {
+        assert_eq!(alt_chord(0).as_deref(), Some("Alt+1"));
+        assert_eq!(alt_chord(8).as_deref(), Some("Alt+9"));
+        assert_eq!(alt_chord(9), None);
+        // The Alt chord is the place, so a tile moved changes its key; the
+        // Ctrl chord belongs to the view.
+        assert_eq!(tile_keys(&Nav::Inbox, 0), "Alt+1 or Ctrl+I");
+        assert_eq!(tile_keys(&Nav::Inbox, 1), "Alt+2 or Ctrl+I");
+        assert_eq!(tile_keys(&Nav::Day, 1), "Alt+2");
+        assert_eq!(tile_keys(&Nav::Today, 2), "Alt+3 or Ctrl+T");
+        // Past nine tiles only the Ctrl chord is left, and some have none.
+        assert_eq!(tile_keys(&Nav::Scheduled, 9), "Ctrl+U");
+        assert_eq!(tile_keys(&Nav::All, 9), "");
+        // Every view's tooltip, shown first to last, names its own place.
+        for (at, nav) in Nav::filters().iter().enumerate() {
+            let keys = tile_keys(nav, at);
+            assert_eq!(keys.starts_with("Alt+"), at < 9, "{nav:?} {keys}");
+            if at < 9 {
+                assert!(keys.starts_with(&format!("Alt+{}", at + 1)), "{keys}");
+            }
+        }
     }
 
     fn on(d: NaiveDate) -> Option<When> {
