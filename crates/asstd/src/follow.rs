@@ -19,7 +19,7 @@
 
 use asst_core::caldav::{RemoteError, RemoteList};
 use asst_core::github::{self, FollowRename, KeepWhy, limits};
-use asst_core::store::{GhLinkRow, LogRow, NewLog};
+use asst_core::store::{Ended, GhLinkRow, LogRow, NewLog};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -369,11 +369,12 @@ fn finish(
     stage: Stage,
 ) -> Result<()> {
     let text = intent.text(stage);
-    {
-        let store = daemon.store();
-        store.gh_log_retag(row, "list-renamed", &text)?;
-        store.gh_clear_follow(&link.repo)?;
-    }
+    let ended = Ended::Row {
+        id: row,
+        kind: "list-renamed",
+        text: &text,
+    };
+    daemon.store().gh_end_follow(&link.repo, ended)?;
     log::info!("{text}");
     daemon.notify("A list followed its repo's new name", &text);
     Ok(())
@@ -397,25 +398,23 @@ fn keep(
         "repo_to": link.repo,
     })
     .to_string();
-    let store = daemon.store();
-    match intent_row {
-        Some(id) => {
-            store.gh_log_retag(id, "list-kept", &text)?;
-        }
-        None => {
-            store.gh_log_add(&NewLog {
-                at: now,
-                repo: &link.repo,
-                list: Some(&link.list),
-                kind: "list-kept",
-                text: &text,
-                data: Some(&data),
-                by: AUTO,
-            })?;
-        }
-    }
-    store.gh_clear_follow(&link.repo)?;
-    drop(store);
+    let ended = match intent_row {
+        Some(id) => Ended::Row {
+            id,
+            kind: "list-kept",
+            text: &text,
+        },
+        None => Ended::New(NewLog {
+            at: now,
+            repo: &link.repo,
+            list: Some(&link.list),
+            kind: "list-kept",
+            text: &text,
+            data: Some(&data),
+            by: AUTO,
+        }),
+    };
+    daemon.store().gh_end_follow(&link.repo, ended)?;
     log::info!("{old} is now {}: {text}", link.repo);
     Ok(())
 }

@@ -164,6 +164,19 @@ pub struct NewLog<'a> {
     pub by: &'a str,
 }
 
+/// How the wait of a link's list for its repo's new name ended.
+#[derive(Debug, Clone, Copy)]
+pub enum Ended<'a> {
+    /// A row written when it began (the intent) says what became of it.
+    Row {
+        id: i64,
+        kind: &'a str,
+        text: &'a str,
+    },
+    /// Nothing was begun: this row is written.
+    New(NewLog<'a>),
+}
+
 /// How many actual blocks carry a label, and how long they last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelTotal {
@@ -1180,9 +1193,11 @@ impl Store {
     /// nothing is paired again. Its id and archived baseline stay, since
     /// they are the repo's, not the name's. In the same transaction,
     /// `follow_at` marks the list as having a rename to follow (from `old`,
-    /// when; a second rename before the first was followed replaces the
-    /// marker) and `log` is written. Fails, changing nothing, when `new` is
-    /// linked. Returns whether there was a link to move.
+    /// when). A second rename before the first was followed keeps the first
+    /// `old`, since that is the name the list can still be called for, and
+    /// takes the newer time, since that is the latest word of the repo.
+    /// `log` is written. Fails, changing nothing, when `new` is linked.
+    /// Returns whether there was a link to move.
     pub fn gh_rename(
         &self,
         old: &str,
@@ -1198,7 +1213,8 @@ impl Store {
         if moved {
             if let Some(at) = follow_at {
                 tx.execute(
-                    "UPDATE gh_links SET follow_from = ?2, follow_at = ?3 WHERE repo = ?1",
+                    "UPDATE gh_links SET follow_from = COALESCE(follow_from, ?2), follow_at = ?3
+                     WHERE repo = ?1",
                     params![new, old, at.timestamp()],
                 )?;
             }
@@ -1216,6 +1232,31 @@ impl Store {
             "UPDATE gh_links SET follow_from = NULL, follow_at = NULL WHERE repo = ?1",
             [repo],
         )?;
+        Ok(())
+    }
+
+    /// The list's wait for the repo's new name is over: the log says how and
+    /// the marker goes, in one transaction. Apart, a crash between the two
+    /// leaves a marker that is judged again against a list already done,
+    /// and told as a second decision.
+    pub fn gh_end_follow(&self, repo: &str, ended: Ended<'_>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        match ended {
+            Ended::Row { id, kind, text } => {
+                tx.execute(
+                    "UPDATE gh_log SET kind = ?2, text = ?3 WHERE id = ?1",
+                    params![id, kind, text],
+                )?;
+            }
+            Ended::New(row) => {
+                insert_log(&tx, &row)?;
+            }
+        }
+        tx.execute(
+            "UPDATE gh_links SET follow_from = NULL, follow_at = NULL WHERE repo = ?1",
+            [repo],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2396,15 +2437,78 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
         let row = &s.gh_link_rows().unwrap()[0];
         assert_eq!((row.follow_from.clone(), row.follow_at), (None, None));
         assert_eq!(row.repo_id, Some(1379104005));
-        // A second rename before the list followed the first replaces the
-        // marker with the newer one
+        // A second rename before the list followed the first keeps the
+        // name the list is called for, and the newer time
         s.gh_rename("jaehho/lab2", "jaehho/lab3", Some(at(19)), None)
             .unwrap();
         s.gh_rename("jaehho/lab3", "jaehho/lab4", Some(at(20)), None)
             .unwrap();
         let row = &s.gh_link_rows().unwrap()[0];
-        assert_eq!(row.follow_from.as_deref(), Some("jaehho/lab3"));
+        assert_eq!(row.repo, "jaehho/lab4");
+        assert_eq!(row.follow_from.as_deref(), Some("jaehho/lab2"));
         assert_eq!(row.follow_at, Some(at(20).timestamp()));
+    }
+
+    #[test]
+    fn the_end_of_a_wait_and_its_row_are_one_write() {
+        let s = store();
+        s.gh_link("jaehho/lab", "/cal/work/").unwrap();
+        let wait = |s: &Store| {
+            s.gh_rename("jaehho/lab", "jaehho/lab2", Some(at(18)), None)
+                .unwrap();
+            s.gh_log_add(&NewLog {
+                at: at(18),
+                repo: "jaehho/lab2",
+                list: Some("/cal/work/"),
+                kind: "list-renaming",
+                text: "renaming",
+                data: None,
+                by: "auto",
+            })
+            .unwrap()
+        };
+        let intent = wait(&s);
+        // The marker cannot be cleared: the row must not say it ended
+        s.conn
+            .execute_batch(
+                "CREATE TRIGGER keep_marker BEFORE UPDATE OF follow_from ON gh_links
+                 BEGIN SELECT RAISE(ABORT, 'no'); END;",
+            )
+            .unwrap();
+        let ended = Ended::Row {
+            id: intent,
+            kind: "list-renamed",
+            text: "renamed",
+        };
+        assert!(s.gh_end_follow("jaehho/lab2", ended).is_err());
+        assert_eq!(s.gh_log_recent(None, 5).unwrap()[0].kind, "list-renaming");
+        assert!(s.gh_link_rows().unwrap()[0].follow_from.is_some());
+        let new = NewLog {
+            at: at(19),
+            repo: "jaehho/lab2",
+            list: None,
+            kind: "list-kept",
+            text: "kept",
+            data: None,
+            by: "auto",
+        };
+        assert!(s.gh_end_follow("jaehho/lab2", Ended::New(new)).is_err());
+        assert_eq!(s.gh_log_recent(None, 5).unwrap().len(), 1, "no row either");
+
+        // Allowed, both happen: a row begun is changed, or one is written
+        s.conn.execute_batch("DROP TRIGGER keep_marker").unwrap();
+        s.gh_end_follow("jaehho/lab2", ended).unwrap();
+        let log = s.gh_log_recent(None, 5).unwrap();
+        assert_eq!((log.len(), log[0].kind.as_str()), (1, "list-renamed"));
+        assert_eq!(log[0].text, "renamed");
+        assert!(s.gh_link_rows().unwrap()[0].follow_from.is_none());
+        s.gh_rename("jaehho/lab2", "jaehho/lab3", Some(at(20)), None)
+            .unwrap();
+        s.gh_end_follow("jaehho/lab3", Ended::New(new)).unwrap();
+        let log = s.gh_log_recent(None, 5).unwrap();
+        assert_eq!((log.len(), log[0].kind.as_str()), (2, "list-kept"));
+        let row = &s.gh_link_rows().unwrap()[0];
+        assert_eq!((row.follow_from.clone(), row.follow_at), (None, None));
     }
 
     #[test]
