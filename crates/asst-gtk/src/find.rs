@@ -94,6 +94,20 @@ fn header(text: &str) -> gtk::ListBoxRow {
     row
 }
 
+/// What a query with no hit shows. Not selectable, so Enter closes.
+fn no_matches() -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::builder()
+        .activatable(false)
+        .selectable(false)
+        .build();
+    let l = ui::label("No matches", &["dim-label"]);
+    l.set_margin_top(12);
+    l.set_margin_bottom(12);
+    l.set_margin_start(9);
+    row.set_child(Some(&l));
+    row
+}
+
 /// A result: `title` is markup; under it a plain subtitle and a line of
 /// notes (markup).
 fn result_row(
@@ -258,8 +272,9 @@ pub fn open(
                     );
                 }
             }
+            // Nothing is selected until a query is typed or Down is pressed,
+            // so Enter on an empty field closes instead of picking a view.
             if q.is_empty() {
-                select_first(&results);
                 return;
             }
             let where_ = |t: &TaskView| match &t.task.due {
@@ -295,6 +310,9 @@ pub fn open(
             }
             select_first(&results);
             if q.chars().count() < 2 {
+                if hits.borrow().is_empty() {
+                    results.append(&no_matches());
+                }
                 return;
             }
             // Completed tasks are the daemon's to search.
@@ -314,8 +332,14 @@ pub fn open(
                     if generation.get() != this {
                         return;
                     }
-                    let Ok(done) = r else { return };
+                    // A failed search counts as none: the rest was found here.
+                    let done = r.unwrap_or_default();
                     if done.is_empty() {
+                        // Said once the daemon has answered, so a hit among
+                        // the completed tasks does not replace it.
+                        if hits.borrow().is_empty() {
+                            results.append(&no_matches());
+                        }
                         return;
                     }
                     results.append(&header("Completed"));
@@ -367,10 +391,19 @@ pub fn open(
     {
         let results = results.clone();
         let activate = activate.clone();
-        search.connect_activate(move |_| {
-            if let Some(row) = results.selected_row() {
-                activate(&row);
+        let dialog = dialog.clone();
+        search.connect_activate(move |_| match results.selected_row() {
+            Some(row) => activate(&row),
+            None => {
+                dialog.close();
             }
+        });
+    }
+    {
+        // A SearchEntry takes Esc as stop-search, so the dialog never sees it.
+        let dialog = dialog.clone();
+        search.connect_stop_search(move |_| {
+            dialog.close();
         });
     }
     {
