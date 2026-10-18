@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use asst_core::fmt;
 use asst_core::store::Row;
-use asst_core::task::priority_level;
+use asst_core::task::{Task, priority_level};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use futures_util::StreamExt;
 use zbus::zvariant::Value;
 
@@ -21,6 +22,9 @@ use crate::daemon::Daemon;
 
 /// An alarm missed by more than this (laptop off) is not worth a notification.
 const GRACE: chrono::Duration = chrono::Duration::hours(12);
+
+/// How much of a task's notes a notification carries.
+const NOTE_CHARS: usize = 120;
 
 #[zbus::proxy(
     interface = "org.freedesktop.Notifications",
@@ -241,25 +245,12 @@ async fn show(
     replaces: u32,
 ) -> zbus::Result<u32> {
     let now = Utc::now().with_timezone(&daemon.zone);
-    let mut body = Vec::new();
-    if let Some(due) = &row.task.due {
-        let when = fmt::due_label(due, now);
-        // An alarm at the due time lands a few ms after it; that is "due", not late.
-        let grace = now - chrono::Duration::minutes(1);
-        body.push(if fmt::is_overdue(due, grace) {
-            format!("Overdue, due {when}")
-        } else {
-            format!("Due {when}")
-        });
-    }
-    if let Some(list) = daemon
+    let list = daemon
         .store()
         .lists()
         .ok()
-        .and_then(|ls| ls.into_iter().find(|l| l.href == row.list))
-    {
-        body.push(list.name);
-    }
+        .and_then(|ls| ls.into_iter().find(|l| l.href == row.list));
+    let body = body(&row.task, list.as_ref().map(|l| l.name.as_str()), now);
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
     hints.insert("desktop-entry", Value::from(asst_core::config::APP_ID));
     if priority_level(row.task.priority) == 1 {
@@ -276,12 +267,52 @@ async fn show(
             replaces,
             asst_core::config::APP_ID,
             &row.task.summary,
-            &body.join(" · "),
+            &body,
             &actions,
             hints,
             -1,
         )
         .await
+}
+
+/// The lines under a notification's title: when it is due and in which
+/// list, then the first line of its notes.
+fn body(task: &Task, list: Option<&str>, now: DateTime<Tz>) -> String {
+    let mut facts = Vec::new();
+    if let Some(due) = &task.due {
+        let when = fmt::due_label(due, now);
+        // An alarm at the due time lands a few ms after it; that is "due", not late.
+        let grace = now - chrono::Duration::minutes(1);
+        facts.push(if fmt::is_overdue(due, grace) {
+            format!("Overdue, due {when}")
+        } else {
+            // A reminder set ahead says how long is left: "in 30 min" tells
+            // more than "today 12:08am". A date has no time to count to.
+            let zone = now.timezone();
+            let left = if due.has_time() {
+                fmt::until_label(due.instant(zone).with_timezone(&zone), now)
+            } else {
+                None
+            };
+            format!("Due {}", left.unwrap_or(when))
+        });
+    }
+    facts.extend(list.map(str::to_string));
+    let mut body = facts.join(" · ");
+    let first = task
+        .description
+        .as_deref()
+        .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()));
+    if let Some(line) = first {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.extend(line.chars().take(NOTE_CHARS));
+        if line.chars().count() > NOTE_CHARS {
+            body.push('…');
+        }
+    }
+    body
 }
 
 /// A notification's actions as (key, label), in the order they show:
@@ -446,7 +477,7 @@ mod tests {
     use asst_core::config::Config;
     use asst_core::store::Store;
     use asst_core::time::Trigger;
-    use chrono_tz::Tz;
+    use chrono::TimeZone;
 
     use super::*;
 
@@ -588,6 +619,76 @@ mod tests {
         assert!(outage.over(), "the server took one");
         assert!(!outage.over());
         assert!(outage.failed(&down), "the next outage is said again");
+    }
+
+    /// 12:08am on Sunday, 18 October 2026.
+    fn midnight_ish() -> DateTime<Tz> {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        zone.with_ymd_and_hms(2026, 10, 18, 0, 8, 0).unwrap()
+    }
+
+    /// An open task due `minutes` after `midnight_ish()`, or on a date.
+    fn due_task(due: Option<(i64, bool)>, notes: Option<&str>) -> Task {
+        let at = midnight_ish();
+        let due = due.map(|(minutes, timed)| {
+            let at = at + chrono::Duration::minutes(minutes);
+            if timed {
+                serde_json::json!({
+                    "kind": "zoned",
+                    "at": at.naive_local().to_string().replace(' ', "T"),
+                    "tzid": "America/New_York",
+                })
+            } else {
+                serde_json::json!({ "kind": "date", "date": at.date_naive() })
+            }
+        });
+        serde_json::from_value(serde_json::json!({
+            "uid": "u1",
+            "summary": "Call the bank",
+            "status": "needs-action",
+            "priority": 0,
+            "due": due,
+            "description": notes,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_body_says_how_long_is_left_and_the_notes_first_line() {
+        let now = midnight_ish();
+        let body = |due, notes, list| body(&due_task(due, notes), list, now);
+
+        // An alarm at the due time rings a moment after it: due, not late.
+        assert_eq!(
+            body(Some((0, true)), None, Some("Work")),
+            "Due today 12:08am · Work"
+        );
+        // Ahead of it, how long is left; further than that, when.
+        assert_eq!(body(Some((30, true)), None, None), "Due in 30 min");
+        assert_eq!(body(Some((3 * 60, true)), None, None), "Due in 3 h");
+        assert_eq!(body(Some((13 * 60, true)), None, None), "Due today 1:08pm");
+        // A date has no time to count to, however near its midnight.
+        assert_eq!(body(Some((60, false)), None, None), "Due today");
+        // Late by more than the minute an alarm may be.
+        assert_eq!(
+            body(Some((-90, true)), None, None),
+            "Overdue, due yesterday 10:38pm"
+        );
+
+        // Only the first line of the notes, under the rest.
+        let notes = Some("\n  Ask about the fee \nthen the card");
+        assert_eq!(
+            body(Some((30, true)), notes, Some("Work")),
+            "Due in 30 min · Work\nAsk about the fee"
+        );
+        assert_eq!(body(None, notes, None), "Ask about the fee");
+        assert_eq!(body(None, Some(" \n "), None), "");
+        let long = "x".repeat(NOTE_CHARS + 1);
+        let cut = body(None, Some(&long), None);
+        assert_eq!(cut.chars().count(), NOTE_CHARS + 1);
+        assert!(cut.ends_with('…'));
+        let fits = "x".repeat(NOTE_CHARS);
+        assert_eq!(body(None, Some(&fits), None), fits);
     }
 
     fn plan(uid: Option<&str>, step: Step) -> Plan<'_> {

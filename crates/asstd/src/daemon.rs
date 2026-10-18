@@ -782,8 +782,13 @@ impl Daemon {
         };
         if let Some(d) = &due {
             edits.push(Edit::Due(d.clone()));
+            // The default reminder is for a task that is getting a time. One
+            // that had a time and has no alarm has none by choice (cleared
+            // here, or on the phone), and a new time does not bring it back.
+            let had_time = row.task.due.as_ref().is_some_and(When::has_time);
             if change.alarms.is_none()
                 && row.task.alarms.is_empty()
+                && !had_time
                 && let Some(a) = self.due_alarm(d)
             {
                 edits.push(Edit::Alarms(vec![a]));
@@ -1489,6 +1494,70 @@ mod tests {
             daemon.store().snoozed().unwrap().is_empty(),
             "completing forgets the snooze"
         );
+    }
+
+    #[test]
+    fn a_new_time_brings_back_the_default_reminder_only_to_a_task_without_one() {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        store
+            .apply_lists(&[caldav::RemoteList {
+                href: "/cal/work/".into(),
+                name: "Work".into(),
+                color: None,
+                order: None,
+                sync_token: Some("t1".into()),
+                ctag: None,
+                writable: true,
+            }])
+            .unwrap();
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        let add = |text: &str, due: &str| {
+            let spec = AddSpec {
+                text: text.into(),
+                due_text: Some(due.into()),
+                list: Some("work".into()),
+                ..AddSpec::default()
+            };
+            daemon.add(&spec).unwrap().task
+        };
+        let due = |id: &str, text: &str| {
+            let change = Change {
+                due_text: Some(text.into()),
+                ..Change::default()
+            };
+            daemon.edit(id, &change).unwrap()
+        };
+
+        // A reminder cleared on a timed task stays cleared when the time moves.
+        let timed = add("Call the bank", "tomorrow 9am");
+        assert_eq!(timed.task.alarms.len(), 1, "added with the default");
+        let clear = Change {
+            alarms: Some(vec![]),
+            ..Change::default()
+        };
+        assert!(
+            daemon
+                .edit(&timed.id, &clear)
+                .unwrap()
+                .task
+                .alarms
+                .is_empty()
+        );
+        assert!(due(&timed.id, "tomorrow 10am").task.alarms.is_empty());
+        assert!(due(&timed.id, "fri 3pm").task.alarms.is_empty());
+
+        // A task given a time for the first time gets one, as when added.
+        let dated = add("Pay rent", "tomorrow");
+        assert!(
+            dated.task.alarms.is_empty(),
+            "a date has nothing to ring at"
+        );
+        assert_eq!(due(&dated.id, "tomorrow 9am").task.alarms.len(), 1);
+
+        // And a time taken away and given again is a first time again.
+        due(&timed.id, "none");
+        assert_eq!(due(&timed.id, "tomorrow 9am").task.alarms.len(), 1);
     }
 
     #[test]

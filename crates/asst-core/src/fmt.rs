@@ -67,14 +67,17 @@ pub fn minutes(m: u64) -> String {
     }
 }
 
-/// `in 25 min`, `in 3 h`, for a notification body.
+/// `in 25 min`, `in 3 h`, for a notification body. Rounded, since an
+/// alarm 30 minutes before a time rings a moment after the half hour, and
+/// that is still "in 30 min".
 pub fn until_label(at: DateTime<Tz>, now: DateTime<Tz>) -> Option<String> {
     let d = at - now;
     (d > Duration::zero() && d < Duration::hours(12)).then(|| {
-        if d < Duration::hours(1) {
-            format!("in {} min", d.num_minutes().max(1))
+        let mins = (d.num_seconds() + 30) / 60;
+        if mins < 60 {
+            format!("in {} min", mins.max(1))
         } else {
-            format!("in {} h", (d.num_minutes() + 30) / 60)
+            format!("in {} h", (mins + 30) / 60)
         }
     })
 }
@@ -283,6 +286,21 @@ mod tests {
             until_label(now + Duration::minutes(25), now).as_deref(),
             Some("in 25 min")
         );
+        // The alarm for "30 minutes before" rings milliseconds late.
+        let late = |ms| now + Duration::minutes(30) + Duration::milliseconds(ms);
+        assert_eq!(until_label(late(0), now).as_deref(), Some("in 30 min"));
+        assert_eq!(until_label(late(-15), now).as_deref(), Some("in 30 min"));
+        assert_eq!(
+            until_label(now + Duration::seconds(3590), now).as_deref(),
+            Some("in 1 h"),
+            "not 60 min"
+        );
+        assert_eq!(
+            until_label(now + Duration::seconds(10), now).as_deref(),
+            Some("in 1 min")
+        );
+        assert_eq!(until_label(now - Duration::seconds(1), now), None);
+        assert_eq!(until_label(now + Duration::hours(12), now), None);
         let words: Vec<String> = [10, 60, 90, 1440, 2880].map(minutes).into();
         assert_eq!(words, ["10 min", "1 h", "1 h 30 min", "1 day", "2 days"]);
     }
