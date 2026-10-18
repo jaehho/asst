@@ -5,13 +5,20 @@
 //! - `p1`…`p4`: priority
 //! - a date and/or time: `today`, `tomorrow`, `fri`, `next monday`,
 //!   `in 3 days`, `in 2h`, `sep 20`, `20 sep`, `9/20`, `2026-09-20`,
-//!   `5pm`, `17:30`, `at 9`, `noon`, `midnight`, `tonight`, `this evening`,
-//!   `tomorrow morning`
+//!   `5pm`, `5 p.m.`, `17:30`, `at 9`, `noon`, `midnight`, `tonight`,
+//!   `this evening`, `tomorrow morning`
 //! - a repeat: `every day`, `daily`, `every weekday`, `every 2 weeks`,
 //!   `every mon, thu`, `every 15th`, `monthly`, with an optional time
 //! - `!`: remind at the due time; `!30m`, `!2h`, `!1d` before it; `!9am` at a time
 //!
 //! The first date wins; a later date-like word stays in the title.
+//!
+//! Punctuation against a word is ignored when matching and goes with it out
+//! of the title: `(tomorrow at 5pm).`, `@5pm`, `#errands,`, `p1.`.
+//!
+//! A time without am/pm reads as a clock face: `at 5` and `5:30` are 5pm
+//! (1 to 7 is the afternoon), `at 9` and `9:30` are 9am, `17:30` and
+//! `07:30` are 24-hour.
 
 use std::ops::Range;
 
@@ -46,9 +53,52 @@ pub struct Parsed {
 }
 
 struct Tok<'a> {
+    /// As typed: what the title keeps when nothing matches.
     text: &'a str,
+    /// `text` without the punctuation around it.
+    core: &'a str,
+    /// `core`, lower case and with `p.m.` written `pm`: what phrases match.
     lower: String,
     span: Range<usize>,
+}
+
+impl<'a> Tok<'a> {
+    fn new(text: &'a str, span: Range<usize>) -> Self {
+        let core = trim_word(text);
+        Tok {
+            text,
+            core,
+            lower: undotted_meridiem(&core.to_lowercase()),
+            span,
+        }
+    }
+}
+
+/// Punctuation that sits against a word without being part of it:
+/// `(tomorrow`, `"@5pm`, `5pm.`, `#errands,`.
+const OPENING: &[char] = &['"', '\'', '~', '@', '('];
+const CLOSING: &[char] = &['.', ',', ';', ':', '?', ')', '"', '\''];
+
+fn trim_word(text: &str) -> &str {
+    let word = text.trim_start_matches(OPENING);
+    if word.starts_with('!') {
+        // An alarm's own `!` is not trailing punctuation: `!`, `!30m.`
+        word.trim_end_matches(CLOSING)
+    } else {
+        word.trim_end_matches(|c| c == '!' || CLOSING.contains(&c))
+    }
+}
+
+/// `p.m` and `5:30a.m` as `pm` and `5:30am`.
+fn undotted_meridiem(s: &str) -> String {
+    for (dotted, plain) in [("a.m", "am"), ("p.m", "pm")] {
+        if let Some(head) = s.strip_suffix(dotted)
+            && head.chars().next_back().is_none_or(|c| c.is_ascii_digit())
+        {
+            return format!("{head}{plain}");
+        }
+    }
+    s.to_string()
 }
 
 fn tokenize(text: &str) -> Vec<Tok<'_>> {
@@ -60,12 +110,7 @@ fn tokenize(text: &str) -> Vec<Tok<'_>> {
     {
         match (c.is_whitespace(), start) {
             (true, Some(s)) => {
-                let t = &text[s..i];
-                toks.push(Tok {
-                    text: t,
-                    lower: t.to_lowercase(),
-                    span: s..i,
-                });
+                toks.push(Tok::new(&text[s..i], s..i));
                 start = None;
             }
             (false, None) => start = Some(i),
@@ -221,7 +266,7 @@ pub fn parse_when(text: &str, now: DateTime<Tz>) -> Option<When> {
 
 fn match_at(toks: &[Tok], i: usize, now: DateTime<Tz>, lists: &[String]) -> Option<(usize, Hit)> {
     let t = &toks[i];
-    if let Some(name) = t.text.strip_prefix('#').filter(|n| !n.is_empty()) {
+    if let Some(name) = t.core.strip_prefix('#').filter(|n| !n.is_empty()) {
         return find_list(name, lists).map(|l| (1, Hit::List(l)));
     }
     if let Some(p) = t
@@ -233,22 +278,15 @@ fn match_at(toks: &[Tok], i: usize, now: DateTime<Tz>, lists: &[String]) -> Opti
     {
         return Some((1, Hit::Priority(p)));
     }
-    if let Some(rest) = t.text.strip_prefix('!') {
+    if let Some(rest) = t.core.strip_prefix('!') {
         if rest.is_empty() {
             return Some((1, Hit::Alarm(AlarmSpec::AtDue)));
         }
-        if let Some(d) = short_duration(&rest.to_lowercase()) {
+        let rest = Tok::new(rest, 0..0);
+        if let Some(d) = short_duration(&rest.lower) {
             return Some((1, Hit::Alarm(AlarmSpec::Before(d))));
         }
-        if let Some((_, time)) = time_at(
-            &[Tok {
-                text: rest,
-                lower: rest.to_lowercase(),
-                span: 0..0,
-            }],
-            0,
-            false,
-        ) {
+        if let Some((_, time)) = time_at(&[rest], 0, false) {
             return Some((1, Hit::Alarm(AlarmSpec::At(time))));
         }
         return None;
@@ -291,7 +329,7 @@ fn short_duration(s: &str) -> Option<Duration> {
 }
 
 fn weekday(s: &str) -> Option<Weekday> {
-    Some(match s.trim_end_matches(',') {
+    Some(match s {
         "monday" | "mon" => Weekday::Mon,
         "tuesday" | "tue" | "tues" => Weekday::Tue,
         "wednesday" | "wed" => Weekday::Wed,
@@ -311,7 +349,7 @@ fn ambiguous_weekday(s: &str) -> bool {
 /// A part of the day, after a day that names it (`tomorrow morning`, `this
 /// evening`): alone, "morning" is too often just a word.
 fn part_of_day(s: &str) -> Option<NaiveTime> {
-    let hour = match s.trim_end_matches(',') {
+    let hour = match s {
         "morning" => 9,
         "afternoon" => 14,
         "evening" => 18,
@@ -332,7 +370,6 @@ fn tonight(now: DateTime<Tz>) -> NaiveTime {
 }
 
 fn month(s: &str) -> Option<u32> {
-    let s = s.trim_end_matches([',', '.']);
     const NAMES: [&str; 12] = [
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
@@ -356,7 +393,6 @@ fn month(s: &str) -> Option<u32> {
 }
 
 fn day_number(s: &str) -> Option<u32> {
-    let s = s.trim_end_matches(',');
     let digits = s
         .trim_end_matches("st")
         .trim_end_matches("nd")
@@ -399,7 +435,7 @@ fn time_at(toks: &[Tok], i: usize, needs_marker: bool) -> Option<(usize, NaiveTi
         "midnight" => return Some((1, NaiveTime::from_hms_opt(23, 59, 0)?)),
         _ => {}
     }
-    let s = t.lower.trim_end_matches(',');
+    let s = t.lower.as_str();
     let (body, mut meridiem) = if let Some(b) = s.strip_suffix("am").or_else(|| s.strip_suffix('a'))
     {
         (b, Some(false))
@@ -418,7 +454,7 @@ fn time_at(toks: &[Tok], i: usize, needs_marker: bool) -> Option<(usize, NaiveTi
     }
     let mut n = 1;
     if meridiem.is_none() {
-        match toks.get(i + 1).map(|t| t.lower.trim_end_matches(',')) {
+        match toks.get(i + 1).map(|t| t.lower.as_str()) {
             Some("am") => (meridiem, n) = (Some(false), 2),
             Some("pm") => (meridiem, n) = (Some(true), 2),
             _ => {}
@@ -427,9 +463,10 @@ fn time_at(toks: &[Tok], i: usize, needs_marker: bool) -> Option<(usize, NaiveTi
     let hour = match meridiem {
         Some(pm) if (1..=12).contains(&h) => (h % 12) + if pm { 12 } else { 0 },
         Some(_) => return None,
-        None if body.contains(':') => h,
-        // "at 5" is a time of day people mean in waking hours.
-        None if !needs_marker && (1..=12).contains(&h) => {
+        // "17:30" and "07:30" are 24-hour times.
+        None if body.contains(':') && (!(1..=12).contains(&h) || body.starts_with('0')) => h,
+        // "at 5" and "5:30" are times of day people mean in waking hours.
+        None if (1..=12).contains(&h) && (body.contains(':') || !needs_marker) => {
             if h <= 7 {
                 h + 12
             } else {
@@ -478,8 +515,7 @@ fn day_at(toks: &[Tok], i: usize, today: NaiveDate) -> Option<(usize, NaiveDate)
                 "a" | "an" | "one" => 1,
                 other => other.parse().ok()?,
             };
-            let unit = toks.get(i + 2)?.lower.trim_end_matches(',').to_string();
-            let date = match unit.as_str() {
+            let date = match toks.get(i + 2)?.lower.as_str() {
                 "day" | "days" | "d" => today + Duration::days(n),
                 "week" | "weeks" | "w" => today + Duration::weeks(n),
                 "month" | "months" => today.checked_add_months(chrono::Months::new(n as u32))?,
@@ -500,7 +536,7 @@ fn day_at(toks: &[Tok], i: usize, today: NaiveDate) -> Option<(usize, NaiveDate)
     // sep 20 [2027] / 20 sep [2027]
     let year_at = |j: usize| {
         toks.get(j)
-            .and_then(|t| t.lower.trim_end_matches(',').parse::<i32>().ok())
+            .and_then(|t| t.lower.parse::<i32>().ok())
             .filter(|y| (2000..2200).contains(y))
     };
     if let (Some(m), Some(d)) = (month(t), next.and_then(day_number)) {
@@ -662,8 +698,7 @@ fn repeat_at(toks: &[Tok], i: usize, now: DateTime<Tz>) -> Option<(usize, Hit)> 
         "monthly" => (1, simple("MONTHLY")),
         "yearly" | "annually" => (1, simple("YEARLY")),
         "every" => {
-            let next = toks.get(i + 1)?.lower.trim_end_matches(',').to_string();
-            match next.as_str() {
+            match toks.get(i + 1)?.lower.as_str() {
                 "day" => (2, simple("DAILY")),
                 "week" => (2, simple("WEEKLY")),
                 "month" => (2, simple("MONTHLY")),
@@ -687,8 +722,7 @@ fn repeat_at(toks: &[Tok], i: usize, now: DateTime<Tz>) -> Option<(usize, Hit)> 
                 ),
                 other => {
                     if let Ok(k) = other.parse::<u32>() {
-                        let unit = toks.get(i + 2)?.lower.trim_end_matches(',').to_string();
-                        let freq = match unit.as_str() {
+                        let freq = match toks.get(i + 2)?.lower.as_str() {
                             "days" | "day" => "DAILY",
                             "weeks" | "week" => "WEEKLY",
                             "months" | "month" => "MONTHLY",
@@ -708,7 +742,7 @@ fn repeat_at(toks: &[Tok], i: usize, now: DateTime<Tz>) -> Option<(usize, Hit)> 
                         let mut days = Vec::new();
                         let mut j = i + 1;
                         while let Some(tok) = toks.get(j) {
-                            let w = tok.lower.trim_end_matches(',');
+                            let w = tok.lower.as_str();
                             if let Some(wd) = weekday(w) {
                                 if !days.contains(&wd) {
                                     days.push(wd);
@@ -981,6 +1015,120 @@ mod tests {
             "first date wins"
         );
         assert_eq!(p("#work Fix the bug").list.as_deref(), Some("Work stuff"));
+    }
+
+    #[test]
+    fn punctuation_around_a_date_or_time_is_not_part_of_it() {
+        // (typed, what the title keeps, due)
+        let rows = [
+            ("Call mom tomorrow at 5pm.", "Call mom", at(9, 15, 17, 0)),
+            ("tomorrow, 5pm", "", at(9, 15, 17, 0)),
+            ("x 5 p.m.", "x", at(9, 14, 17, 0)),
+            ("x 7p.m.", "x", at(9, 14, 19, 0)),
+            ("x 7:30 A.M.", "x", at(9, 15, 7, 30)),
+            ("x @5pm", "x", at(9, 14, 17, 0)),
+            ("(tomorrow at 5pm)", "", at(9, 15, 17, 0)),
+            ("Call mom (tomorrow at 5pm)", "Call mom", at(9, 15, 17, 0)),
+            ("x \"tomorrow 5pm\"", "x", at(9, 15, 17, 0)),
+            ("Wed. 3pm standup", "standup", at(9, 16, 15, 0)),
+            ("Call at 5:30", "Call", at(9, 14, 17, 30)),
+            ("x in 2h?", "x", at(9, 14, 12, 0)),
+            ("x by fri;", "x", date(9, 18)),
+            ("x sep. 20,", "x", date(9, 20)),
+        ];
+        for (text, summary, due) in rows {
+            let r = p(text);
+            assert_eq!((r.summary.as_str(), r.due), (summary, Some(due)), "{text}");
+        }
+        let r = p("Call mom tomorrow at 5pm.");
+        assert_eq!(
+            &"Call mom tomorrow at 5pm."[r.spans[0].0.clone()],
+            "tomorrow at 5pm.",
+            "the highlight covers what leaves the title"
+        );
+        let r = p("x every mon, thu. at 6pm");
+        assert_eq!(r.rrule.as_deref(), Some("FREQ=WEEKLY;BYDAY=MO,TH"));
+    }
+
+    #[test]
+    fn punctuation_around_a_list_or_priority_is_not_part_of_it() {
+        let r = p("Email Bob #errands,");
+        assert_eq!(r.summary, "Email Bob");
+        assert_eq!(r.list.as_deref(), Some("Errands"));
+        let r = p("Pay rent p1.");
+        assert_eq!(r.summary, "Pay rent");
+        assert_eq!(r.priority, Some(1));
+        let r = p("(#work) (p2)");
+        assert_eq!(r.summary, "");
+        assert_eq!(
+            (r.list.as_deref(), r.priority),
+            (Some("Work stuff"), Some(2))
+        );
+    }
+
+    #[test]
+    fn an_alarm_keeps_its_bang_and_loses_the_punctuation_after_it() {
+        let due = at(9, 15, 17, 0).instant(now().timezone());
+        let before = Some(Trigger::Relative {
+            offset: Duration::minutes(-30),
+            from_due: false,
+        });
+        let r = p("x tomorrow 5pm !30m.");
+        assert_eq!((r.summary.as_str(), r.alarm), ("x", before));
+        let r = p("x tomorrow 5pm (!)");
+        assert_eq!(
+            (r.summary.as_str(), r.alarm),
+            ("x", Some(Trigger::Absolute { at: due }))
+        );
+        let r = p("x tomorrow !9a.m.");
+        let nine = at(9, 15, 9, 0).instant(now().timezone());
+        assert_eq!(
+            (r.summary.as_str(), r.alarm),
+            ("x", Some(Trigger::Absolute { at: nine }))
+        );
+        let r = p("x tomorrow 5pm !!");
+        assert_eq!(
+            (r.summary.as_str(), r.alarm),
+            ("x !!", None),
+            "not a bare !"
+        );
+    }
+
+    #[test]
+    fn punctuation_does_not_make_ordinary_words_dates() {
+        for text in [
+            "Hello, world (draft).",
+            "Read chapter 5.",
+            "We sat.",
+            "Plan may trip?",
+            "Wow!",
+            "Is it a.m.?",
+        ] {
+            let r = p(text);
+            assert_eq!((r.summary.as_str(), r.due), (text, None), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_clock_time_without_am_or_pm_reads_like_a_bare_hour() {
+        // "now" is 10:00: an hour before that is for tomorrow.
+        let rows = [
+            ("x at 5:30", at(9, 14, 17, 30)),
+            ("x 5:30", at(9, 14, 17, 30)),
+            ("x tomorrow 1:15", at(9, 15, 13, 15)),
+            ("x 11:15", at(9, 14, 11, 15)),
+            ("x at 8:15", at(9, 15, 8, 15)),
+            ("x 12:30", at(9, 14, 12, 30)),
+            ("x 17:30", at(9, 14, 17, 30)),
+            ("x 07:30", at(9, 15, 7, 30)),
+            ("x 0:30", at(9, 15, 0, 30)),
+            ("x every day at 6:30", at(9, 14, 18, 30)),
+        ];
+        for (text, due) in rows {
+            assert_eq!(p(text).due, Some(due), "{text}");
+        }
+        assert_eq!(p("x 9:30am").due, Some(at(9, 15, 9, 30)), "am still wins");
+        assert_eq!(p("Read chapter 5").summary, "Read chapter 5");
     }
 
     #[test]
