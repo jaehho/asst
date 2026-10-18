@@ -164,6 +164,10 @@ impl Service {
         json(&self.daemon.links().map_err(failed)?)
     }
 
+    async fn link_log(&self, repo: &str, limit: u32) -> fdo::Result<String> {
+        json(&self.daemon.link_log(repo, limit).map_err(failed)?)
+    }
+
     async fn settings(&self) -> fdo::Result<String> {
         json(&self.daemon.settings())
     }
@@ -183,7 +187,7 @@ impl Service {
     async fn login_done(emitter: &SignalEmitter<'_>, ok: bool, message: &str) -> zbus::Result<()>;
 }
 
-/// Turn daemon events into signals.
+/// Turn daemon events into signals, and notices into notifications.
 pub async fn pump(conn: zbus::Connection, mut events: tokio::sync::mpsc::UnboundedReceiver<Event>) {
     let emitter = match SignalEmitter::new(&conn, asst_core::api::OBJECT_PATH) {
         Ok(e) => e,
@@ -213,6 +217,17 @@ pub async fn pump(conn: zbus::Connection, mut events: tokio::sync::mpsc::Unbound
                     .await
                 }
                 Event::LoginDone(ok, message) => Service::login_done(&emitter, ok, &message).await,
+                Event::Notice { summary, body } => {
+                    // Apart from the signals: no notification service must
+                    // not hold them up.
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::location::tell(&conn, &summary, &body).await {
+                            log::warn!("showing a notification: {e}");
+                        }
+                    });
+                    Ok(())
+                }
             };
             if let Err(e) = result {
                 log::warn!("emitting a signal: {e}");

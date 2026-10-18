@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::github::FollowRename;
 use crate::store::{Block, Query, Row};
 use crate::task::Task;
 use crate::time::{Trigger, When};
@@ -71,6 +72,10 @@ pub trait Asst {
     fn unlink(&self, repo: &str) -> zbus::Result<bool>;
     /// → `[LinkView]`
     fn links(&self) -> zbus::Result<String>;
+    /// `owner/repo` (any case; `""` for every repo), how many rows at most
+    /// (the log keeps 500) → `[store::LogRow]`, newest first: what asstd
+    /// changed or decided about a link by itself, and why.
+    fn link_log(&self, repo: &str, limit: u32) -> zbus::Result<String>;
     /// → `Settings`
     fn settings(&self) -> zbus::Result<String>;
     /// `SettingsChange` → `Settings`, saved to `config.toml`.
@@ -132,8 +137,54 @@ pub struct ListView {
     pub done: usize,
 }
 
-/// A GitHub repo whose issues are synced with a list.
+/// Why a link is worth a look beyond whether its last pass worked. A link
+/// with none of these is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkState {
+    /// GitHub says the repo is archived or disabled.
+    Archived,
+    /// The repo was renamed and the list has not followed.
+    Renamed,
+    /// GitHub cannot find the repo: deleted, or the token cannot see it.
+    Unreachable,
+    /// The name belongs to another repo than the one that was linked.
+    Replaced,
+    /// Two links claim one repo.
+    Conflict,
+}
+
+impl LinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkState::Archived => "archived",
+            LinkState::Renamed => "renamed",
+            LinkState::Unreachable => "unreachable",
+            LinkState::Replaced => "replaced",
+            LinkState::Conflict => "conflict",
+        }
+    }
+
+    /// The link's issues are not read while this holds, so nothing syncs.
+    pub fn stalls(self) -> bool {
+        matches!(
+            self,
+            LinkState::Unreachable | LinkState::Replaced | LinkState::Conflict
+        )
+    }
+}
+
+/// A repo rename the repo's list has not followed yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRename {
+    /// The repo's name before the rename.
+    pub from: String,
+    /// When asstd saw the rename.
+    pub since: DateTime<Utc>,
+}
+
+/// A GitHub repo whose issues are synced with a list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkView {
     /// `owner/repo`.
     pub repo: String,
@@ -147,6 +198,23 @@ pub struct LinkView {
     /// Why the last pass failed, until one succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// GitHub's id for the repo, which a rename leaves alone; learned on
+    /// the first look at it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<u64>,
+    /// Absent when the link is fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<LinkState>,
+    /// The state in a sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When the state began, if asst knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// The repo was renamed and its list has yet to follow. Kept apart from
+    /// `state`, which names only the most pressing thing about the link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_rename: Option<PendingRename>,
 }
 
 /// The GitHub issue a task is paired with.
@@ -367,6 +435,9 @@ pub struct Settings {
     /// Minutes before the due time that reminder rings.
     #[serde(default)]
     pub alarm_before: u32,
+    /// Whether a list named for a repo is renamed when the repo is.
+    #[serde(default)]
+    pub follow_rename: FollowRename,
 }
 
 /// Absent means unchanged; `inbox: null` goes back to the default.
@@ -386,6 +457,8 @@ pub struct SettingsChange {
     pub alarm_at_due: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alarm_before: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_rename: Option<FollowRename>,
 }
 
 fn double<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -473,6 +546,86 @@ pub fn short_ids(uids: &[String]) -> std::collections::HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_that_is_fine_looks_as_it_did_before_the_state_fields() {
+        // What an older asstd sends, and an older client reads
+        let old = r#"{"repo":"jaehho/lab","list":"/cal/lab/","name":"lab"}"#;
+        let l: LinkView = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            (l.state, l.note, l.since, l.repo_id, l.pending_rename),
+            (None, None, None, None, None)
+        );
+        let fine = LinkView {
+            repo: "jaehho/lab".into(),
+            list: "/cal/lab/".into(),
+            name: "lab".into(),
+            ..LinkView::default()
+        };
+        assert_eq!(serde_json::to_string(&fine).unwrap(), old);
+
+        // A link with something to say names its state in words
+        let archived = LinkView {
+            repo_id: Some(1379104203),
+            state: Some(LinkState::Archived),
+            note: Some("archived on GitHub, first seen 2026-10-18; no open tasks here".into()),
+            ..fine
+        };
+        let json = serde_json::to_value(&archived).unwrap();
+        assert_eq!(json["state"], "archived");
+        assert_eq!(json["repo_id"], 1379104203);
+        assert_eq!(serde_json::from_value::<LinkView>(json).unwrap(), archived);
+
+        // A rename the list has yet to follow is told apart from the state
+        let waiting = LinkView {
+            pending_rename: Some(PendingRename {
+                from: "jaehho/champalimaud".into(),
+                since: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
+            }),
+            ..archived
+        };
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["pending_rename"]["from"], "jaehho/champalimaud");
+        assert_eq!(json["state"], "archived");
+        assert_eq!(serde_json::from_value::<LinkView>(json).unwrap(), waiting);
+        for (state, word) in [
+            (LinkState::Archived, "archived"),
+            (LinkState::Renamed, "renamed"),
+            (LinkState::Unreachable, "unreachable"),
+            (LinkState::Replaced, "replaced"),
+            (LinkState::Conflict, "conflict"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{word}\"")
+            );
+            assert_eq!(state.as_str(), word);
+        }
+    }
+
+    #[test]
+    fn following_a_rename_is_a_setting_older_peers_do_not_know() {
+        // An older asstd sends settings without it: the default
+        let old = r#"{"interval":60,"snooze":[10],"alarm_at_due":true}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.follow_rename, FollowRename::List);
+        // A change that leaves it alone does not mention it
+        let change = SettingsChange {
+            interval: Some(300),
+            ..SettingsChange::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&change).unwrap(),
+            r#"{"interval":300}"#
+        );
+        let off = SettingsChange {
+            follow_rename: Some(FollowRename::Off),
+            ..SettingsChange::default()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(json, r#"{"follow_rename":"off"}"#);
+        assert_eq!(serde_json::from_str::<SettingsChange>(&json).unwrap(), off);
+    }
 
     #[test]
     fn change_tells_absent_from_null() {

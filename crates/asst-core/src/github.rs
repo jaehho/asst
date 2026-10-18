@@ -3,12 +3,15 @@
 //! and state both sides last agreed on; a pass compares each side with that
 //! base, so it works the same whichever side changed, and a push that
 //! failed is simply found again next time. `plan` decides, the daemon does.
+//! `judge` and `follow_list_name` decide the same way about the repo itself:
+//! whether it is still the one linked, and whether its list follows a rename.
 
 use std::collections::HashSet;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use http::header::{ACCEPT, AUTHORIZATION, HeaderValue};
+use http::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use http::{Method, Request, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::caldav::{self, RemoteError};
 
@@ -235,6 +238,202 @@ fn merge(p: &Pair, i: &Issue, t: &Ref) -> Option<Op> {
     })
 }
 
+/// What one look at a repo means for its link, given what is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Still the repo that is linked, nothing changed.
+    Fine,
+    /// Nothing is stored for this link yet and the name found the repo:
+    /// remember its id (and its archived flag, without a log row).
+    LearnId(u64),
+    /// The repo is called `to` now. `witnessed` is that the link had an id
+    /// and the record under it changed: this is an event. Without an id the
+    /// old name merely redirects, the move is found after the fact, and the
+    /// caller learns the record's id as it moves the link.
+    Renamed { to: String, witnessed: bool },
+    /// Archived or disabled since the last look.
+    Archived,
+    /// No longer archived or disabled.
+    Unarchived,
+    /// The name belongs to another repo (`found` is its id) than the one
+    /// whose id is stored: deleted and made again, or the name was reused.
+    /// Nothing on that repo is the linked project's.
+    Replaced { found: u64 },
+    /// The look settles nothing: no finding, no change.
+    Unknown,
+}
+
+/// Judge one look at the repo linked as `linked`, whose stored id (if any)
+/// and archived baseline (`None`: never observed) are given. One finding
+/// per look, the one that matters most: another repo, then a new name, then
+/// the archived flag.
+///
+/// A redirect names only an id, not the repo's new name, so a `Moved` alone
+/// is not enough to rename by. The caller follows it with a look by that id
+/// and judges the record, which is the "301 then record" case: with an id
+/// stored, a `Moved` to another one is `Replaced` all the same.
+pub fn judge(
+    stored_id: Option<u64>,
+    linked: &str,
+    archived: Option<bool>,
+    seen: &Observed,
+) -> Verdict {
+    let info = match seen {
+        Observed::Record(info, _) => info,
+        // The record behind the ETag is the one already judged.
+        Observed::Unchanged if stored_id.is_some() => return Verdict::Fine,
+        Observed::Moved { id } => {
+            return match stored_id {
+                Some(stored) if stored != *id => Verdict::Replaced { found: *id },
+                _ => Verdict::Unknown,
+            };
+        }
+        Observed::Unchanged | Observed::Missing | Observed::Denied { .. } | Observed::Failed => {
+            return Verdict::Unknown;
+        }
+    };
+    if let Some(stored) = stored_id
+        && stored != info.id
+    {
+        return Verdict::Replaced { found: info.id };
+    }
+    if !info.full_name.eq_ignore_ascii_case(linked) {
+        return Verdict::Renamed {
+            to: info.full_name.clone(),
+            witnessed: stored_id.is_some(),
+        };
+    }
+    if stored_id.is_none() {
+        return Verdict::LearnId(info.id);
+    }
+    let retired = info.archived || info.disabled;
+    match archived {
+        Some(false) if retired => Verdict::Archived,
+        Some(true) if !retired => Verdict::Unarchived,
+        // No baseline yet: first sight, stored without a finding.
+        _ => Verdict::Fine,
+    }
+}
+
+/// What asstd holds itself to when it looks after a link. They are here,
+/// not in the daemon, so that `asst projects --json` says the numbers the
+/// daemon uses and not a copy of them.
+pub mod limits {
+    /// Lists renamed by following a repo, in any hour, at most; a rename
+    /// past it waits for the next pass.
+    pub const RENAMES_PER_HOUR: usize = 3;
+    /// A rename the list has not followed is given up on after this long.
+    pub const MARKER_EXPIRES_DAYS: i64 = 30;
+    /// A refusal that says nothing about when to come back (no
+    /// `Retry-After`, no rate-limit reset) is waited out this long.
+    pub const REFUSED_WAIT_MINUTES: i64 = 15;
+    /// The longest a refusal's own wait is taken at: a rate limit resets
+    /// within the hour, and a header that asks for more (or a clock that
+    /// is off) must not park a link for days.
+    pub const LONGEST_WAIT_MINUTES: i64 = 60;
+    /// A repo whose id GitHub cannot find is asked for by its name this
+    /// often at most, to tell a name taken by another repo from a repo that
+    /// is gone.
+    pub const NAME_LOOKUP_MINUTES: i64 = 60;
+    /// A repo GitHub cannot find for this long gets a hint at `asst unlink`.
+    pub const UNLINK_HINT_DAYS: i64 = 14;
+}
+
+/// Whether a renamed repo renames its list too (`follow_rename` in
+/// `config.toml`): `List` only for a list named exactly for the old repo,
+/// `Off` reports it and leaves the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowRename {
+    #[default]
+    List,
+    Off,
+}
+
+impl FollowRename {
+    /// As `config.toml` and `asst settings` spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FollowRename::List => "list",
+            FollowRename::Off => "off",
+        }
+    }
+}
+
+/// Why a list keeps its name when its repo is renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepWhy {
+    /// The list is not named exactly for the old repo: someone named it.
+    Custom,
+    /// The list already has the new repo's name.
+    AlreadyNamed,
+    /// Only the owner changed; the repo's name, and so the list's, did not.
+    SameName,
+    /// Another list has the new name (in any case).
+    Clash,
+    /// A shared list the user cannot write.
+    ReadOnly,
+    /// `config.inbox` is a list name; renaming it would lose the inbox.
+    Inbox,
+    /// `follow_rename = "off"`.
+    Off,
+    /// The new repo name has no name part to give a list.
+    Empty,
+}
+
+/// The name part of `owner/repo`.
+pub fn short(repo: &str) -> &str {
+    repo.split_once('/').map_or(repo, |(_, name)| name)
+}
+
+/// The name the list takes when its repo `old` is now `new`, or why it
+/// keeps its own. The list follows only if it is named exactly (byte for
+/// byte) for the old repo; `other_names` are the other lists' names, and
+/// the new name may not be any of them in any case, since Nextcloud lets
+/// two lists share one. The first reason that applies is the one given:
+/// `Off`, `Empty` and `SameName` (nothing to do or to say), then
+/// `AlreadyNamed` and `Custom` (the list is not the repo's to rename), then
+/// `Inbox`, `ReadOnly` and `Clash` (it is, but cannot be renamed).
+pub fn follow_list_name(
+    list_name: &str,
+    old: &str,
+    new: &str,
+    other_names: &[impl AsRef<str>],
+    is_inbox: bool,
+    writable: bool,
+    setting: FollowRename,
+) -> Result<String, KeepWhy> {
+    let (old, new) = (short(old), short(new));
+    if setting == FollowRename::Off {
+        return Err(KeepWhy::Off);
+    }
+    if old.is_empty() || new.is_empty() {
+        return Err(KeepWhy::Empty);
+    }
+    if old.eq_ignore_ascii_case(new) {
+        return Err(KeepWhy::SameName);
+    }
+    if list_name.to_lowercase() == new.to_lowercase() {
+        return Err(KeepWhy::AlreadyNamed);
+    }
+    if list_name != old {
+        return Err(KeepWhy::Custom);
+    }
+    if is_inbox {
+        return Err(KeepWhy::Inbox);
+    }
+    if !writable {
+        return Err(KeepWhy::ReadOnly);
+    }
+    if other_names
+        .iter()
+        .any(|n| n.as_ref().to_lowercase() == new.to_lowercase())
+    {
+        return Err(KeepWhy::Clash);
+    }
+    Ok(new.to_string())
+}
+
 /// `owner/repo`, as GitHub allows the two names.
 pub fn valid_repo(repo: &str) -> bool {
     let name = |s: &str| {
@@ -254,6 +453,60 @@ const API: &str = "https://api.github.com";
 
 pub struct GitHub {
     auth: HeaderValue,
+    base: String,
+    /// A shorter wait than the 30 seconds every request gets, so a test
+    /// can see a timeout.
+    #[cfg(any(test, feature = "testing"))]
+    timeout: Option<Duration>,
+}
+
+/// A repository, named or numbered: the name changes with a rename, the id
+/// does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target<'a> {
+    Name(&'a str),
+    Id(u64),
+}
+
+/// What a repository's record says, as far as asst reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoInfo {
+    pub id: u64,
+    pub full_name: String,
+    pub archived: bool,
+    pub disabled: bool,
+}
+
+/// One look at a repository: what GitHub answered, not what it means (that
+/// is `judge`'s). An answer that settles nothing (a refusal, an error page, a
+/// body that is not a record) stays one of the last three, never a finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    /// 200, with the record and its ETag.
+    Record(RepoInfo, Option<String>),
+    /// 304: the record is as it was when the ETag was given.
+    Unchanged,
+    /// 301 to `/repositories/<id>`: the name belongs to that repository now.
+    Moved { id: u64 },
+    /// 404 or 410. GitHub also says 404 to a private repo the token cannot
+    /// see, so this is never evidence that the repository is gone.
+    Missing,
+    /// 403 or 429. `retry` is how long GitHub asked to wait, if it did: the
+    /// `Retry-After` header, else until the window resets when none is left.
+    Denied { retry: Option<Duration> },
+    /// 5xx or an answer that is not a record. A dropped connection or a
+    /// timeout is an `Err`, not this.
+    Failed,
+}
+
+#[derive(Deserialize)]
+struct RawRepo {
+    id: u64,
+    full_name: String,
+    // Both are required: a record without them says nothing about either,
+    // and a missing flag read as `false` would look like an un-archive.
+    archived: bool,
+    disabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -294,7 +547,31 @@ impl GitHub {
         let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| RemoteError::Protocol("the GitHub token has invalid characters".into()))?;
         auth.set_sensitive(true);
-        Ok(GitHub { auth })
+        Ok(GitHub {
+            auth,
+            base: API.into(),
+            #[cfg(any(test, feature = "testing"))]
+            timeout: None,
+        })
+    }
+
+    /// A client for another server, e.g. `testing::FakeGitHub`. Only tests
+    /// have it: nothing the daemon runs can send the token elsewhere.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_base(token: &str, base: &str) -> Result<GitHub, RemoteError> {
+        Ok(GitHub {
+            base: base.trim_end_matches('/').into(),
+            ..GitHub::new(token)?
+        })
+    }
+
+    /// Give up on a request after `limit` instead of 30 seconds.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_timeout(self, limit: Duration) -> GitHub {
+        GitHub {
+            timeout: Some(limit),
+            ..self
+        }
     }
 
     // ponytail: each request builds its own client (and reads the system
@@ -333,33 +610,53 @@ impl GitHub {
         let req = req
             .body(body.map(|b| b.to_string()).unwrap_or_default())
             .map_err(|e| RemoteError::Protocol(e.to_string()))?;
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(limit) = self.timeout {
+            return tokio::time::timeout(limit, caldav::send(req))
+                .await
+                .map_err(|_| RemoteError::Network("timed out".into()))?;
+        }
         caldav::send(req).await
+    }
+
+    /// One look at a repository: by name, or by the id a rename leaves
+    /// alone. With the `etag` of an earlier record, GitHub answers 304
+    /// while it is unchanged, which it does not count against the rate
+    /// limit. A dropped connection, a timeout and a rejected token are
+    /// errors, as for every call here; every other answer is an `Observed`.
+    pub async fn repo(
+        &self,
+        target: Target<'_>,
+        etag: Option<&str>,
+    ) -> Result<Observed, RemoteError> {
+        let url = match target {
+            Target::Name(name) => format!("{}/repos/{name}", self.base),
+            Target::Id(id) => format!("{}/repositories/{id}", self.base),
+        };
+        let (status, headers, body) = self.raw(Method::GET, &url, None, etag).await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        observe(status, &headers, &body, now)
     }
 
     /// Where `repo` is called now, if it was renamed or moved to another
     /// owner. GitHub answers the old name with a redirect to the
     /// repository's id, and the id's record has the name.
     pub async fn renamed(&self, repo: &str) -> Result<Option<String>, RemoteError> {
-        let (status, headers, _) = self
-            .raw(Method::GET, &format!("{API}/repos/{repo}"), None, None)
-            .await?;
-        if status != StatusCode::MOVED_PERMANENTLY {
+        let Observed::Moved { id } = self.repo(Target::Name(repo), None).await? else {
             return Ok(None);
+        };
+        match self.repo(Target::Id(id), None).await? {
+            Observed::Record(info, _) => Ok(valid_repo(&info.full_name)
+                .then_some(info.full_name)
+                .filter(|n| n != repo)),
+            Observed::Missing => Err(RemoteError::NotFound),
+            Observed::Denied { .. } => Err(RemoteError::Status(403)),
+            Observed::Unchanged | Observed::Moved { .. } | Observed::Failed => Err(
+                RemoteError::Protocol("a redirect to a repository GitHub will not describe".into()),
+            ),
         }
-        let id = headers
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .and_then(repository_id)
-            .ok_or_else(|| RemoteError::Protocol("a redirect that names no repository".into()))?;
-        let (_, _, body) = self
-            .call(Method::GET, &format!("{API}/repositories/{id}"), None, None)
-            .await?;
-        #[derive(Deserialize)]
-        struct Repo {
-            full_name: String,
-        }
-        let name = parse::<Repo>(&body)?.full_name;
-        Ok(valid_repo(&name).then_some(name).filter(|n| n != repo))
     }
 
     /// Every issue of `repo`, open and closed, pull requests left out, and
@@ -369,8 +666,10 @@ impl GitHub {
         repo: &str,
         etag: Option<&str>,
     ) -> Result<Option<(Vec<Issue>, Option<String>)>, RemoteError> {
-        let mut url =
-            format!("{API}/repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100");
+        let mut url = format!(
+            "{}/repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100",
+            self.base
+        );
         let mut out = Vec::new();
         let mut first_etag = None;
         let mut first = true;
@@ -412,7 +711,7 @@ impl GitHub {
         body: Option<&str>,
         priority: u8,
     ) -> Result<Issue, RemoteError> {
-        let url = format!("{API}/repos/{repo}/issues");
+        let url = format!("{}/repos/{repo}/issues", self.base);
         let mut body_json = serde_json::json!({ "title": title });
         if let Some(b) = body.filter(|b| !b.trim().is_empty()) {
             body_json["body"] = b.into();
@@ -433,7 +732,7 @@ impl GitHub {
         change: &Change,
         not_planned: bool,
     ) -> Result<(), RemoteError> {
-        let url = format!("{API}/repos/{repo}/issues/{number}");
+        let url = format!("{}/repos/{repo}/issues/{number}", self.base);
         let mut body = serde_json::Map::new();
         if let Some(t) = &change.title {
             body.insert("title".into(), t.clone().into());
@@ -468,7 +767,7 @@ impl GitHub {
     /// Whether the issue is still in `repo`: a transferred one answers
     /// with a redirect, a deleted one 404 or 410.
     pub async fn exists(&self, repo: &str, number: u32) -> Result<bool, RemoteError> {
-        let url = format!("{API}/repos/{repo}/issues/{number}");
+        let url = format!("{}/repos/{repo}/issues/{number}", self.base);
         match self.call(Method::GET, &url, None, None).await {
             Ok((s, _, _)) => Ok(s == StatusCode::OK),
             Err(RemoteError::NotFound | RemoteError::Status(301)) => Ok(false),
@@ -481,7 +780,70 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, RemoteError> 
     serde_json::from_slice(body).map_err(|e| RemoteError::Protocol(e.to_string()))
 }
 
-/// The `rel="next"` URL of a `Link` header.
+/// The answer to a repository lookup, read. `now` is the time in epoch
+/// seconds, for a rate limit that says when it resets and not how long.
+fn observe(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+    now: u64,
+) -> Result<Observed, RemoteError> {
+    Ok(match status.as_u16() {
+        200 => match parse::<RawRepo>(body) {
+            Ok(r) if valid_repo(&r.full_name) => Observed::Record(
+                RepoInfo {
+                    id: r.id,
+                    full_name: r.full_name,
+                    archived: r.archived,
+                    disabled: r.disabled,
+                },
+                header(headers, "etag").map(str::to_string),
+            ),
+            _ => {
+                log::info!("GitHub's repository record is not one asst can read");
+                Observed::Failed
+            }
+        },
+        304 => Observed::Unchanged,
+        301 => match header(headers, "location").and_then(repository_id) {
+            Some(id) => Observed::Moved { id },
+            None => {
+                log::info!("GitHub redirected a repository to somewhere that is not an id");
+                Observed::Failed
+            }
+        },
+        404 | 410 => Observed::Missing,
+        403 | 429 => Observed::Denied {
+            retry: retry_after(headers, now),
+        },
+        // As for every other call: the daemon asks for the token again.
+        401 => return Err(RemoteError::Unauthorized),
+        n => {
+            log::info!("GitHub answered {n} for a repository");
+            Observed::Failed
+        }
+    })
+}
+
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// How long a refusal asks to wait: `Retry-After` when it has one, else
+/// until the window resets when no requests are left in it. A 403 that
+/// shows only the window's headers (the token cannot see the repo) says
+/// nothing about waiting.
+fn retry_after(headers: &HeaderMap, now: u64) -> Option<Duration> {
+    let number = |name| header(headers, name).and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(secs) = number("retry-after") {
+        return Some(Duration::from_secs(secs));
+    }
+    (number("x-ratelimit-remaining") == Some(0))
+        .then(|| number("x-ratelimit-reset"))
+        .flatten()
+        .map(|reset| Duration::from_secs(reset.saturating_sub(now)))
+}
+
 /// The id in a redirect's `Location`: `…/repositories/<id>/…`.
 fn repository_id(location: &str) -> Option<u64> {
     let rest = location.split_once("/repositories/")?.1;
@@ -489,6 +851,7 @@ fn repository_id(location: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The `rel="next"` URL of a `Link` header.
 fn next_page(link: &str) -> Option<String> {
     link.split(',').find_map(|part| {
         let (url, rel) = part.split_once(';')?;
@@ -822,5 +1185,874 @@ mod tests {
             Some("https://api.github.com/repositories/1/issues?page=2")
         );
         assert_eq!(next_page(r#"<https://x/?page=1>; rel="prev""#), None);
+    }
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+    use crate::testing::{FakeGitHub, Reply};
+
+    // Answers recorded from api.github.com with a read-only GET and the
+    // owner's token, then cut to the fields asst reads (no timestamps,
+    // counts, descriptions or URL templates) and the headers it uses.
+    const LAB: &str = include_str!("../tests/fixtures/github/lab-by-id.http");
+    const ARCHIVED: &str = include_str!("../tests/fixtures/github/mail-digest-archived.http");
+    const MOVED: &str = include_str!("../tests/fixtures/github/champalimaud-moved.http");
+    const NOT_FOUND: &str = include_str!("../tests/fixtures/github/not-found.http");
+
+    const LAB_ID: u64 = 1379104005;
+    const LAB_ETAG: &str = "\"45affe4b62fa7f4bcef84f988e8f0267fd85a1ef28e90592f8fcbe38f24ecb2e\"";
+
+    /// A recorded answer: the status line, headers, a blank line, the body.
+    fn recorded(text: &str) -> (StatusCode, HeaderMap, String) {
+        let (head, body) = text
+            .split_once("\n\n")
+            .expect("a blank line before the body");
+        let mut lines = head.lines();
+        let code = lines.next().unwrap().split(' ').nth(1).unwrap();
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            let (name, value) = line.split_once(": ").unwrap();
+            headers.append(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        (code.parse().unwrap(), headers, body.to_string())
+    }
+
+    fn observed(text: &str) -> Observed {
+        let (status, headers, body) = recorded(text);
+        observe(status, &headers, body.as_bytes(), 0).unwrap()
+    }
+
+    fn lab() -> RepoInfo {
+        RepoInfo {
+            id: LAB_ID,
+            full_name: "jaehho/lab".into(),
+            archived: false,
+            disabled: false,
+        }
+    }
+
+    fn answer(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &str,
+        now: u64,
+    ) -> Result<Observed, RemoteError> {
+        let mut map = HeaderMap::new();
+        for (k, v) in headers {
+            map.append(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        observe(
+            StatusCode::from_u16(status).unwrap(),
+            &map,
+            body.as_bytes(),
+            now,
+        )
+    }
+
+    #[test]
+    fn the_recorded_answers_read_as_observations() {
+        assert_eq!(
+            observed(LAB),
+            Observed::Record(lab(), Some(LAB_ETAG.into()))
+        );
+        let Observed::Record(archived, _) = observed(ARCHIVED) else {
+            panic!("a record");
+        };
+        assert_eq!(
+            archived,
+            RepoInfo {
+                id: 1379104203,
+                full_name: "jaehho/mail-digest".into(),
+                archived: true,
+                disabled: false,
+            }
+        );
+        // The old name answers with a redirect to the id, nothing more
+        assert_eq!(observed(MOVED), Observed::Moved { id: LAB_ID });
+        assert_eq!(observed(NOT_FOUND), Observed::Missing);
+    }
+
+    #[test]
+    fn an_answer_that_settles_nothing_is_not_a_finding() {
+        let none = |status| answer(status, &[], "", 0).unwrap();
+        assert_eq!(none(304), Observed::Unchanged);
+        for gone in [404, 410] {
+            assert_eq!(none(gone), Observed::Missing);
+        }
+        for broken in [500, 502, 503, 418, 451, 307, 302] {
+            assert_eq!(none(broken), Observed::Failed, "{broken}");
+        }
+        // The same error as every other call: the daemon asks for a token
+        assert!(matches!(
+            answer(401, &[], "", 0),
+            Err(RemoteError::Unauthorized)
+        ));
+        // A 301 that is not to an id, a body that is not a record
+        let elsewhere = [("location", "https://api.github.com/repos/jaehho/lab")];
+        assert_eq!(answer(301, &elsewhere, "", 0).unwrap(), Observed::Failed);
+        assert_eq!(answer(301, &[], "", 0).unwrap(), Observed::Failed);
+        for body in [
+            "",
+            "<html>",
+            "[]",
+            r#"{"id":1,"full_name":"jaehho/lab","archived":false}"#,
+            r#"{"id":1,"full_name":"jaehho/lab","disabled":false}"#,
+            r#"{"id":1,"full_name":"lab","archived":false,"disabled":false}"#,
+            r#"{"id":"1","full_name":"jaehho/lab","archived":false,"disabled":false}"#,
+        ] {
+            assert_eq!(
+                answer(200, &[], body, 0).unwrap(),
+                Observed::Failed,
+                "{body}"
+            );
+        }
+        // Disabled counts as a flag of its own
+        let disabled = r#"{"id":1,"full_name":"a/b","archived":false,"disabled":true}"#;
+        let Observed::Record(info, etag) = answer(200, &[], disabled, 0).unwrap() else {
+            panic!("a record");
+        };
+        assert!(info.disabled && !info.archived && etag.is_none());
+    }
+
+    #[test]
+    fn a_refusal_says_when_to_come_back_only_when_it_does() {
+        let denied = |status, headers: &[(&str, &str)]| match answer(status, headers, "", 1000) {
+            Ok(Observed::Denied { retry }) => retry,
+            other => panic!("{other:?}"),
+        };
+        let secs = |s| Some(Duration::from_secs(s));
+        assert_eq!(denied(429, &[("retry-after", "60")]), secs(60));
+        assert_eq!(denied(403, &[("retry-after", "7")]), secs(7));
+        // No requests left: wait for the window
+        let spent = [
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "1090"),
+        ];
+        assert_eq!(denied(403, &spent), secs(90));
+        assert_eq!(denied(429, &spent), secs(90));
+        // Retry-After is the more exact of the two
+        let both = [
+            ("retry-after", "5"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "1090"),
+        ];
+        assert_eq!(denied(403, &both), secs(5));
+        // A reset in the past: come back now
+        let past = [("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "900")];
+        assert_eq!(denied(403, &past), secs(0));
+        // A plain 403 with the window's headers (requests left) is the
+        // token not seeing the repo, not a reason to wait
+        let plain = [
+            ("x-ratelimit-remaining", "4990"),
+            ("x-ratelimit-reset", "1090"),
+        ];
+        assert_eq!(denied(403, &plain), None);
+        assert_eq!(denied(403, &[]), None);
+        assert_eq!(denied(429, &[("retry-after", "soon")]), None);
+    }
+
+    fn lab_body() -> String {
+        recorded(LAB).2
+    }
+
+    #[tokio::test]
+    async fn a_repo_is_read_by_name_and_by_id() {
+        let fake = FakeGitHub::start().await;
+        fake.reply("GET", "/repos/jaehho/lab", Reply::json(200, &lab_body()));
+        fake.reply(
+            "GET",
+            "/repositories/1379104005",
+            Reply::json(200, &lab_body()),
+        );
+        let gh = GitHub::with_base("tok", &fake.base()).unwrap();
+
+        let by_name = gh.repo(Target::Name("jaehho/lab"), None).await.unwrap();
+        assert_eq!(by_name, Observed::Record(lab(), None));
+        let by_id = gh.repo(Target::Id(LAB_ID), None).await.unwrap();
+        assert_eq!(by_id, Observed::Record(lab(), None));
+
+        let seen = fake.seen();
+        assert_eq!(
+            seen.iter().map(|r| r.target.as_str()).collect::<Vec<_>>(),
+            ["/repos/jaehho/lab", "/repositories/1379104005"]
+        );
+        // The token goes to the base it was given, and no ETag was sent
+        assert!(seen.iter().all(|r| r.method == "GET"
+            && r.header("authorization") == Some("Bearer tok")
+            && r.header("if-none-match").is_none()));
+    }
+
+    #[tokio::test]
+    async fn an_etag_that_still_matches_costs_a_304() {
+        let fake = FakeGitHub::start().await;
+        fake.etagged("/repositories/1379104005", LAB_ETAG, &lab_body());
+        let gh = GitHub::with_base("tok", &fake.base()).unwrap();
+
+        let first = gh.repo(Target::Id(LAB_ID), None).await.unwrap();
+        assert_eq!(first, Observed::Record(lab(), Some(LAB_ETAG.into())));
+        let second = gh.repo(Target::Id(LAB_ID), Some(LAB_ETAG)).await.unwrap();
+        assert_eq!(second, Observed::Unchanged);
+        // A stale ETag gets the record again
+        let stale = gh.repo(Target::Id(LAB_ID), Some("\"old\"")).await.unwrap();
+        assert_eq!(stale, Observed::Record(lab(), Some(LAB_ETAG.into())));
+
+        let sent: Vec<Option<&str>> = fake
+            .seen()
+            .iter()
+            .map(|r| r.header("if-none-match").map(|_| "sent"))
+            .collect();
+        assert_eq!(sent, [None, Some("sent"), Some("sent")]);
+        let seen = fake.seen();
+        assert_eq!(seen[1].header("if-none-match"), Some(LAB_ETAG));
+        assert_eq!(fake.count("/repositories/1379104005"), 3);
+    }
+
+    #[tokio::test]
+    async fn the_old_name_redirects_to_the_id_and_the_id_has_the_name() {
+        let fake = FakeGitHub::start().await;
+        let (_, headers, body) = recorded(MOVED);
+        let location = headers["location"]
+            .to_str()
+            .unwrap()
+            .replace(API, &fake.base());
+        fake.reply(
+            "GET",
+            "/repos/jaehho/champalimaud",
+            Reply::json(301, &body).header("location", &location),
+        );
+        fake.reply(
+            "GET",
+            "/repositories/1379104005",
+            Reply::json(200, &lab_body()),
+        );
+        fake.reply("GET", "/repos/jaehho/lab", Reply::json(200, &lab_body()));
+        let gh = GitHub::with_base("tok", &fake.base()).unwrap();
+
+        let moved = gh
+            .repo(Target::Name("jaehho/champalimaud"), None)
+            .await
+            .unwrap();
+        assert_eq!(moved, Observed::Moved { id: LAB_ID });
+        assert_eq!(fake.seen().len(), 1);
+
+        // renamed() asks the name, then the id it was sent to
+        assert_eq!(
+            gh.renamed("jaehho/champalimaud").await.unwrap().as_deref(),
+            Some("jaehho/lab")
+        );
+        assert_eq!(fake.count("/repos/jaehho/champalimaud"), 2);
+        assert_eq!(fake.count("/repositories/1379104005"), 1);
+
+        // A repo that was not renamed is one request, and no answer
+        assert_eq!(gh.renamed("jaehho/lab").await.unwrap(), None);
+        assert_eq!(fake.count("/repos/jaehho/lab"), 1);
+        assert_eq!(fake.count("/repositories/1379104005"), 1);
+    }
+
+    #[tokio::test]
+    async fn renamed_is_an_error_when_the_id_cannot_be_read() {
+        let fake = FakeGitHub::start().await;
+        let location = format!("{}/repositories/42", fake.base());
+        fake.reply(
+            "GET",
+            "/repos/a/old",
+            Reply::status(301).header("location", &location),
+        );
+        let gh = GitHub::with_base("tok", &fake.base()).unwrap();
+        // The id answers 404 (nothing routed)
+        assert!(matches!(
+            gh.renamed("a/old").await,
+            Err(RemoteError::NotFound)
+        ));
+        fake.reply("GET", "/repositories/42", Reply::status(500));
+        assert!(matches!(
+            gh.renamed("a/old").await,
+            Err(RemoteError::Protocol(_))
+        ));
+        fake.reply("GET", "/repositories/42", Reply::status(403));
+        assert!(matches!(
+            gh.renamed("a/old").await,
+            Err(RemoteError::Status(403))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refusals_and_errors_come_through_as_observations() {
+        let fake = FakeGitHub::start().await;
+        fake.reply(
+            "GET",
+            "/repos/a/gone",
+            Reply::json(404, &recorded(NOT_FOUND).2),
+        );
+        fake.reply("GET", "/repos/a/hidden", Reply::status(410));
+        fake.reply(
+            "GET",
+            "/repos/a/limited",
+            Reply::json(403, "{}").header("retry-after", "30"),
+        );
+        fake.reply(
+            "GET",
+            "/repos/a/slow",
+            Reply::status(429).header("retry-after", "120"),
+        );
+        fake.reply("GET", "/repos/a/broken", Reply::json(500, "oops"));
+        fake.reply("GET", "/repos/a/denied", Reply::status(401));
+        let gh = GitHub::with_base("tok", &fake.base()).unwrap();
+        let look = |name: &'static str| {
+            let gh = &gh;
+            async move { gh.repo(Target::Name(name), None).await }
+        };
+
+        assert_eq!(look("a/gone").await.unwrap(), Observed::Missing);
+        assert_eq!(look("a/hidden").await.unwrap(), Observed::Missing);
+        assert_eq!(
+            look("a/limited").await.unwrap(),
+            Observed::Denied {
+                retry: Some(Duration::from_secs(30))
+            }
+        );
+        assert_eq!(
+            look("a/slow").await.unwrap(),
+            Observed::Denied {
+                retry: Some(Duration::from_secs(120))
+            }
+        );
+        assert_eq!(look("a/broken").await.unwrap(), Observed::Failed);
+        assert!(matches!(
+            look("a/denied").await,
+            Err(RemoteError::Unauthorized)
+        ));
+        // One request each: nothing here retries by itself
+        assert_eq!(fake.seen().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_an_error_not_a_finding() {
+        let gh = GitHub::with_base("tok", &FakeGitHub::refused_base().await).unwrap();
+        let err = gh.repo(Target::Id(LAB_ID), None).await.unwrap_err();
+        assert!(matches!(err, RemoteError::Network(_)), "{err:?}");
+        // renamed() cannot tell either, and says so the same way
+        assert!(matches!(
+            gh.renamed("a/b").await,
+            Err(RemoteError::Network(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_is_a_timeout_not_a_finding() {
+        let fake = FakeGitHub::start().await;
+        fake.reply("GET", "/repositories/1379104005", Reply::hang());
+        let gh = GitHub::with_base("tok", &fake.base())
+            .unwrap()
+            .with_timeout(Duration::from_millis(150));
+        let err = gh.repo(Target::Id(LAB_ID), None).await.unwrap_err();
+        assert!(
+            matches!(&err, RemoteError::Network(m) if m == "timed out"),
+            "{err:?}"
+        );
+        assert_eq!(fake.count("/repositories/1379104005"), 1);
+    }
+
+    #[test]
+    fn the_real_endpoint_is_the_default() {
+        let gh = GitHub::new("tok").unwrap();
+        assert_eq!(gh.base, "https://api.github.com");
+        let local = GitHub::with_base("tok", "http://127.0.0.1:9/").unwrap();
+        assert_eq!(local.base, "http://127.0.0.1:9");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn rec(id: u64, name: &str, archived: bool, disabled: bool) -> Observed {
+        Observed::Record(
+            RepoInfo {
+                id,
+                full_name: name.into(),
+                archived,
+                disabled,
+            },
+            None,
+        )
+    }
+
+    fn live(id: u64, name: &str) -> Observed {
+        rec(id, name, false, false)
+    }
+
+    fn renamed(to: &str, witnessed: bool) -> Verdict {
+        Verdict::Renamed {
+            to: to.into(),
+            witnessed,
+        }
+    }
+
+    /// One row of the table: the stored id, the linked name and the
+    /// archived baseline, what was seen, and the verdict.
+    struct Row {
+        why: &'static str,
+        id: Option<u64>,
+        archived: Option<bool>,
+        seen: Observed,
+        verdict: Verdict,
+    }
+
+    fn row(
+        why: &'static str,
+        id: Option<u64>,
+        archived: Option<bool>,
+        seen: Observed,
+        verdict: Verdict,
+    ) -> Row {
+        Row {
+            why,
+            id,
+            archived,
+            seen,
+            verdict,
+        }
+    }
+
+    #[test]
+    fn a_look_at_a_repo_is_judged_against_what_is_stored() {
+        let moved = Observed::Moved { id: 7 };
+        let denied = Observed::Denied {
+            retry: Some(Duration::from_secs(60)),
+        };
+        let rows = [
+            // Fine
+            row(
+                "same id, same name, same flag",
+                Some(7),
+                Some(false),
+                live(7, "jaehho/lab"),
+                Verdict::Fine,
+            ),
+            row(
+                "the name in another case is the same name",
+                Some(7),
+                Some(false),
+                live(7, "Jaehho/LAB"),
+                Verdict::Fine,
+            ),
+            row(
+                "a 304 is the record already judged",
+                Some(7),
+                Some(false),
+                Observed::Unchanged,
+                Verdict::Fine,
+            ),
+            row(
+                "archived before and still",
+                Some(7),
+                Some(true),
+                rec(7, "jaehho/lab", true, false),
+                Verdict::Fine,
+            ),
+            // Learning
+            row(
+                "found by name with nothing stored",
+                None,
+                None,
+                live(7, "jaehho/lab"),
+                Verdict::LearnId(7),
+            ),
+            row(
+                "found by name, archived, with nothing stored",
+                None,
+                None,
+                rec(7, "jaehho/lab", true, false),
+                Verdict::LearnId(7),
+            ),
+            // Renamed
+            row(
+                "same id, another full name",
+                Some(7),
+                Some(false),
+                live(7, "jaehho/lab"),
+                renamed("jaehho/lab", true),
+            ),
+            row(
+                "301 then the record, no id stored",
+                None,
+                None,
+                live(7, "jaehho/lab"),
+                renamed("jaehho/lab", false),
+            ),
+            row(
+                "301 to the stored id then the record",
+                Some(7),
+                None,
+                live(7, "other/lab"),
+                renamed("other/lab", true),
+            ),
+            // Archived
+            row(
+                "archived since the last look",
+                Some(7),
+                Some(false),
+                rec(7, "jaehho/lab", true, false),
+                Verdict::Archived,
+            ),
+            row(
+                "disabled counts as archived",
+                Some(7),
+                Some(false),
+                rec(7, "jaehho/lab", false, true),
+                Verdict::Archived,
+            ),
+            row(
+                "unarchived since the last look",
+                Some(7),
+                Some(true),
+                live(7, "jaehho/lab"),
+                Verdict::Unarchived,
+            ),
+            row(
+                "first sight of an archived repo is not an event",
+                Some(7),
+                None,
+                rec(7, "jaehho/lab", true, false),
+                Verdict::Fine,
+            ),
+            row(
+                "first sight of a live repo is not either",
+                Some(7),
+                None,
+                live(7, "jaehho/lab"),
+                Verdict::Fine,
+            ),
+            // Replaced: the name lookup made after the id was Missing
+            row(
+                "the name answers a record with another id",
+                Some(7),
+                Some(false),
+                live(9, "jaehho/lab"),
+                Verdict::Replaced { found: 9 },
+            ),
+            row(
+                "the name answers a 301 to another id",
+                Some(7),
+                Some(false),
+                Observed::Moved { id: 9 },
+                Verdict::Replaced { found: 9 },
+            ),
+            row(
+                "another id outranks a new name",
+                Some(7),
+                Some(false),
+                live(9, "jaehho/elsewhere"),
+                Verdict::Replaced { found: 9 },
+            ),
+            // Unknown
+            row(
+                "404 with an id",
+                Some(7),
+                Some(false),
+                Observed::Missing,
+                Verdict::Unknown,
+            ),
+            row(
+                "404 without",
+                None,
+                None,
+                Observed::Missing,
+                Verdict::Unknown,
+            ),
+            row(
+                "403 or 429 with an id",
+                Some(7),
+                Some(true),
+                denied.clone(),
+                Verdict::Unknown,
+            ),
+            row("403 without", None, None, denied, Verdict::Unknown),
+            row(
+                "5xx with an id",
+                Some(7),
+                Some(false),
+                Observed::Failed,
+                Verdict::Unknown,
+            ),
+            row(
+                "5xx without",
+                None,
+                None,
+                Observed::Failed,
+                Verdict::Unknown,
+            ),
+            row(
+                "a 304 with nothing stored has no record behind it",
+                None,
+                None,
+                Observed::Unchanged,
+                Verdict::Unknown,
+            ),
+            row(
+                "a bare 301 to the stored id cannot name the repo",
+                Some(7),
+                Some(false),
+                moved.clone(),
+                Verdict::Unknown,
+            ),
+            row(
+                "a bare 301 with nothing stored either",
+                None,
+                None,
+                moved,
+                Verdict::Unknown,
+            ),
+        ];
+        for r in rows {
+            // The link is called "jaehho/lab" in every row but the renames,
+            // which name the repo it was before.
+            let linked = match r.verdict {
+                Verdict::Renamed { .. } => "jaehho/champalimaud",
+                _ => "jaehho/lab",
+            };
+            assert_eq!(
+                judge(r.id, linked, r.archived, &r.seen),
+                r.verdict,
+                "{}",
+                r.why
+            );
+        }
+    }
+
+    #[test]
+    fn a_repo_that_comes_back_is_a_finding_once_per_flip() {
+        let flag =
+            |archived, baseline| judge(Some(7), "a/b", baseline, &rec(7, "a/b", archived, false));
+        assert_eq!(flag(true, Some(false)), Verdict::Archived);
+        // The baseline moves with the finding, so the next look is Fine
+        assert_eq!(flag(true, Some(true)), Verdict::Fine);
+        assert_eq!(flag(false, Some(true)), Verdict::Unarchived);
+        assert_eq!(flag(false, Some(false)), Verdict::Fine);
+    }
+
+    fn follow(list: &str, old: &str, new: &str) -> Result<String, KeepWhy> {
+        follow_list_name(
+            list,
+            old,
+            new,
+            &["Work", "Home"],
+            false,
+            true,
+            FollowRename::List,
+        )
+    }
+
+    #[test]
+    fn an_exactly_named_list_follows_its_repo() {
+        assert_eq!(
+            follow("champalimaud", "jaehho/champalimaud", "jaehho/lab"),
+            Ok("lab".to_string())
+        );
+        // To another owner at the same time
+        assert_eq!(
+            follow("asst", "jaehho/asst", "org/tasks"),
+            Ok("tasks".into())
+        );
+        // A new name that only looks like another list's
+        assert_eq!(follow("a", "o/a", "o/Workshop"), Ok("Workshop".into()));
+    }
+
+    #[test]
+    fn a_list_keeps_its_name_and_says_why() {
+        let (old, new) = ("jaehho/champalimaud", "jaehho/lab");
+        let cases = [
+            (
+                "a name someone chose",
+                follow("Lab work", old, new),
+                KeepWhy::Custom,
+            ),
+            (
+                "a case someone chose",
+                follow("Champalimaud", old, new),
+                KeepWhy::Custom,
+            ),
+            ("a prefix of it", follow("champ", old, new), KeepWhy::Custom),
+            (
+                "a name with a space",
+                follow("champalimaud ", old, new),
+                KeepWhy::Custom,
+            ),
+            (
+                "the list is not the repo's at all",
+                follow("Work", old, new),
+                KeepWhy::Custom,
+            ),
+            (
+                "already the new name",
+                follow("lab", old, new),
+                KeepWhy::AlreadyNamed,
+            ),
+            (
+                "already the new name in another case",
+                follow("Lab", old, new),
+                KeepWhy::AlreadyNamed,
+            ),
+            (
+                "an owner-only transfer",
+                follow("champalimaud", "jaehho/champalimaud", "org/champalimaud"),
+                KeepWhy::SameName,
+            ),
+            (
+                "an owner-only transfer, list already named for it",
+                follow("lab", "jaehho/lab", "org/lab"),
+                KeepWhy::SameName,
+            ),
+            (
+                "an owner-only transfer, custom list",
+                follow("Lab work", "jaehho/lab", "org/lab"),
+                KeepWhy::SameName,
+            ),
+            (
+                "a clash",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["lab"],
+                    false,
+                    true,
+                    FollowRename::List,
+                ),
+                KeepWhy::Clash,
+            ),
+            (
+                "a clash in any case",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work", "LAB"],
+                    false,
+                    true,
+                    FollowRename::List,
+                ),
+                KeepWhy::Clash,
+            ),
+            (
+                "the inbox",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work"],
+                    true,
+                    true,
+                    FollowRename::List,
+                ),
+                KeepWhy::Inbox,
+            ),
+            (
+                "a list the user cannot write",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work"],
+                    false,
+                    false,
+                    FollowRename::List,
+                ),
+                KeepWhy::ReadOnly,
+            ),
+            (
+                "the setting is off",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work"],
+                    false,
+                    true,
+                    FollowRename::Off,
+                ),
+                KeepWhy::Off,
+            ),
+            (
+                "no name part",
+                follow("champalimaud", old, "jaehho/"),
+                KeepWhy::Empty,
+            ),
+            (
+                "no name at all",
+                follow("champalimaud", old, ""),
+                KeepWhy::Empty,
+            ),
+            (
+                "no old name part",
+                follow("", "jaehho/", new),
+                KeepWhy::Empty,
+            ),
+        ];
+        for (why, got, want) in cases {
+            assert_eq!(got, Err(want), "{why}");
+        }
+    }
+
+    #[test]
+    fn the_first_reason_that_applies_is_the_one_given() {
+        let (old, new) = ("jaehho/champalimaud", "jaehho/lab");
+        let ask = |list, others: &[&str], inbox, writable, setting| {
+            follow_list_name(list, old, new, others, inbox, writable, setting)
+        };
+        // Off outranks everything
+        assert_eq!(
+            ask("Custom", &["lab"], true, false, FollowRename::Off),
+            Err(KeepWhy::Off)
+        );
+        // A list that is not the repo's to rename is Custom before it is
+        // read-only, the inbox or in a clash
+        assert_eq!(
+            ask("Custom", &["lab"], true, false, FollowRename::List),
+            Err(KeepWhy::Custom)
+        );
+        // Of the three that stop a list that is the repo's: inbox, then
+        // read-only, then the clash
+        assert_eq!(
+            ask("champalimaud", &["lab"], true, false, FollowRename::List),
+            Err(KeepWhy::Inbox)
+        );
+        assert_eq!(
+            ask("champalimaud", &["lab"], false, false, FollowRename::List),
+            Err(KeepWhy::ReadOnly)
+        );
+        assert_eq!(
+            ask("champalimaud", &["lab"], false, true, FollowRename::List),
+            Err(KeepWhy::Clash)
+        );
+        // The list's own name among the others changes nothing
+        assert_eq!(
+            ask(
+                "champalimaud",
+                &["champalimaud"],
+                false,
+                true,
+                FollowRename::List
+            ),
+            Ok("lab".to_string())
+        );
+    }
+
+    #[test]
+    fn the_names_are_the_repo_halves() {
+        assert_eq!(short("jaehho/lab"), "lab");
+        assert_eq!(short("lab"), "lab");
+        assert_eq!(short("jaehho/"), "");
+        assert_eq!(short(""), "");
+        assert_eq!(FollowRename::default(), FollowRename::List);
     }
 }

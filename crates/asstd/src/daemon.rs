@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use asst_core::api::{
-    AddSpec, Added, Change, LinkView, ListChange, ListSpec, ListView, Settings, SettingsChange,
-    StatusView, SyncState, TaskView, short_ids,
+    AddSpec, Added, Change, LinkState, LinkView, ListChange, ListSpec, ListView, PendingRename,
+    Settings, SettingsChange, StatusView, SyncState, TaskView, short_ids,
 };
-use asst_core::caldav::{self, Account, CalDav, RemoteError};
+use asst_core::caldav::{self, Account, CalDav, RemoteError, RemoteList};
 use asst_core::config::{self, AccountConfig, Config};
 use asst_core::github;
 use asst_core::quickadd;
-use asst_core::store::{Query, Row, Store, StoreError};
+use asst_core::store::{GH_LOG_KEEP, GhLinkRow, LogRow, Query, Row, Store, StoreError};
 use asst_core::sync::{self, Report, SyncError};
 use asst_core::task::{Edit, priority_from_level};
 use asst_core::time::{Trigger, When};
@@ -81,6 +81,97 @@ pub struct Daemon {
 struct GhState {
     synced: Option<DateTime<Utc>>,
     error: Option<String>,
+    /// Why the repo's issues are not being read, for as long as it holds.
+    hold: Option<Hold>,
+}
+
+/// A finding that stops a link's pass until the repo is confirmed to be
+/// the one that was linked. Kept in memory: nothing is written for it, and
+/// the next look at the repo finds it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pub state: LinkState,
+    pub note: String,
+    pub since: DateTime<Utc>,
+}
+
+/// A link missing for this long gets a hint at the way out.
+const UNLINK_HINT_AFTER: chrono::Duration =
+    chrono::Duration::days(github::limits::UNLINK_HINT_DAYS);
+
+/// What a link needs a look for, if anything: a held pass first, then a
+/// rename its list has not followed, then an archived repo. `open` is the
+/// list's open tasks, for the archived note.
+#[derive(Debug, PartialEq, Eq)]
+struct Condition {
+    state: LinkState,
+    note: String,
+    since: Option<DateTime<Utc>>,
+}
+
+fn link_condition(
+    row: &GhLinkRow,
+    list_name: &str,
+    hold: Option<&Hold>,
+    open: usize,
+    zone: Tz,
+    now: DateTime<Utc>,
+) -> Option<Condition> {
+    let day = |at: DateTime<Utc>| at.with_timezone(&zone).format("%Y-%m-%d").to_string();
+    if let Some(h) = hold {
+        let gone_a_while = h.state == LinkState::Unreachable && now - h.since >= UNLINK_HINT_AFTER;
+        let note = if gone_a_while {
+            format!(
+                "{}; asst unlink {} if it is gone for good",
+                h.note, row.repo
+            )
+        } else {
+            h.note.clone()
+        };
+        return Some(Condition {
+            state: h.state,
+            note,
+            since: Some(h.since),
+        });
+    }
+    if let (Some(from), Some(at)) = (&row.follow_from, row.follow_at) {
+        let at = DateTime::from_timestamp(at, 0)?;
+        return Some(Condition {
+            state: LinkState::Renamed,
+            note: format!(
+                "renamed from {from} on {}; the list is still called {list_name:?}",
+                day(at)
+            ),
+            since: Some(at),
+        });
+    }
+    let first_seen = DateTime::from_timestamp(row.archived.filter(|t| *t > 0)?, 0)?;
+    // Archiving the list in the window only hides it: it still syncs, and
+    // its reminders still ring
+    let tasks = match open {
+        0 => "no open tasks here".to_string(),
+        1 => "1 task is still open here (a list archived in the window still syncs and rings)"
+            .to_string(),
+        n => format!(
+            "{n} tasks are still open here (a list archived in the window still syncs and rings)"
+        ),
+    };
+    Some(Condition {
+        state: LinkState::Archived,
+        note: format!(
+            "archived on GitHub, first seen {}; {tasks}",
+            day(first_seen)
+        ),
+        since: Some(first_seen),
+    })
+}
+
+/// The rename the link's list has yet to follow, if there is one.
+fn pending_rename(row: &GhLinkRow) -> Option<PendingRename> {
+    Some(PendingRename {
+        from: row.follow_from.clone()?,
+        since: DateTime::from_timestamp(row.follow_at?, 0)?,
+    })
 }
 
 /// What the D-Bus side should tell clients.
@@ -88,6 +179,12 @@ pub enum Event {
     Changed,
     Status(StatusView),
     LoginDone(bool, String),
+    /// Something to tell the person with a desktop notification, for what
+    /// the daemon did without being asked.
+    Notice {
+        summary: String,
+        body: String,
+    },
 }
 
 impl Daemon {
@@ -147,6 +244,14 @@ impl Daemon {
 
     fn emit(&self, e: Event) {
         let _ = self.events.send(e);
+    }
+
+    /// Tell the person something with a desktop notification.
+    pub fn notify(&self, summary: &str, body: &str) {
+        self.emit(Event::Notice {
+            summary: summary.to_string(),
+            body: body.to_string(),
+        });
     }
 
     /// Tasks changed here: tell clients, rearm reminders, send soon.
@@ -349,6 +454,12 @@ impl Daemon {
     }
 
     // -- reads ------------------------------------------------------------------
+
+    /// Whether quick add files to this list when none is named: the one
+    /// `config.inbox` names, else a list called Inbox, else the first.
+    pub fn is_inbox(&self, href: &str) -> bool {
+        self.inbox(&self.store()).as_deref() == Some(href)
+    }
 
     fn inbox(&self, store: &Store) -> Option<String> {
         let lists = store.lists().ok()?;
@@ -809,30 +920,54 @@ impl Daemon {
     /// The links between repos and lists, as `asst link` shows them.
     pub fn links(&self) -> Result<Vec<LinkView>> {
         let store = self.store();
+        let counts = store.counts()?;
+        let now = Utc::now();
         store
-            .gh_links()?
+            .gh_link_rows()?
             .into_iter()
-            .map(|(repo, href)| {
+            .map(|row| {
                 let name = store
-                    .find_list(&href)
+                    .find_list(&row.list)
                     .map(|l| l.name)
-                    .unwrap_or_else(|_| href.clone());
-                let state = self
+                    .unwrap_or_else(|_| row.list.clone());
+                let seen = self
                     .gh_state
                     .lock()
                     .expect("not poisoned")
-                    .get(&repo)
+                    .get(&row.repo)
                     .cloned()
                     .unwrap_or_default();
+                let open = counts.get(&row.list).map_or(0, |(open, _)| *open);
+                let found = link_condition(&row, &name, seen.hold.as_ref(), open, self.zone, now);
+                let waiting = pending_rename(&row);
                 Ok(LinkView {
-                    repo,
-                    list: href,
+                    repo_id: row.repo_id,
+                    state: found.as_ref().map(|c| c.state),
+                    since: found.as_ref().and_then(|c| c.since),
+                    note: found.map(|c| c.note),
+                    pending_rename: waiting,
+                    repo: row.repo,
+                    list: row.list,
                     name,
-                    synced: state.synced,
-                    error: state.error,
+                    synced: seen.synced,
+                    error: seen.error,
                 })
             })
             .collect()
+    }
+
+    /// What asstd changed or decided about its links by itself, newest
+    /// first: one repo's rows (named in any case) or, with `""`, every
+    /// repo's. The log keeps 500 rows, so no call gets more than that.
+    pub fn link_log(&self, repo: &str, limit: u32) -> Result<Vec<LogRow>> {
+        let repo = repo.trim();
+        let kept = u32::try_from(GH_LOG_KEEP).unwrap_or(u32::MAX);
+        let rows = self.store().gh_log_recent(None, kept)?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| repo.is_empty() || r.repo.eq_ignore_ascii_case(repo))
+            .take(limit as usize)
+            .collect())
     }
 
     /// A GitHub pass over `repo` ended: it worked, or this is why not.
@@ -844,9 +979,31 @@ impl Daemon {
                 *entry = GhState {
                     synced: Some(Utc::now()),
                     error: None,
+                    hold: None,
                 }
             }
             Err(e) => entry.error = Some(e),
+        }
+    }
+
+    /// The repo is not the one that was linked, or cannot be told to be:
+    /// its issues are not read until a look settles it. The time it began
+    /// is kept while the same state goes on.
+    pub fn gh_hold(&self, repo: &str, state: LinkState, note: String, now: DateTime<Utc>) {
+        let mut all = self.gh_state.lock().expect("not poisoned");
+        let entry = all.entry(repo.to_string()).or_default();
+        let since = match &entry.hold {
+            Some(h) if h.state == state => h.since,
+            _ => now,
+        };
+        entry.hold = Some(Hold { state, note, since });
+    }
+
+    /// A look at the repo confirmed it is the one that was linked.
+    pub fn gh_release(&self, repo: &str) {
+        let mut all = self.gh_state.lock().expect("not poisoned");
+        if let Some(entry) = all.get_mut(repo) {
+            entry.hold = None;
         }
     }
 
@@ -865,7 +1022,7 @@ impl Daemon {
         let links = store.gh_links()?;
         if let Some((other, _)) = links.iter().find(|(r, href)| *href == l.href && r != repo) {
             return Err(Error::Invalid(format!(
-                "{} is linked to {other}; unlink it first",
+                "{} is linked to {other}; unlink {other} first",
                 l.name
             )));
         }
@@ -879,7 +1036,7 @@ impl Daemon {
                 .find_list(href)
                 .map_or_else(|_| href.clone(), |o| o.name);
             return Err(Error::Invalid(format!(
-                "{other} is linked to {name}; unlink it first"
+                "{other} is already linked to {name}; unlink {other} first to link it to another list"
             )));
         }
         store.gh_link(repo, &l.href)?;
@@ -889,8 +1046,7 @@ impl Daemon {
             repo: repo.to_string(),
             list: l.href,
             name: l.name,
-            synced: None,
-            error: None,
+            ..LinkView::default()
         })
     }
 
@@ -911,10 +1067,27 @@ impl Daemon {
         }
     }
 
+    /// The server for a caller that sorts failures by what the server said:
+    /// not being signed in, or no way to the app password, is a failure to
+    /// get through, and says nothing about the request.
+    pub async fn server(&self) -> std::result::Result<Arc<CalDav>, RemoteError> {
+        match self.remote().await {
+            Ok(Some(remote)) => Ok(remote),
+            Ok(None) => Err(RemoteError::Unauthorized),
+            Err(e) => Err(RemoteError::Protocol(e)),
+        }
+    }
+
     /// After a change to lists on the server: take its listing, tell clients.
     async fn lists_changed(&self, remote: &CalDav) -> Result<()> {
         let lists = remote.lists().await.map_err(remote_error)?;
-        self.store().apply_lists(&lists)?;
+        self.adopt_lists(&lists)
+    }
+
+    /// The server's listing of lists, as just read, is the cache's: tell
+    /// clients, and sync soon.
+    pub fn adopt_lists(&self, lists: &[RemoteList]) -> Result<()> {
+        self.store().apply_lists(lists)?;
         self.emit(Event::Changed);
         self.wake_reminders.notify_one();
         self.refresh_pending();
@@ -1162,6 +1335,7 @@ fn settings_of(cfg: &Config) -> Settings {
         snooze: cfg.snooze.clone(),
         alarm_at_due: cfg.alarm_at_due,
         alarm_before: cfg.alarm_before,
+        follow_rename: cfg.follow_rename,
     }
 }
 
@@ -1216,6 +1390,9 @@ fn apply_settings(
     if let Some(m) = change.alarm_before {
         cfg.alarm_before = m;
     }
+    if let Some(f) = change.follow_rename {
+        cfg.follow_rename = f;
+    }
     Ok(())
 }
 
@@ -1247,6 +1424,7 @@ mod tests {
             snooze: Some(vec![60, 5, 5]),
             alarm_at_due: Some(false),
             alarm_before: Some(30),
+            follow_rename: Some(github::FollowRename::Off),
         };
         apply_settings(&mut cfg, &change, Some(Some("Work".into()))).unwrap();
         assert_eq!(
@@ -1257,11 +1435,13 @@ mod tests {
                 snooze: vec![5, 60],
                 alarm_at_due: false,
                 alarm_before: 30,
+                follow_rename: github::FollowRename::Off,
             }
         );
         apply_settings(&mut cfg, &SettingsChange::default(), Some(None)).unwrap();
         assert_eq!(cfg.inbox, None);
         assert_eq!(cfg.interval, 300, "absent fields stay");
+        assert_eq!(cfg.follow_rename, github::FollowRename::Off);
     }
 
     #[test]
@@ -1345,12 +1525,19 @@ mod tests {
         daemon.store().gh_pair("jaehho/asst", &pair).unwrap();
         // Again is nothing new; another repo for the same list is refused
         daemon.link("work", "jaehho/asst").unwrap();
-        assert!(daemon.link("work", "jaehho/other").is_err());
+        assert_eq!(
+            daemon.link("work", "jaehho/other").unwrap_err().to_string(),
+            "Work is linked to jaehho/asst; unlink jaehho/asst first"
+        );
         // So is the same repo for another list, in any case: the store
         // would move the link and drop its pairs, so unlink comes first
         for typed in ["jaehho/asst", "Jaehho/ASST"] {
             let err = daemon.link("home", typed).unwrap_err().to_string();
-            assert_eq!(err, "jaehho/asst is linked to Work; unlink it first");
+            assert_eq!(
+                err,
+                "jaehho/asst is already linked to Work; unlink jaehho/asst first to link it \
+                 to another list"
+            );
         }
         assert_eq!(
             daemon.links().unwrap().len(),
@@ -1379,6 +1566,249 @@ mod tests {
         assert!(daemon.unlink("jaehho/asst").unwrap());
         assert!(!daemon.unlink("jaehho/asst").unwrap());
         assert_eq!(daemon.links().unwrap().len(), 1);
+    }
+
+    fn two_lists() -> Arc<Daemon> {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        let list = |href: &str, name: &str| caldav::RemoteList {
+            href: href.into(),
+            name: name.into(),
+            color: None,
+            order: None,
+            sync_token: Some("t1".into()),
+            ctag: None,
+            writable: true,
+        };
+        store
+            .apply_lists(&[
+                list("/cal/lab/", "champalimaud"),
+                list("/cal/home/", "Home"),
+            ])
+            .unwrap();
+        Daemon::new(Config::default(), store, zone).0
+    }
+
+    #[test]
+    fn a_rename_the_list_has_yet_to_follow_is_told_apart_from_the_links_state() {
+        let daemon = two_lists();
+        daemon.link("champalimaud", "jaehho/champalimaud").unwrap();
+        let at = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+        let waiting = |daemon: &Daemon| daemon.links().unwrap().remove(0).pending_rename;
+        assert_eq!(waiting(&daemon), None);
+
+        // Seen by the daemon: the link has moved, the list has not
+        daemon
+            .store()
+            .gh_rename("jaehho/champalimaud", "jaehho/lab", Some(at), None)
+            .unwrap();
+        let link = daemon.links().unwrap().remove(0);
+        assert_eq!(link.repo, "jaehho/lab");
+        assert_eq!(link.state, Some(LinkState::Renamed));
+        assert_eq!(
+            link.pending_rename,
+            Some(PendingRename {
+                from: "jaehho/champalimaud".into(),
+                since: at
+            })
+        );
+
+        // Held for another reason, it is still a rename the list waits on
+        daemon.gh_hold("jaehho/lab", LinkState::Conflict, "two links".into(), at);
+        let link = daemon.links().unwrap().remove(0);
+        assert_eq!(link.state, Some(LinkState::Conflict));
+        assert!(link.pending_rename.is_some());
+
+        daemon.store().gh_clear_follow("jaehho/lab").unwrap();
+        assert_eq!(waiting(&daemon), None);
+    }
+
+    #[test]
+    fn the_log_is_asked_for_by_repo_in_any_case_newest_first_and_no_more_than_it_keeps() {
+        let daemon = two_lists();
+        let at = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+        let add = |n: usize, repo: &str| {
+            daemon
+                .store()
+                .gh_log_add(&asst_core::store::NewLog {
+                    at,
+                    repo,
+                    list: None,
+                    kind: "repo-renamed",
+                    text: &format!("row {n}"),
+                    data: None,
+                    by: "auto",
+                })
+                .unwrap();
+        };
+        for n in 0..6 {
+            add(
+                n,
+                if n % 2 == 0 {
+                    "jaehho/lab"
+                } else {
+                    "jaehho/asst"
+                },
+            );
+        }
+        let texts = |repo: &str, limit: u32| -> Vec<String> {
+            daemon
+                .link_log(repo, limit)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.text)
+                .collect()
+        };
+        assert_eq!(texts("", 3), ["row 5", "row 4", "row 3"]);
+        assert_eq!(texts("Jaehho/LAB", 10), ["row 4", "row 2", "row 0"]);
+        assert_eq!(texts(" jaehho/lab ", 2), ["row 4", "row 2"]);
+        assert!(texts("jaehho/nobody", 10).is_empty());
+        assert!(texts("", 0).is_empty());
+
+        // The log keeps 500 rows and no call gets more than that
+        for n in 6..520 {
+            add(n, "jaehho/lab");
+        }
+        let all = daemon.link_log("", u32::MAX).unwrap();
+        assert_eq!(all.len(), 500);
+        assert_eq!(all[0].text, "row 519");
+        assert_eq!(all[499].text, "row 20");
+    }
+
+    fn link_row(archived: Option<i64>, follow: Option<(&str, i64)>) -> GhLinkRow {
+        GhLinkRow {
+            repo: "jaehho/lab".into(),
+            list: "/cal/lab/".into(),
+            repo_id: Some(1379104005),
+            archived,
+            follow_from: follow.map(|(from, _)| from.to_string()),
+            follow_at: follow.map(|(_, at)| at),
+        }
+    }
+
+    #[test]
+    fn a_link_says_what_needs_a_look_the_most_pressing_first() {
+        use chrono::TimeZone;
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let at = |d: u32, h: u32| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let now = at(20, 16);
+        let found = |row: &GhLinkRow, hold: Option<&Hold>, open: usize| {
+            link_condition(row, "lab", hold, open, zone, now)
+        };
+
+        // Looked at and live, or not looked at: nothing to say
+        assert_eq!(found(&link_row(Some(0), None), None, 3), None);
+        assert_eq!(found(&link_row(None, None), None, 3), None);
+
+        // Archived: when it was first seen (in the user's day), and what
+        // is left open here
+        let archived = link_row(Some(at(19, 2).timestamp()), None);
+        let c = found(&archived, None, 0).unwrap();
+        assert_eq!(c.state, LinkState::Archived);
+        assert_eq!(c.since, Some(at(19, 2)));
+        assert_eq!(
+            c.note,
+            "archived on GitHub, first seen 2026-10-18; no open tasks here"
+        );
+        assert_eq!(
+            found(&archived, None, 1).unwrap().note,
+            "archived on GitHub, first seen 2026-10-18; 1 task is still open here \
+             (a list archived in the window still syncs and rings)"
+        );
+        assert_eq!(
+            found(&archived, None, 4).unwrap().note,
+            "archived on GitHub, first seen 2026-10-18; 4 tasks are still open here \
+             (a list archived in the window still syncs and rings)"
+        );
+
+        // A rename the list has not followed comes before an archive
+        let renamed = link_row(
+            Some(at(19, 2).timestamp()),
+            Some(("jaehho/champalimaud", at(18, 15).timestamp())),
+        );
+        let c = found(&renamed, None, 0).unwrap();
+        assert_eq!(c.state, LinkState::Renamed);
+        assert_eq!(c.since, Some(at(18, 15)));
+        assert_eq!(
+            c.note,
+            "renamed from jaehho/champalimaud on 2026-10-18; the list is still called \"lab\""
+        );
+
+        // A held pass comes before both
+        let hold = |state, days: i64| Hold {
+            state,
+            note: "GitHub cannot find it".into(),
+            since: now - chrono::Duration::days(days),
+        };
+        let held = hold(LinkState::Replaced, 0);
+        let c = found(&renamed, Some(&held), 0).unwrap();
+        assert_eq!(
+            (c.state, c.note.as_str()),
+            (LinkState::Replaced, "GitHub cannot find it")
+        );
+        assert_eq!(c.since, Some(now));
+
+        // Not finding a repo says how to let go of it, after two weeks
+        let new = hold(LinkState::Unreachable, 13);
+        assert_eq!(
+            found(&renamed, Some(&new), 0).unwrap().note,
+            "GitHub cannot find it"
+        );
+        let old = hold(LinkState::Unreachable, 14);
+        assert_eq!(
+            found(&renamed, Some(&old), 0).unwrap().note,
+            "GitHub cannot find it; asst unlink jaehho/lab if it is gone for good"
+        );
+        // ... and only for that state
+        let replaced = hold(LinkState::Replaced, 30);
+        assert_eq!(
+            found(&renamed, Some(&replaced), 0).unwrap().note,
+            "GitHub cannot find it"
+        );
+    }
+
+    #[test]
+    fn a_hold_keeps_its_start_while_it_goes_on_and_ends_with_a_confirmed_pass() {
+        use chrono::TimeZone;
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let store = Store::in_memory(zone).unwrap();
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        let at = |m: u32| Utc.with_ymd_and_hms(2026, 10, 18, 12, m, 0).unwrap();
+        let hold = |daemon: &Daemon| {
+            daemon
+                .gh_state
+                .lock()
+                .unwrap()
+                .get("jaehho/lab")
+                .and_then(|s| s.hold.clone())
+        };
+
+        daemon.gh_hold("jaehho/lab", LinkState::Unreachable, "a".into(), at(0));
+        daemon.gh_hold("jaehho/lab", LinkState::Unreachable, "b".into(), at(5));
+        let h = hold(&daemon).unwrap();
+        assert_eq!(
+            (h.since, h.note.as_str()),
+            (at(0), "b"),
+            "same state, same start"
+        );
+        daemon.gh_hold("jaehho/lab", LinkState::Replaced, "c".into(), at(9));
+        assert_eq!(
+            hold(&daemon).unwrap().since,
+            at(9),
+            "another state starts again"
+        );
+
+        // A refusal says nothing about what it held; a confirmed look lifts it
+        daemon.gh_pass_done("jaehho/lab", Err("GitHub refused".into()));
+        assert!(hold(&daemon).is_some());
+        daemon.gh_release("jaehho/lab");
+        assert!(hold(&daemon).is_none());
+        daemon.gh_hold("jaehho/lab", LinkState::Conflict, "d".into(), at(12));
+        daemon.gh_pass_done("jaehho/lab", Ok(()));
+        assert!(
+            hold(&daemon).is_none(),
+            "a pass that ran has confirmed the repo"
+        );
     }
 
     #[tokio::test]

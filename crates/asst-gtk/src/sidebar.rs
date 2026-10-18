@@ -371,7 +371,7 @@ impl Sidebar {
                     r.link.set_visible(true);
                     r.link
                         .set_tooltip_text(Some(&model::link_state(l, pickers::now())));
-                    if l.error.is_some() {
+                    if model::link_warns(l) {
                         r.link.add_css_class("warning");
                     } else {
                         r.link.remove_css_class("warning");

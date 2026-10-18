@@ -1,0 +1,22 @@
+HTTP/2 200
+content-type: application/json; charset=utf-8
+etag: "45affe4b62fa7f4bcef84f988e8f0267fd85a1ef28e90592f8fcbe38f24ecb2e"
+x-ratelimit-limit: 5000
+x-ratelimit-remaining: 4995
+x-ratelimit-reset: 1792299676
+
+{
+  "id": 1379104005,
+  "name": "lab",
+  "full_name": "jaehho/lab",
+  "private": true,
+  "owner": {
+    "login": "jaehho",
+    "type": "User"
+  },
+  "fork": false,
+  "default_branch": "main",
+  "archived": false,
+  "disabled": false,
+  "visibility": "private"
+}

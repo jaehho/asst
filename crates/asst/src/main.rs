@@ -2,6 +2,7 @@
 
 mod bar;
 mod out;
+mod projects;
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -12,12 +13,13 @@ use asst_core::api::{
     SettingsChange, StatusView, SyncState, TaskView,
 };
 use asst_core::fmt;
-use asst_core::store::{Query, Store, View};
+use asst_core::github::FollowRename;
+use asst_core::store::{LogRow, Query, Store, View};
 use asst_core::sync::Report;
 use asst_core::task::priority_level;
 use asst_core::track;
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use out::Style;
 
@@ -99,6 +101,13 @@ enum Cmd {
         #[arg(value_name = "OWNER/REPO")]
         repo: String,
     },
+    /// What the ties to GitHub repos need: lists to rename, retired repos,
+    /// old labels. Reads and proposes; changes nothing. `asst projects log`
+    /// is what asstd did by itself
+    Projects {
+        #[command(subcommand)]
+        action: Option<ProjectsCmd>,
+    },
     /// Show a task in the window
     Open { id: String },
     /// Show one task
@@ -169,6 +178,10 @@ enum Cmd {
         /// Minutes before the due time that reminder rings (0: at the due time)
         #[arg(long)]
         alarm_before: Option<u32>,
+        /// What a list does when its repo is renamed: `list` renames a list
+        /// named exactly for the old repo, `off` leaves it (and says so)
+        #[arg(long, value_enum)]
+        follow_rename: Option<Follow>,
     },
     /// Sync with the server now
     Sync,
@@ -198,6 +211,19 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ProjectsCmd {
+    /// What asstd changed or decided about a link by itself, newest first
+    Log {
+        /// How many rows (the log keeps 500)
+        #[arg(short = 'n', long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
+        /// Only this repo's rows
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum TrackCmd {
     /// AFK-clipped tagged spans → blocks (replaces the day's actual blocks)
     Ingest {
@@ -218,6 +244,22 @@ enum TrackCmd {
         #[arg(long)]
         date: Option<String>,
     },
+}
+
+/// `--follow-rename`'s two words.
+#[derive(Clone, Copy, ValueEnum)]
+enum Follow {
+    List,
+    Off,
+}
+
+impl From<Follow> for FollowRename {
+    fn from(f: Follow) -> FollowRename {
+        match f {
+            Follow::List => FollowRename::List,
+            Follow::Off => FollowRename::Off,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -623,15 +665,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     return show_json(&raw);
                 }
                 let links: Vec<LinkView> = serde_json::from_str(&raw)?;
-                if links.is_empty() {
-                    println!(
-                        "{}",
-                        style.dim("no list is linked; `asst link <list> <owner/repo>`")
-                    );
-                }
-                for l in links {
-                    println!("{} ⇄ {}", l.name, l.repo);
-                }
+                println!("{}", out::links_text(&style, &links));
             }
         },
         Cmd::Unlink { repo } => {
@@ -641,6 +675,36 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if !json {
                 println!("{} {repo}", style.dim("Unlinked:"));
             }
+        }
+        Cmd::Projects { action: None } => {
+            let facts = projects::gather(&proxy).await?;
+            let log = facts.log.clone();
+            let report = projects::build(facts);
+            if json {
+                return show_json(&serde_json::to_string(&report)?);
+            }
+            println!("{}", out::projects_text(&style, &report, zone));
+            if let Some(line) = out::log_pointer(&style, &log, Utc::now(), zone) {
+                println!("\n{line}");
+            }
+        }
+        Cmd::Projects {
+            action: Some(ProjectsCmd::Log { limit, repo }),
+        } => {
+            let raw = match proxy
+                .link_log(repo.as_deref().map_or("", str::trim), limit)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(e) if projects::is_unknown_method(&e) => bail!(projects::OLD_DAEMON),
+                Err(e) => return Err(e.into()),
+            };
+            if json {
+                return show_json(&raw);
+            }
+            let rows: Vec<LogRow> = serde_json::from_str(&raw)?;
+            let asked = repo.as_deref().map(str::trim).filter(|r| !r.is_empty());
+            println!("{}", out::log_text(&style, &rows, zone, asked));
         }
         Cmd::Open { id } => {
             let t: TaskView = serde_json::from_str(&proxy.get(&id).await?)?;
@@ -765,6 +829,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             snooze,
             alarm_at_due,
             alarm_before,
+            follow_rename,
         } => {
             let change = SettingsChange {
                 inbox: inbox.map(|i| Some(i).filter(|i| !i.eq_ignore_ascii_case("default"))),
@@ -772,6 +837,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 snooze,
                 alarm_at_due,
                 alarm_before,
+                follow_rename: follow_rename.map(FollowRename::from),
             };
             let raw = if change == SettingsChange::default() {
                 proxy.settings().await?
@@ -804,6 +870,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     m => format!("{} before", fmt::minutes(u64::from(m))),
                 },
             );
+            row("follow-rename", out::follow_rename_words(s.follow_rename));
         }
 
         Cmd::Lists => {
@@ -857,6 +924,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 return show_json(&raw);
             }
             print_status(&style, &serde_json::from_str(&raw)?);
+            // Links are an extra: a daemon that cannot list them still has a status
+            if let Ok(raw) = proxy.links().await
+                && let Ok(links) = serde_json::from_str::<Vec<LinkView>>(&raw)
+                && let Some(line) = out::links_status(&style, &links)
+            {
+                println!("{line}");
+            }
         }
 
         Cmd::Login {
@@ -1072,8 +1146,7 @@ mod tests {
             repo: repo.into(),
             list: format!("/cal/{name}/"),
             name: name.into(),
-            synced: None,
-            error: None,
+            ..LinkView::default()
         }
     }
 
@@ -1088,5 +1161,52 @@ mod tests {
         assert_eq!(link_of_repo(&links, "Jaehho/Dash"), Some(&links[1]));
         assert_eq!(link_of_repo(&links, "jaehho/other"), None);
         assert_eq!(link_of_repo(&[], "jaehho/lab"), None);
+    }
+
+    #[test]
+    fn a_list_follows_its_repo_or_not_and_there_is_no_third_word() {
+        let change = |word: &str| {
+            let cli = Cli::try_parse_from(["asst", "settings", "--follow-rename", word]).ok()?;
+            match cli.command {
+                Some(Cmd::Settings { follow_rename, .. }) => follow_rename.map(FollowRename::from),
+                _ => None,
+            }
+        };
+        assert_eq!(change("list"), Some(FollowRename::List));
+        assert_eq!(change("off"), Some(FollowRename::Off));
+        assert_eq!(change("on"), None);
+        assert_eq!(change("yes"), None);
+        // Left out, the setting is left alone
+        let cli = Cli::try_parse_from(["asst", "settings", "--interval", "300"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Settings {
+                follow_rename: None,
+                ..
+            })
+        ));
+    }
+
+    /// `asst projects` reads and proposes. It reaches the database only
+    /// through `Store::label_totals` (read-only, migrating nothing), writes
+    /// no file, and names nothing that deletes or links.
+    #[test]
+    fn the_report_names_nothing_that_changes_anything() {
+        let text = include_str!("projects.rs");
+        let code = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+        assert!(code.len() > 1000, "the code was found");
+        for word in [
+            "delete_list",
+            "gh_unlink",
+            "remove_list",
+            "DELETE FROM",
+            "Store::open",
+            "fs::write",
+            "File::create",
+            ".link(",
+            ".unlink(",
+        ] {
+            assert!(!code.contains(word), "projects.rs names {word}");
+        }
     }
 }

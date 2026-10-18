@@ -1482,14 +1482,26 @@ pub fn link_edit(current: Option<&str>, typed: &str) -> Result<LinkEdit, String>
     })
 }
 
-/// A list's GitHub link, as its sidebar mark's tooltip says it.
+/// A list's GitHub link, as its sidebar mark's tooltip says it: when its
+/// issues were read, or what went wrong, then on a line of its own what the
+/// daemon found about the repo (archived, renamed, not the same repo).
 pub fn link_state(l: &LinkView, now: DateTime<Tz>) -> String {
-    match (&l.error, l.synced) {
+    let read = match (&l.error, l.synced) {
         (Some(e), Some(t)) => format!("{}: {e} (last read {})", l.repo, ago(t, now)),
         (Some(e), None) => format!("{}: {e}", l.repo),
         (None, Some(t)) => format!("Issues of {} read {}", l.repo, ago(t, now)),
         (None, None) => format!("Issues of {}: not read yet", l.repo),
+    };
+    match (&l.state, &l.note) {
+        (Some(_), Some(note)) => format!("{read}\n{note}"),
+        _ => read,
     }
+}
+
+/// Whether the link's mark shows a warning: its last pass failed, or its
+/// issues are not being read at all.
+pub fn link_warns(l: &LinkView) -> bool {
+    l.error.is_some() || l.state.is_some_and(|s| s.stalls())
 }
 
 /// `just now`, `12 seconds ago`, `5 minutes ago`, `3 hours ago`, then the
@@ -2168,6 +2180,7 @@ mod tests {
             name: "asst".into(),
             synced: synced.map(|s| now().with_timezone(&Utc) - Duration::seconds(s)),
             error: error.map(str::to_string),
+            ..LinkView::default()
         };
         assert_eq!(
             link_state(&link(Some(150), None), now()),
@@ -2181,6 +2194,52 @@ mod tests {
             link_state(&link(Some(61), Some("the server answered 403")), now()),
             "jaehho/asst: the server answered 403 (last read 1 minute ago)"
         );
+    }
+
+    #[test]
+    fn a_link_that_needs_a_look_says_what_was_found_on_its_own_line() {
+        use asst_core::api::LinkState;
+        let link = |state: Option<LinkState>, error: Option<&str>| LinkView {
+            repo: "jaehho/mail-digest".into(),
+            list: "/cal/mail-digest/".into(),
+            name: "mail-digest".into(),
+            synced: Some(now().with_timezone(&Utc) - Duration::seconds(150)),
+            error: error.map(str::to_string),
+            state,
+            note: state.map(|_| {
+                "archived on GitHub, first seen 2026-10-18; no open tasks here".to_string()
+            }),
+            ..LinkView::default()
+        };
+        let archived = link(Some(LinkState::Archived), None);
+        assert_eq!(
+            link_state(&archived, now()),
+            "Issues of jaehho/mail-digest read 2 minutes ago\n\
+             archived on GitHub, first seen 2026-10-18; no open tasks here"
+        );
+        // A fine link has no second line, even with a stale note
+        let fine = LinkView {
+            note: Some("old".into()),
+            ..link(None, None)
+        };
+        assert_eq!(
+            link_state(&fine, now()),
+            "Issues of jaehho/mail-digest read 2 minutes ago"
+        );
+
+        // The mark warns when the pass failed or the issues are not read,
+        // not for a repo that is merely archived or renamed
+        assert!(!link_warns(&link(None, None)));
+        assert!(!link_warns(&archived));
+        assert!(!link_warns(&link(Some(LinkState::Renamed), None)));
+        assert!(link_warns(&link(None, Some("the server answered 403"))));
+        for stalled in [
+            LinkState::Unreachable,
+            LinkState::Replaced,
+            LinkState::Conflict,
+        ] {
+            assert!(link_warns(&link(Some(stalled), None)), "{stalled:?}");
+        }
     }
 
     #[test]

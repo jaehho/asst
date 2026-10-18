@@ -11,5 +11,7 @@ pub mod recur;
 pub mod store;
 pub mod sync;
 pub mod task;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod time;
 pub mod track;

@@ -104,7 +104,7 @@ const DEFAULT_SIDEBAR: [Nav; 6] = [
 ];
 
 fn path() -> PathBuf {
-    asst_core::config::config_path().with_file_name("window.toml")
+    asst_core::config::window_path()
 }
 
 impl Prefs {
@@ -324,6 +324,22 @@ mod tests {
         assert!(p.prune_plan(&live));
         assert_eq!(p.plan.len(), 1);
         assert!(!p.prune_plan(&live));
+    }
+
+    #[test]
+    fn the_archive_is_written_where_asst_projects_reads_it() {
+        // `asst projects` reads the key by name; the window writes the file.
+        let p = Prefs {
+            archived: vec!["/cal/mail-digest-d1e268/".into(), "/cal/old/".into()],
+            ..Prefs::default()
+        };
+        let text = toml::to_string(&p).unwrap();
+        assert_eq!(
+            asst_core::config::archived_lists(&text),
+            ["/cal/mail-digest-d1e268/", "/cal/old/"]
+        );
+        let none = toml::to_string(&Prefs::default()).unwrap();
+        assert!(asst_core::config::archived_lists(&none).is_empty());
     }
 
     #[test]
