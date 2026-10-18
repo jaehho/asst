@@ -409,6 +409,12 @@ impl Prefs {
         }
     }
 
+    /// Whether the sidebar shows the default views in the default order,
+    /// saved or not: a reset would change nothing.
+    pub fn is_default_sidebar(&self) -> bool {
+        self.sidebar_views() == DEFAULT_SIDEBAR
+    }
+
     /// Back to the default sidebar. What `sidebar` held, as saved, for the
     /// Undo to write back.
     pub fn reset_sidebar(&mut self) -> Option<Vec<String>> {
@@ -991,6 +997,27 @@ day_zoom = 52.0
         let reread = parse(&toml::to_string(&all).unwrap());
         assert_eq!(reread.sidebar_views(), Nav::filters());
         assert_eq!(reread.migrated_from, None);
+    }
+
+    #[test]
+    fn a_sidebar_that_shows_the_default_needs_no_reset() {
+        let mut p = Prefs::default();
+        assert!(p.is_default_sidebar());
+        // Saved as the default, it is the default all the same.
+        p.sidebar = Some(keys(&DEFAULT_SIDEBAR));
+        assert!(p.is_default_sidebar());
+        // A different set, a different order, or none at all is not.
+        for views in [
+            vec![Nav::Inbox],
+            vec![Nav::Day, Nav::Inbox],
+            vec![Nav::Inbox, Nav::Day, Nav::Today],
+            vec![],
+        ] {
+            p.set_sidebar_views(&views);
+            assert!(!p.is_default_sidebar(), "{views:?}");
+        }
+        p.reset_sidebar();
+        assert!(p.is_default_sidebar());
     }
 
     #[test]
