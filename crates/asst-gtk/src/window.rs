@@ -1388,9 +1388,9 @@ impl Component for Window {
                     }
                     Nav::Completed => sender.input(Msg::Complete(href)),
                     // Dropped on Day: give it the next free half hour
-                    // on the day the view is showing.
+                    // on the plan's day.
                     Nav::Day => {
-                        let day = self.day_day;
+                        let day = self.plan_day();
                         let start = self
                             .prefs
                             .plan
@@ -1423,7 +1423,7 @@ impl Component for Window {
                 });
             }
             Msg::PlanSet(href, start, duration) => {
-                let day = self.day_day;
+                let day = self.plan_day();
                 let prior = self.plan_slot(&href, day);
                 let Some(t) = self.find(&href).cloned() else {
                     return;
@@ -2896,6 +2896,17 @@ impl Window {
         self.find(href).cloned()
     }
 
+    /// The day a task is put on the plan for: the day the Day view is
+    /// stepped to while it is on screen, else today. `day_day` is kept when
+    /// Day is left, so elsewhere it is a day nobody is looking at.
+    fn plan_day(&self) -> NaiveDate {
+        if self.nav == Nav::Day {
+            self.day_day
+        } else {
+            self.now().date_naive()
+        }
+    }
+
     /// Today's planned slot for `href`, for an undo toast to hold.
     fn plan_slot(&self, href: &str, date: NaiveDate) -> Option<(u32, u32)> {
         let t = self.find(href)?;
@@ -3065,14 +3076,14 @@ impl Window {
                 }
             }
             Key::PlanPlace => {
-                // The task under the cursor goes on the plan of the day the
-                // Day view is on (today, unless stepped): at its own time,
-                // else the first free slot. Any view will do, so a task can
-                // be planned from the Inbox without a trip to Day.
+                // The task under the cursor goes on the plan of the day on
+                // view (today, away from Day): at its own time, else the
+                // first free slot. Any view will do, so a task can be
+                // planned from the Inbox without a trip to Day.
                 let Some(t) = self.cursor_task().filter(|t| t.task.is_open()) else {
                     return;
                 };
-                let day = self.day_day;
+                let day = self.plan_day();
                 if let Some((start, _)) = self.plan_slot(&t.href, day) {
                     let said = format!(
                         "{} is already planned at {}",
@@ -3505,6 +3516,7 @@ impl Window {
     /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
     /// `plan <words> at HH:MM [minutes]`, `planoff <words>`,
     /// `planghost <words> at HH:MM [minutes]`, `planghostoff`,
+    /// `dropview <words> on <view>` (a task dropped on a sidebar tile),
     /// `daystep ±N` (the view's day cursor), `daytoday`, `nodate` (the tray's
     /// No date section, open or shut).
     fn drive(&mut self, w: &mut Widgets, sender: &ComponentSender<Self>, command: &str) {
@@ -3636,6 +3648,15 @@ impl Window {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(model::PLAN_DEFAULT_DURATION);
                 sender.input(Msg::PlanSet(h, start, duration));
+            }
+            // A task dropped on a view's tile in the sidebar.
+            "dropview" => {
+                if let Some((words, view)) = arg.split_once(" on ")
+                    && let Some(h) = task(words)
+                    && let Some(nav) = Nav::from_key(view.trim())
+                {
+                    sender.input(Msg::DropTask(h, nav));
+                }
             }
             // The Day view's Carry button.
             "carry" => sender.input(Msg::PlanCarry),
