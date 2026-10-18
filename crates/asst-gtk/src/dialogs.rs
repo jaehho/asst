@@ -289,7 +289,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             "Moving around",
             &[
                 ("Next / previous task", "j k"),
-                ("First / last task", "g G"),
+                ("First / last task", "g <Shift>g"),
                 ("Previous / next view", "bracketleft bracketright"),
                 ("Inbox", "<Control>i"),
                 ("Today", "<Control>t"),
@@ -325,10 +325,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                 ("Place the task on the plan at now", "n"),
                 ("Move the block start", "Left Right"),
                 ("Complete the block", "x space"),
-                (
-                    "Zoom the day grid",
-                    "<Control>plus <Control>minus <Control>scroll",
-                ),
+                ("Zoom the day grid", "<Control>plus <Control>minus"),
             ],
         ),
         (
@@ -356,10 +353,17 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             ],
         ),
     ];
+    // What the keycaps cannot draw, said under their row: the wheel is
+    // no accelerator, and Adwaita warns and stops drawing at one.
+    let notes = [("Zoom the day grid", "Or hold Ctrl and scroll")];
     for (title, items) in sections {
         let section = adw::ShortcutsSection::new(Some(title));
         for (what, keys) in items {
-            section.add(adw::ShortcutsItem::new(what, keys));
+            let item = adw::ShortcutsItem::new(what, keys);
+            if let Some((_, note)) = notes.iter().find(|(t, _)| t == what) {
+                item.set_subtitle(note);
+            }
+            section.add(item);
         }
         dialog.add(section);
     }
