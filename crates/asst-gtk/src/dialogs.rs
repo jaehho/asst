@@ -309,6 +309,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                 ("Priority 1–4", "1...4"),
                 ("Due today / tomorrow", "t m"),
                 ("Next week", "w"),
+                ("Put the task on the day plan", "n"),
                 ("Select tasks", "v"),
                 ("From the title to the notes", "Tab"),
                 (
@@ -322,7 +323,6 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
         (
             "Day",
             &[
-                ("Place the task on the plan at now", "n"),
                 ("Move the block start", "Left Right Up Down"),
                 ("Complete the block", "x space"),
                 ("Zoom the day grid", "<Control>plus <Control>minus"),

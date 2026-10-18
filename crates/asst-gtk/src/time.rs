@@ -58,11 +58,20 @@ pub fn day_note(blocks: &[BlockView]) -> String {
     format!("{} tracked", dur_label(total))
 }
 
+/// Whether any of `b` falls on `day`. Blocks the day stepped away from stay
+/// in the window until the new day's arrive, and are not on it.
+fn touches(b: &BlockView, day: NaiveDate, zone: Tz) -> bool {
+    let start_of = |d: NaiveDate| {
+        asst_core::time::resolve(zone, d.and_time(chrono::NaiveTime::MIN)).timestamp_millis()
+    };
+    b.end > start_of(day) && b.start < start_of(day.succ_opt().unwrap_or(day))
+}
+
 /// Earliest tracked minute on `day`, for scroll-to-first on other days.
 pub fn first_min(blocks: &[BlockView], day: NaiveDate, zone: Tz) -> Option<f64> {
     blocks
         .iter()
-        .filter(|b| !b.planned)
+        .filter(|b| !b.planned && touches(b, day, zone))
         .map(|b| daygrid::minutes_from_midnight(b.start, day, zone))
         .fold(None, |acc: Option<f64>, m| {
             Some(acc.map_or(m, |a| a.min(m)))
@@ -148,5 +157,56 @@ pub fn fill_lane(
         wrap.set_margin_top(top as i32);
         wrap.append(&row);
         overlay.add_overlay(&wrap);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    fn ny() -> Tz {
+        "America/New_York".parse().unwrap()
+    }
+
+    fn block(from: (u32, u32, u32), to: (u32, u32, u32)) -> BlockView {
+        let ms = |(d, h, m): (u32, u32, u32)| {
+            ny().with_ymd_and_hms(2026, 9, d, h, m, 0)
+                .unwrap()
+                .timestamp_millis()
+        };
+        BlockView {
+            id: None,
+            task_uid: None,
+            start: ms(from),
+            end: ms(to),
+            label: None,
+            planned: false,
+            source: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn the_first_minute_ignores_blocks_of_other_days() {
+        let day = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let yesterday = block((14, 9, 0), (14, 10, 0));
+        let today = block((15, 13, 30), (15, 14, 0));
+        // Stale blocks of the day just left must not pull the day to
+        // midnight, the minute a clamped edge reads as.
+        assert_eq!(first_min(std::slice::from_ref(&yesterday), day, ny()), None);
+        assert_eq!(
+            first_min(&[yesterday, today], day, ny()),
+            Some(13.0 * 60.0 + 30.0)
+        );
+        // A block that runs in from the night before starts the day.
+        let overnight = block((14, 23, 0), (15, 1, 0));
+        assert_eq!(first_min(&[overnight], day, ny()), Some(0.0));
+        // One that ended at midnight sharp, or starts the day after, is not
+        // on it.
+        let ended = block((14, 23, 0), (15, 0, 0));
+        let later = block((16, 0, 0), (16, 1, 0));
+        assert_eq!(first_min(&[ended, later], day, ny()), None);
     }
 }

@@ -278,7 +278,8 @@ pub enum Key {
     Delete,
     /// The Delete key: deliberate on its own, with Undo a toast away.
     Remove,
-    /// Place the focused tray task on the plan at now.
+    /// Put the cursor task on the day plan: at its own time, else the first
+    /// free slot.
     PlanPlace,
     /// Nudge the focused block's start by ±15 minutes.
     PlanNudge(i32),
@@ -1376,9 +1377,16 @@ impl Component for Window {
                 {
                     self.prefs.save();
                     self.shown = 0;
+                    // Away from the Day view the plan is out of sight, so
+                    // the toast says which day it went on.
+                    let on_day = if self.nav == Nav::Day {
+                        String::new()
+                    } else {
+                        format!(" {}", fmt::day_label(day, self.now().date_naive()))
+                    };
                     let said = match prior {
                         None => format!(
-                            "Planned {} at {}",
+                            "Planned {}{on_day} at {}",
                             quoted(&t.task.summary),
                             plan::clock_label(start)
                         ),
@@ -2998,19 +3006,28 @@ impl Window {
                 }
             }
             Key::PlanPlace => {
-                // The focused tray task goes on the plan at now, or at the
-                // hour of the focused block when that is what is under the
-                // cursor and a tray task is the one being placed.
-                let Some(t) = self.cursor_task() else { return };
-                if self.nav != Nav::Day {
+                // The task under the cursor goes on the plan of the day the
+                // Day view is on (today, unless stepped): at its own time,
+                // else the first free slot. Any view will do, so a task can
+                // be planned from the Inbox without a trip to Day.
+                let Some(t) = self.cursor_task().filter(|t| t.task.is_open()) else {
                     return;
-                }
+                };
                 let day = self.day_day;
-                if self.plan_slot(&t.href, day).is_some() {
+                if let Some((start, _)) = self.plan_slot(&t.href, day) {
+                    let said = format!(
+                        "{} is already planned at {}",
+                        quoted(&t.task.summary),
+                        plan::clock_label(start)
+                    );
+                    let toast = adw::Toast::builder()
+                        .title(glib::markup_escape_text(&said))
+                        .timeout(3)
+                        .build();
+                    self.plan_toast(w, toast);
                     return;
                 }
-                let plan = model::day_plan(&self.open, &self.prefs.plan, self.now(), day);
-                let start = model::place_start(plan.now_min, plan.hour_start);
+                let start = model::place_start(&t.task, &self.prefs.plan, day, self.now());
                 sender.input(Msg::PlanSet(t.href, start, model::PLAN_DEFAULT_DURATION));
             }
             Key::ZoomIn | Key::ZoomOut => {

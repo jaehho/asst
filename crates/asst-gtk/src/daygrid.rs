@@ -453,8 +453,8 @@ pub struct ScrollRest {
 
 /// Attach scroll-to-now (today) or scroll-to-first-content (other days) to
 /// `scroll`. `first_min` is the earliest minute the view drew, if any; on a
-/// non-today day the scroller rests there, or at 07:00 when the day is
-/// empty. Rebuilds of the same day keep the reader's place. `hold` is a
+/// non-today day the scroller opens an hour above it, or at 7 AM when the
+/// day is empty. Rebuilds of the same day keep the reader's place. `hold` is a
 /// minute to pin at `hold_y` from the top of the viewport (a zoom), and
 /// wins over both.
 pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
@@ -485,15 +485,13 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
             }
             let y = if let Some((mins, keep_y)) = hold {
                 model::scroll_keep_min(mins as u32, HOUR_START, HOUR_END, view_h, keep_y, px)
-            } else if recenter {
-                let target = if day == today {
-                    now_min
-                } else {
-                    first_min.or(Some(7.0 * 60.0))
-                };
-                target.map_or(0.0, |m| {
+            } else if recenter && day == today {
+                now_min.map_or(0.0, |m| {
                     scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
                 })
+            } else if recenter {
+                let top = model::day_rest_min(first_min);
+                model::scroll_keep_min(top, HOUR_START, HOUR_END, view_h, 0.0, px)
             } else {
                 let kept = scroll_slot(step).0;
                 if kept.is_finite() { kept } else { 0.0 }

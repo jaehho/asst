@@ -979,10 +979,57 @@ pub fn nudge_start(start: u32, delta: i32) -> u32 {
     snap(start as i32 + delta)
 }
 
-/// Where a keyboard place lands: `now` snapped to the grid when it sits
-/// there, else the first hour of the day. Never claims a false "now".
-pub fn place_start(now_min: Option<u32>, hour_start: u32) -> u32 {
-    now_min.map_or(hour_start * 60, |m| snap(m as i32))
+/// Where a keyboard place starts looking for room: the morning, not the
+/// grid's first row at midnight.
+pub const PLAN_PLACE_FROM: u32 = 9 * 60;
+
+/// Where a keyboard place lands on `day`: the task's own time of day when
+/// it has one, else the first free slot from 9:00. Today's search starts at
+/// now when that is later, so a plan never begins in the past.
+pub fn place_start(task: &Task, slots: &[PlanSlot], day: NaiveDate, now: DateTime<Tz>) -> u32 {
+    let zone = now.timezone();
+    if let Some(due) = task.due.as_ref().filter(|d| d.has_time()) {
+        let at = due.instant(zone).with_timezone(&zone).time();
+        return at.hour() * 60 + at.minute();
+    }
+    let mut from = PLAN_PLACE_FROM;
+    if day == now.date_naive() {
+        from = from.max(snap((now.hour() * 60 + now.minute()) as i32));
+    }
+    first_free(slots, day, from, PLAN_DEFAULT_DURATION)
+}
+
+/// The first start at or after `from`, on the grid, where `duration`
+/// minutes fit between `day`'s slots. With no room before midnight, `from`:
+/// blocks that overlap are laid side by side.
+fn first_free(slots: &[PlanSlot], day: NaiveDate, from: u32, duration: u32) -> u32 {
+    let mut busy: Vec<(u32, u32)> = slots
+        .iter()
+        .filter(|s| s.date == day)
+        .map(|s| (s.start, s.start + s.duration))
+        .collect();
+    busy.sort_unstable();
+    let mut start = from;
+    for (s, e) in busy {
+        if e <= start {
+            continue;
+        }
+        if s >= start + duration {
+            break;
+        }
+        start = e.div_ceil(PLAN_SNAP) * PLAN_SNAP;
+    }
+    if start + duration <= 24 * 60 {
+        start
+    } else {
+        from
+    }
+}
+
+/// The minute a day other than today opens at the top of the view: an hour
+/// before its first block, else 7 AM.
+pub fn day_rest_min(first_min: Option<f64>) -> u32 {
+    first_min.map_or(7 * 60, |m| (m as u32).saturating_sub(60))
 }
 
 /// `now` in minutes if it falls on the grid `hour_start..hour_end`, else
@@ -2829,12 +2876,105 @@ mod tests {
         );
     }
 
+    fn at(h: u32, m: u32) -> DateTime<Tz> {
+        ny().with_ymd_and_hms(2026, 9, 14, h, m, 0).unwrap()
+    }
+
     #[test]
-    fn keyboard_place_and_nudge_snap_to_the_grid() {
-        assert_eq!(place_start(Some(9 * 60 + 7), PLAN_HOUR_START), 9 * 60);
-        assert_eq!(place_start(Some(9 * 60 + 8), PLAN_HOUR_START), 9 * 60 + 15);
-        // Off the grid: the first hour, not a false now.
-        assert_eq!(place_start(None, PLAN_HOUR_START), PLAN_HOUR_START * 60);
+    fn place_takes_the_first_free_slot_from_nine() {
+        let t = task("t", "/a/", None).task;
+        let (mon, tue) = (date(9, 14), date(9, 15));
+        let slot_on = |d, uid: &str, start, duration| PlanSlot {
+            uid: uid.into(),
+            date: d,
+            start,
+            duration,
+        };
+        // Another day, before nine: 9:00, never the grid's midnight row.
+        assert_eq!(place_start(&t, &[], tue, at(7, 0)), 9 * 60);
+        // Today, before nine, is the same.
+        assert_eq!(place_start(&t, &[], mon, at(2, 19)), 9 * 60);
+        // A busy morning pushes it past, with no gap left between.
+        let busy = [
+            slot_on(tue, "a", 9 * 60, 30),
+            slot_on(tue, "b", 9 * 60 + 30, 30),
+        ];
+        assert_eq!(place_start(&t, &busy, tue, at(7, 0)), 10 * 60);
+        // Another day's slots are not in the way.
+        assert_eq!(place_start(&t, &busy, mon, at(7, 0)), 9 * 60);
+        // A gap too small for the default length is skipped; one that fits
+        // exactly is taken.
+        let gap = [
+            slot_on(tue, "a", 9 * 60, 30),
+            slot_on(tue, "b", 9 * 60 + 45, 30),
+        ];
+        assert_eq!(place_start(&t, &gap, tue, at(7, 0)), 10 * 60 + 15);
+        let fits = [
+            slot_on(tue, "a", 9 * 60, 30),
+            slot_on(tue, "b", 10 * 60, 30),
+        ];
+        assert_eq!(place_start(&t, &fits, tue, at(7, 0)), 9 * 60 + 30);
+        // A slot that ends off the grid hands over on the next rule.
+        let odd = [slot_on(tue, "a", 9 * 60, 40)];
+        assert_eq!(place_start(&t, &odd, tue, at(7, 0)), 9 * 60 + 45);
+        // Slots listed out of order, one covering the others.
+        let wide = [
+            slot_on(tue, "b", 9 * 60 + 30, 30),
+            slot_on(tue, "a", 9 * 60, 120),
+        ];
+        assert_eq!(place_start(&t, &wide, tue, at(7, 0)), 11 * 60);
+        // Today after nine looks from now (snapped), not into the past.
+        assert_eq!(place_start(&t, &[], mon, at(14, 8)), 14 * 60 + 15);
+        let now_busy = [slot_on(mon, "a", 14 * 60 + 15, 60)];
+        assert_eq!(place_start(&t, &now_busy, mon, at(14, 8)), 15 * 60 + 15);
+        // Late in the day with no room left: where the search began.
+        let full = [slot_on(mon, "a", 22 * 60, 120)];
+        assert_eq!(place_start(&t, &full, mon, at(23, 40)), 23 * 60 + 45);
+        let packed = [slot_on(tue, "a", 9 * 60, 15 * 60)];
+        assert_eq!(place_start(&t, &packed, tue, at(7, 0)), 9 * 60);
+    }
+
+    #[test]
+    fn place_keeps_the_time_a_task_already_has() {
+        let zone = ny();
+        let timed = |h, m| {
+            let mut t = task("t", "/a/", None).task;
+            t.due = Some(When::local(date(9, 14).and_hms_opt(h, m, 0).unwrap(), zone));
+            t
+        };
+        let slots = [PlanSlot {
+            uid: "a".into(),
+            date: date(9, 14),
+            start: 15 * 60,
+            duration: 60,
+        }];
+        // The minute it names, even off the grid and over another slot.
+        assert_eq!(
+            place_start(&timed(15, 20), &slots, date(9, 14), at(7, 0)),
+            15 * 60 + 20
+        );
+        // On another day (an overdue task brought forward) the clock stays.
+        assert_eq!(
+            place_start(&timed(15, 20), &[], date(9, 17), at(7, 0)),
+            15 * 60 + 20
+        );
+        // A date alone has no clock: the free slot, as for no date.
+        let dated = task("d", "/a/", on(date(9, 14))).task;
+        assert_eq!(place_start(&dated, &[], date(9, 14), at(7, 0)), 9 * 60);
+    }
+
+    #[test]
+    fn a_day_opens_an_hour_before_its_first_block() {
+        assert_eq!(day_rest_min(Some(9.0 * 60.0)), 8 * 60);
+        assert_eq!(day_rest_min(Some(9.0 * 60.0 + 30.0)), 8 * 60 + 30);
+        // Never above midnight.
+        assert_eq!(day_rest_min(Some(30.0)), 0);
+        // An empty day opens on the morning.
+        assert_eq!(day_rest_min(None), 7 * 60);
+    }
+
+    #[test]
+    fn keyboard_nudge_snaps_to_the_grid() {
         assert_eq!(nudge_start(9 * 60, 15), 9 * 60 + 15);
         assert_eq!(nudge_start(9 * 60, -15), 8 * 60 + 45);
         assert_eq!(nudge_start(9 * 60 + 7, 15), 9 * 60 + 15);
