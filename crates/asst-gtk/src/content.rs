@@ -81,9 +81,25 @@ pub fn section_target(kind: &Kind) -> Option<Target> {
     }
 }
 
+/// The add card, in a revealer either way so closing it can fold it. A view
+/// must place it while it is open: a card nothing holds takes no keys, and
+/// what is typed goes to the shortcuts.
+pub fn card(o: &Opts, add_card: &gtk::Box) -> gtk::Revealer {
+    ui::detach(add_card);
+    if o.fresh.adding {
+        motion::opening(add_card, gtk::RevealerTransitionType::SlideDown)
+    } else {
+        gtk::Revealer::builder()
+            .reveal_child(true)
+            .transition_duration(motion::ROW_MS)
+            .child(add_card)
+            .build()
+    }
+}
+
 pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Built {
     if o.nav == &Nav::Day {
-        return crate::day::build_column(o, sections, tx);
+        return crate::day::build_column(o, sections, add_card, tx);
     }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("view-column");
@@ -101,19 +117,6 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
             "focus-leave"
         });
     }
-    // In a revealer either way, so closing the card can fold it.
-    let card = || {
-        ui::detach(add_card);
-        if o.fresh.adding {
-            motion::opening(add_card, gtk::RevealerTransitionType::SlideDown)
-        } else {
-            gtk::Revealer::builder()
-                .reveal_child(true)
-                .transition_duration(motion::ROW_MS)
-                .child(add_card)
-                .build()
-        }
-    };
     let open = sections
         .iter()
         .filter(|s| s.kind != Kind::Completed)
@@ -125,7 +128,7 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
     if matches!(o.nav, Nav::Matrix) {
         root.append(&matrix(sections, o, tx, &mut rows));
         if o.adding.is_some() {
-            root.append(&card());
+            root.append(&card(o, add_card));
         }
         return Built { root, rows };
     }
@@ -139,14 +142,14 @@ pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Bu
         let adding_here = target.is_some() && target == o.adding;
         root.append(&section(s, o, tx, &mut rows, None));
         if adding_here {
-            root.append(&card());
+            root.append(&card(o, add_card));
             placed = true;
         } else if let Some(t) = target.filter(|_| s.title.is_none() && any) {
             root.append(&add_button(t, tx));
         }
     }
     if !placed && o.adding.is_some() {
-        root.append(&card());
+        root.append(&card(o, add_card));
     }
     if !any && o.adding.is_none() {
         root.append(&empty(o, tx));

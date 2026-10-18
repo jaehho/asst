@@ -1062,6 +1062,11 @@ impl Component for Window {
             Msg::DayStep(delta) => {
                 let day = self.day_day + chrono::Duration::days(i64::from(delta));
                 self.day_day = day;
+                // An open card follows the day on view, keeping its text.
+                if self.nav == Nav::Day && matches!(self.adding, Some(Target::Day(_))) {
+                    self.adding = Some(Target::Day(day));
+                    w.add_card.set_target(Target::Day(day));
+                }
                 self.reload_blocks(&sender, day);
                 self.shown = 0;
             }
@@ -2159,7 +2164,8 @@ impl Component for Window {
                     let here = match &self.nav {
                         Nav::List(h) => &t.list == h,
                         Nav::Inbox => model::inbox(&self.lists).is_some_and(|l| l.href == t.list),
-                        Nav::Today => t
+                        // Day's tray holds what is due by today, whatever day is on view.
+                        Nav::Today | Nav::Day => t
                             .task
                             .due
                             .as_ref()
@@ -2527,16 +2533,12 @@ impl Window {
     }
 
     fn default_target(&self) -> Target {
-        let today = self.now().date_naive();
-        match &self.nav {
-            Nav::List(h) => Target::List(h.clone()),
-            Nav::Inbox => {
-                model::inbox(&self.lists).map_or(Target::Anywhere, |l| Target::List(l.href.clone()))
-            }
-            Nav::Today | Nav::Scheduled => Target::Day(today),
-            Nav::Tomorrow => Target::Day(today + Days::days(1)),
-            _ => Target::Anywhere,
-        }
+        add_target(
+            &self.nav,
+            model::inbox(&self.lists).map(|l| l.href.as_str()),
+            self.now().date_naive(),
+            self.day_day,
+        )
     }
 
     /// Open a task in place, closing the one open before.
@@ -4281,6 +4283,19 @@ fn scroll_while_dragging(scroller: &gtk::ScrolledWindow) {
     scroller.add_controller(motion);
 }
 
+/// Where the add card puts a task in `nav` when the text says nothing else.
+/// Day adds to the day on view, to the inbox like any dated task.
+fn add_target(nav: &Nav, inbox: Option<&str>, today: NaiveDate, viewed: NaiveDate) -> Target {
+    match nav {
+        Nav::List(h) => Target::List(h.clone()),
+        Nav::Inbox => inbox.map_or(Target::Anywhere, |h| Target::List(h.to_string())),
+        Nav::Today | Nav::Scheduled => Target::Day(today),
+        Nav::Tomorrow => Target::Day(today + Days::days(1)),
+        Nav::Day => Target::Day(viewed),
+        _ => Target::Anywhere,
+    }
+}
+
 /// A task's title as a file name: no slashes or control characters, not too long.
 fn file_name(title: &str) -> String {
     let name: String = title
@@ -4555,5 +4570,24 @@ mod tests {
         // `d` waits for a second `d`, as vim's does; the Delete key acts.
         assert!(matches!(vim_key(K::d), Some(Key::Delete)));
         assert!(matches!(vim_key(K::Delete), Some(Key::Remove)));
+    }
+
+    #[test]
+    fn day_adds_to_the_day_on_view_and_does_not_fall_through_to_anywhere() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let viewed = today + Days::days(3);
+        let inbox = Some("/u/inbox/");
+        assert_eq!(
+            add_target(&Nav::Day, inbox, today, viewed),
+            Target::Day(viewed)
+        );
+        assert_eq!(
+            add_target(&Nav::Today, inbox, today, viewed),
+            Target::Day(today)
+        );
+        assert_eq!(
+            add_target(&Nav::Inbox, inbox, today, viewed),
+            Target::List("/u/inbox/".into())
+        );
     }
 }

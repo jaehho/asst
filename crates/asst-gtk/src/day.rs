@@ -12,6 +12,7 @@ use crate::{content, plan, row, time};
 pub fn build_column(
     o: &content::Opts<'_>,
     _sections: &[crate::model::Section],
+    add_card: &gtk::Box,
     tx: &crate::window::Tx,
 ) -> content::Built {
     let p = o.plan;
@@ -59,6 +60,10 @@ pub fn build_column(
         carry,
         tx,
     ));
+
+    if o.adding.is_some() {
+        root.append(&content::card(o, add_card));
+    }
 
     let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
     if let Some(href) = o.editing {
