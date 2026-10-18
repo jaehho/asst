@@ -3,6 +3,8 @@
 //! and state both sides last agreed on; a pass compares each side with that
 //! base, so it works the same whichever side changed, and a push that
 //! failed is simply found again next time. `plan` decides, the daemon does.
+//! `judge` and `follow_list_name` decide the same way about the repo itself:
+//! whether it is still the one linked, and whether its list follows a rename.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -234,6 +236,167 @@ fn merge(p: &Pair, i: &Issue, t: &Ref) -> Option<Op> {
         body,
         priority,
     })
+}
+
+/// What one look at a repo means for its link, given what is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Still the repo that is linked, nothing changed.
+    Fine,
+    /// Nothing is stored for this link yet and the name found the repo:
+    /// remember its id (and its archived flag, without a log row).
+    LearnId(u64),
+    /// The repo is called `to` now. `witnessed` is that the link had an id
+    /// and the record under it changed: this is an event. Without an id the
+    /// old name merely redirects, the move is found after the fact, and the
+    /// caller learns the record's id as it moves the link.
+    Renamed { to: String, witnessed: bool },
+    /// Archived or disabled since the last look.
+    Archived,
+    /// No longer archived or disabled.
+    Unarchived,
+    /// The name belongs to another repo (`found` is its id) than the one
+    /// whose id is stored: deleted and made again, or the name was reused.
+    /// Nothing on that repo is the linked project's.
+    Replaced { found: u64 },
+    /// The look settles nothing: no finding, no change.
+    Unknown,
+}
+
+/// Judge one look at the repo linked as `linked`, whose stored id (if any)
+/// and archived baseline (`None`: never observed) are given. One finding
+/// per look, the one that matters most: another repo, then a new name, then
+/// the archived flag.
+///
+/// A redirect names only an id, not the repo's new name, so a `Moved` alone
+/// is not enough to rename by. The caller follows it with a look by that id
+/// and judges the record, which is the "301 then record" case: with an id
+/// stored, a `Moved` to another one is `Replaced` all the same.
+pub fn judge(
+    stored_id: Option<u64>,
+    linked: &str,
+    archived: Option<bool>,
+    seen: &Observed,
+) -> Verdict {
+    let info = match seen {
+        Observed::Record(info, _) => info,
+        // The record behind the ETag is the one already judged.
+        Observed::Unchanged if stored_id.is_some() => return Verdict::Fine,
+        Observed::Moved { id } => {
+            return match stored_id {
+                Some(stored) if stored != *id => Verdict::Replaced { found: *id },
+                _ => Verdict::Unknown,
+            };
+        }
+        Observed::Unchanged | Observed::Missing | Observed::Denied { .. } | Observed::Failed => {
+            return Verdict::Unknown;
+        }
+    };
+    if let Some(stored) = stored_id
+        && stored != info.id
+    {
+        return Verdict::Replaced { found: info.id };
+    }
+    if !info.full_name.eq_ignore_ascii_case(linked) {
+        return Verdict::Renamed {
+            to: info.full_name.clone(),
+            witnessed: stored_id.is_some(),
+        };
+    }
+    if stored_id.is_none() {
+        return Verdict::LearnId(info.id);
+    }
+    let retired = info.archived || info.disabled;
+    match archived {
+        Some(false) if retired => Verdict::Archived,
+        Some(true) if !retired => Verdict::Unarchived,
+        // No baseline yet: first sight, stored without a finding.
+        _ => Verdict::Fine,
+    }
+}
+
+/// Whether a renamed repo renames its list too (`follow_rename` in
+/// `config.toml`): `List` only for a list named exactly for the old repo,
+/// `Off` reports it and leaves the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FollowRename {
+    #[default]
+    List,
+    Off,
+}
+
+/// Why a list keeps its name when its repo is renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepWhy {
+    /// The list is not named exactly for the old repo: someone named it.
+    Custom,
+    /// The list already has the new repo's name.
+    AlreadyNamed,
+    /// Only the owner changed; the repo's name, and so the list's, did not.
+    SameName,
+    /// Another list has the new name (in any case).
+    Clash,
+    /// A shared list the user cannot write.
+    ReadOnly,
+    /// `config.inbox` is a list name; renaming it would lose the inbox.
+    Inbox,
+    /// `follow_rename = "off"`.
+    Off,
+    /// The new repo name has no name part to give a list.
+    Empty,
+}
+
+/// The name part of `owner/repo`.
+fn short(repo: &str) -> &str {
+    repo.split_once('/').map_or(repo, |(_, name)| name)
+}
+
+/// The name the list takes when its repo `old` is now `new`, or why it
+/// keeps its own. The list follows only if it is named exactly (byte for
+/// byte) for the old repo; `other_names` are the other lists' names, and
+/// the new name may not be any of them in any case, since Nextcloud lets
+/// two lists share one. The first reason that applies is the one given:
+/// `Off`, `Empty` and `SameName` (nothing to do or to say), then
+/// `AlreadyNamed` and `Custom` (the list is not the repo's to rename), then
+/// `Inbox`, `ReadOnly` and `Clash` (it is, but cannot be renamed).
+pub fn follow_list_name(
+    list_name: &str,
+    old: &str,
+    new: &str,
+    other_names: &[impl AsRef<str>],
+    is_inbox: bool,
+    writable: bool,
+    setting: FollowRename,
+) -> Result<String, KeepWhy> {
+    let (old, new) = (short(old), short(new));
+    if setting == FollowRename::Off {
+        return Err(KeepWhy::Off);
+    }
+    if old.is_empty() || new.is_empty() {
+        return Err(KeepWhy::Empty);
+    }
+    if old.eq_ignore_ascii_case(new) {
+        return Err(KeepWhy::SameName);
+    }
+    if list_name.to_lowercase() == new.to_lowercase() {
+        return Err(KeepWhy::AlreadyNamed);
+    }
+    if list_name != old {
+        return Err(KeepWhy::Custom);
+    }
+    if is_inbox {
+        return Err(KeepWhy::Inbox);
+    }
+    if !writable {
+        return Err(KeepWhy::ReadOnly);
+    }
+    if other_names
+        .iter()
+        .any(|n| n.as_ref().to_lowercase() == new.to_lowercase())
+    {
+        return Err(KeepWhy::Clash);
+    }
+    Ok(new.to_string())
 }
 
 /// `owner/repo`, as GitHub allows the two names.
@@ -1333,5 +1496,492 @@ mod repo_tests {
         assert_eq!(gh.base, "https://api.github.com");
         let local = GitHub::with_base("tok", "http://127.0.0.1:9/").unwrap();
         assert_eq!(local.base, "http://127.0.0.1:9");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn rec(id: u64, name: &str, archived: bool, disabled: bool) -> Observed {
+        Observed::Record(
+            RepoInfo {
+                id,
+                full_name: name.into(),
+                archived,
+                disabled,
+            },
+            None,
+        )
+    }
+
+    fn live(id: u64, name: &str) -> Observed {
+        rec(id, name, false, false)
+    }
+
+    fn renamed(to: &str, witnessed: bool) -> Verdict {
+        Verdict::Renamed {
+            to: to.into(),
+            witnessed,
+        }
+    }
+
+    /// One row of the table: the stored id, the linked name and the
+    /// archived baseline, what was seen, and the verdict.
+    struct Row {
+        why: &'static str,
+        id: Option<u64>,
+        archived: Option<bool>,
+        seen: Observed,
+        verdict: Verdict,
+    }
+
+    fn row(
+        why: &'static str,
+        id: Option<u64>,
+        archived: Option<bool>,
+        seen: Observed,
+        verdict: Verdict,
+    ) -> Row {
+        Row {
+            why,
+            id,
+            archived,
+            seen,
+            verdict,
+        }
+    }
+
+    #[test]
+    fn a_look_at_a_repo_is_judged_against_what_is_stored() {
+        let moved = Observed::Moved { id: 7 };
+        let denied = Observed::Denied {
+            retry: Some(Duration::from_secs(60)),
+        };
+        let rows = [
+            // Fine
+            row(
+                "same id, same name, same flag",
+                Some(7),
+                Some(false),
+                live(7, "jaehho/lab"),
+                Verdict::Fine,
+            ),
+            row(
+                "the name in another case is the same name",
+                Some(7),
+                Some(false),
+                live(7, "Jaehho/LAB"),
+                Verdict::Fine,
+            ),
+            row(
+                "a 304 is the record already judged",
+                Some(7),
+                Some(false),
+                Observed::Unchanged,
+                Verdict::Fine,
+            ),
+            row(
+                "archived before and still",
+                Some(7),
+                Some(true),
+                rec(7, "jaehho/lab", true, false),
+                Verdict::Fine,
+            ),
+            // Learning
+            row(
+                "found by name with nothing stored",
+                None,
+                None,
+                live(7, "jaehho/lab"),
+                Verdict::LearnId(7),
+            ),
+            row(
+                "found by name, archived, with nothing stored",
+                None,
+                None,
+                rec(7, "jaehho/lab", true, false),
+                Verdict::LearnId(7),
+            ),
+            // Renamed
+            row(
+                "same id, another full name",
+                Some(7),
+                Some(false),
+                live(7, "jaehho/lab"),
+                renamed("jaehho/lab", true),
+            ),
+            row(
+                "301 then the record, no id stored",
+                None,
+                None,
+                live(7, "jaehho/lab"),
+                renamed("jaehho/lab", false),
+            ),
+            row(
+                "301 to the stored id then the record",
+                Some(7),
+                None,
+                live(7, "other/lab"),
+                renamed("other/lab", true),
+            ),
+            // Archived
+            row(
+                "archived since the last look",
+                Some(7),
+                Some(false),
+                rec(7, "jaehho/lab", true, false),
+                Verdict::Archived,
+            ),
+            row(
+                "disabled counts as archived",
+                Some(7),
+                Some(false),
+                rec(7, "jaehho/lab", false, true),
+                Verdict::Archived,
+            ),
+            row(
+                "unarchived since the last look",
+                Some(7),
+                Some(true),
+                live(7, "jaehho/lab"),
+                Verdict::Unarchived,
+            ),
+            row(
+                "first sight of an archived repo is not an event",
+                Some(7),
+                None,
+                rec(7, "jaehho/lab", true, false),
+                Verdict::Fine,
+            ),
+            row(
+                "first sight of a live repo is not either",
+                Some(7),
+                None,
+                live(7, "jaehho/lab"),
+                Verdict::Fine,
+            ),
+            // Replaced: the name lookup made after the id was Missing
+            row(
+                "the name answers a record with another id",
+                Some(7),
+                Some(false),
+                live(9, "jaehho/lab"),
+                Verdict::Replaced { found: 9 },
+            ),
+            row(
+                "the name answers a 301 to another id",
+                Some(7),
+                Some(false),
+                Observed::Moved { id: 9 },
+                Verdict::Replaced { found: 9 },
+            ),
+            row(
+                "another id outranks a new name",
+                Some(7),
+                Some(false),
+                live(9, "jaehho/elsewhere"),
+                Verdict::Replaced { found: 9 },
+            ),
+            // Unknown
+            row(
+                "404 with an id",
+                Some(7),
+                Some(false),
+                Observed::Missing,
+                Verdict::Unknown,
+            ),
+            row(
+                "404 without",
+                None,
+                None,
+                Observed::Missing,
+                Verdict::Unknown,
+            ),
+            row(
+                "403 or 429 with an id",
+                Some(7),
+                Some(true),
+                denied.clone(),
+                Verdict::Unknown,
+            ),
+            row("403 without", None, None, denied, Verdict::Unknown),
+            row(
+                "5xx with an id",
+                Some(7),
+                Some(false),
+                Observed::Failed,
+                Verdict::Unknown,
+            ),
+            row(
+                "5xx without",
+                None,
+                None,
+                Observed::Failed,
+                Verdict::Unknown,
+            ),
+            row(
+                "a 304 with nothing stored has no record behind it",
+                None,
+                None,
+                Observed::Unchanged,
+                Verdict::Unknown,
+            ),
+            row(
+                "a bare 301 to the stored id cannot name the repo",
+                Some(7),
+                Some(false),
+                moved.clone(),
+                Verdict::Unknown,
+            ),
+            row(
+                "a bare 301 with nothing stored either",
+                None,
+                None,
+                moved,
+                Verdict::Unknown,
+            ),
+        ];
+        for r in rows {
+            // The link is called "jaehho/lab" in every row but the renames,
+            // which name the repo it was before.
+            let linked = match r.verdict {
+                Verdict::Renamed { .. } => "jaehho/champalimaud",
+                _ => "jaehho/lab",
+            };
+            assert_eq!(
+                judge(r.id, linked, r.archived, &r.seen),
+                r.verdict,
+                "{}",
+                r.why
+            );
+        }
+    }
+
+    #[test]
+    fn a_repo_that_comes_back_is_a_finding_once_per_flip() {
+        let flag =
+            |archived, baseline| judge(Some(7), "a/b", baseline, &rec(7, "a/b", archived, false));
+        assert_eq!(flag(true, Some(false)), Verdict::Archived);
+        // The baseline moves with the finding, so the next look is Fine
+        assert_eq!(flag(true, Some(true)), Verdict::Fine);
+        assert_eq!(flag(false, Some(true)), Verdict::Unarchived);
+        assert_eq!(flag(false, Some(false)), Verdict::Fine);
+    }
+
+    fn follow(list: &str, old: &str, new: &str) -> Result<String, KeepWhy> {
+        follow_list_name(
+            list,
+            old,
+            new,
+            &["Work", "Home"],
+            false,
+            true,
+            FollowRename::List,
+        )
+    }
+
+    #[test]
+    fn an_exactly_named_list_follows_its_repo() {
+        assert_eq!(
+            follow("champalimaud", "jaehho/champalimaud", "jaehho/lab"),
+            Ok("lab".to_string())
+        );
+        // To another owner at the same time
+        assert_eq!(
+            follow("asst", "jaehho/asst", "org/tasks"),
+            Ok("tasks".into())
+        );
+        // A new name that only looks like another list's
+        assert_eq!(follow("a", "o/a", "o/Workshop"), Ok("Workshop".into()));
+    }
+
+    #[test]
+    fn a_list_keeps_its_name_and_says_why() {
+        let (old, new) = ("jaehho/champalimaud", "jaehho/lab");
+        let cases = [
+            (
+                "a name someone chose",
+                follow("Lab work", old, new),
+                KeepWhy::Custom,
+            ),
+            (
+                "a case someone chose",
+                follow("Champalimaud", old, new),
+                KeepWhy::Custom,
+            ),
+            ("a prefix of it", follow("champ", old, new), KeepWhy::Custom),
+            (
+                "a name with a space",
+                follow("champalimaud ", old, new),
+                KeepWhy::Custom,
+            ),
+            (
+                "the list is not the repo's at all",
+                follow("Work", old, new),
+                KeepWhy::Custom,
+            ),
+            (
+                "already the new name",
+                follow("lab", old, new),
+                KeepWhy::AlreadyNamed,
+            ),
+            (
+                "already the new name in another case",
+                follow("Lab", old, new),
+                KeepWhy::AlreadyNamed,
+            ),
+            (
+                "an owner-only transfer",
+                follow("champalimaud", "jaehho/champalimaud", "org/champalimaud"),
+                KeepWhy::SameName,
+            ),
+            (
+                "an owner-only transfer, list already named for it",
+                follow("lab", "jaehho/lab", "org/lab"),
+                KeepWhy::SameName,
+            ),
+            (
+                "an owner-only transfer, custom list",
+                follow("Lab work", "jaehho/lab", "org/lab"),
+                KeepWhy::SameName,
+            ),
+            (
+                "a clash",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["lab"],
+                    false,
+                    true,
+                    FollowRename::List,
+                ),
+                KeepWhy::Clash,
+            ),
+            (
+                "a clash in any case",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work", "LAB"],
+                    false,
+                    true,
+                    FollowRename::List,
+                ),
+                KeepWhy::Clash,
+            ),
+            (
+                "the inbox",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work"],
+                    true,
+                    true,
+                    FollowRename::List,
+                ),
+                KeepWhy::Inbox,
+            ),
+            (
+                "a list the user cannot write",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work"],
+                    false,
+                    false,
+                    FollowRename::List,
+                ),
+                KeepWhy::ReadOnly,
+            ),
+            (
+                "the setting is off",
+                follow_list_name(
+                    "champalimaud",
+                    old,
+                    new,
+                    &["Work"],
+                    false,
+                    true,
+                    FollowRename::Off,
+                ),
+                KeepWhy::Off,
+            ),
+            (
+                "no name part",
+                follow("champalimaud", old, "jaehho/"),
+                KeepWhy::Empty,
+            ),
+            (
+                "no name at all",
+                follow("champalimaud", old, ""),
+                KeepWhy::Empty,
+            ),
+            (
+                "no old name part",
+                follow("", "jaehho/", new),
+                KeepWhy::Empty,
+            ),
+        ];
+        for (why, got, want) in cases {
+            assert_eq!(got, Err(want), "{why}");
+        }
+    }
+
+    #[test]
+    fn the_first_reason_that_applies_is_the_one_given() {
+        let (old, new) = ("jaehho/champalimaud", "jaehho/lab");
+        let ask = |list, others: &[&str], inbox, writable, setting| {
+            follow_list_name(list, old, new, others, inbox, writable, setting)
+        };
+        // Off outranks everything
+        assert_eq!(
+            ask("Custom", &["lab"], true, false, FollowRename::Off),
+            Err(KeepWhy::Off)
+        );
+        // A list that is not the repo's to rename is Custom before it is
+        // read-only, the inbox or in a clash
+        assert_eq!(
+            ask("Custom", &["lab"], true, false, FollowRename::List),
+            Err(KeepWhy::Custom)
+        );
+        // Of the three that stop a list that is the repo's: inbox, then
+        // read-only, then the clash
+        assert_eq!(
+            ask("champalimaud", &["lab"], true, false, FollowRename::List),
+            Err(KeepWhy::Inbox)
+        );
+        assert_eq!(
+            ask("champalimaud", &["lab"], false, false, FollowRename::List),
+            Err(KeepWhy::ReadOnly)
+        );
+        assert_eq!(
+            ask("champalimaud", &["lab"], false, true, FollowRename::List),
+            Err(KeepWhy::Clash)
+        );
+        // The list's own name among the others changes nothing
+        assert_eq!(
+            ask(
+                "champalimaud",
+                &["champalimaud"],
+                false,
+                true,
+                FollowRename::List
+            ),
+            Ok("lab".to_string())
+        );
+    }
+
+    #[test]
+    fn the_names_are_the_repo_halves() {
+        assert_eq!(short("jaehho/lab"), "lab");
+        assert_eq!(short("lab"), "lab");
+        assert_eq!(short("jaehho/"), "");
+        assert_eq!(short(""), "");
+        assert_eq!(FollowRename::default(), FollowRename::List);
     }
 }
