@@ -1474,7 +1474,9 @@ pub struct Counts {
     pub anytime: usize,
     pub repeating: usize,
     pub all: usize,
-    /// Open tasks with a planned slot today.
+    /// What Day has for today: the planned blocks and the tray (what is
+    /// due by today and not placed). The No date section is left out: it
+    /// is every undated task, a backlog and not the day's work.
     pub day: usize,
     pub lists: HashMap<String, usize>,
 }
@@ -1515,18 +1517,32 @@ impl Counts {
                 }
             }
         }
-        c.day = day_plan(data.open, slots, now, today).blocks.len();
+        let plan = day_plan(data.open, slots, now, today);
+        c.day = plan.blocks.len() + plan.tray.len();
         c
     }
 
-    /// What a sidebar entry shows; nothing for Completed.
+    /// The tile that carries the overdue dot: the first of Today, Day and
+    /// Inbox that is in the sidebar, so hiding Today does not take the
+    /// signal away. None when nothing is overdue or none of them is shown.
+    pub fn dot_on(&self, shown: &[Nav]) -> Option<Nav> {
+        if self.overdue == 0 {
+            return None;
+        }
+        [Nav::Today, Nav::Day, Nav::Inbox]
+            .into_iter()
+            .find(|nav| shown.contains(nav))
+    }
+
+    /// What a sidebar entry shows; nothing for Completed or Matrix.
     pub fn of(&self, nav: &Nav) -> Option<usize> {
         match nav {
             Nav::Inbox => Some(self.inbox),
             Nav::Today => Some(self.today),
             Nav::Day => Some(self.day),
-            // Every open task sits in some box.
-            Nav::Matrix => Some(self.all),
+            // Every open task sits in some box, so a count would only
+            // repeat All Tasks.
+            Nav::Matrix => None,
             Nav::Scheduled => Some(self.scheduled),
             Nav::Completed => None,
             Nav::Tomorrow => Some(self.tomorrow),
@@ -2253,6 +2269,77 @@ mod tests {
     }
 
     #[test]
+    fn the_overdue_dot_goes_to_the_first_of_today_day_inbox_that_is_shown() {
+        let late = Counts {
+            overdue: 2,
+            ..Counts::default()
+        };
+        // Today wins wherever it sits among the tiles.
+        let all = [Nav::Day, Nav::Inbox, Nav::Today];
+        assert_eq!(late.dot_on(&all), Some(Nav::Today));
+        // Hide Today and the signal moves to Day, then to Inbox.
+        assert_eq!(late.dot_on(&[Nav::Inbox, Nav::Day]), Some(Nav::Day));
+        assert_eq!(late.dot_on(&[Nav::Matrix, Nav::Inbox]), Some(Nav::Inbox));
+        // Views that cannot show overdue work carry nothing.
+        assert_eq!(late.dot_on(&[Nav::Matrix, Nav::Scheduled]), None);
+        assert_eq!(late.dot_on(&[]), None);
+        // Nothing overdue, no dot.
+        assert_eq!(Counts::default().dot_on(&all), None);
+    }
+
+    #[test]
+    fn day_count_is_blocks_plus_tray() {
+        let lists = lists();
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("now", "/a/", on(date(9, 14))),
+            task("soon", "/b/", on(date(9, 15))),
+            task("someday", "/b/", None),
+            task("planned", "/b/", None),
+        ];
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: None,
+            sunday_first: false,
+        };
+        let day = |slots: &[PlanSlot]| Counts::new(&data, slots, now()).day;
+        // Nothing placed: the tray holds late and now. Tomorrow's task waits
+        // for its day, and the undated one sits in No date, which is a
+        // backlog and does not count.
+        assert_eq!(day(&[]), 2);
+        // A block counts and an undated task can be one.
+        assert_eq!(day(&[slot("planned", 9 * 60, 30)]), 3);
+        // Placing a task from the tray moves it, not adds it.
+        let both = [slot("planned", 9 * 60, 30), slot("late", 11 * 60, 30)];
+        assert_eq!(day(&both), 3);
+        // A slot on another day is not today's.
+        let other = PlanSlot {
+            date: date(9, 15),
+            ..slot("planned", 9 * 60, 30)
+        };
+        assert_eq!(day(&[other]), 2);
+    }
+
+    #[test]
+    fn matrix_has_no_count() {
+        let lists = lists();
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("someday", "/b/", None),
+        ];
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: None,
+            sunday_first: false,
+        };
+        let c = Counts::new(&data, &[], now());
+        // Every open task is in a box, so it would only repeat All Tasks.
+        assert_eq!((c.of(&Nav::Matrix), c.of(&Nav::All)), (None, Some(2)));
+    }
+
+    #[test]
     fn scheduled_has_the_week_then_months() {
         let lists = lists();
         let open = vec![
@@ -2848,7 +2935,8 @@ mod tests {
         assert_eq!(undated, ["someday"]);
         // 10:00 on Sep 14 2026.
         assert_eq!(p.now_min, Some(10 * 60));
-        // A slot for a task the open set no longer holds does not count.
+        // The badge is the block and the tray, and a slot for a task the open
+        // set no longer holds is not a block.
         let c = Counts::new(
             &Data {
                 lists: &lists(),
@@ -2859,7 +2947,8 @@ mod tests {
             &slots,
             now(),
         );
-        assert_eq!(c.day, 1);
+        assert_eq!(c.day, p.blocks.len() + p.tray.len());
+        assert_eq!(c.day, 3);
     }
 
     #[test]

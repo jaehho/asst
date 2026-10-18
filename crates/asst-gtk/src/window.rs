@@ -3766,6 +3766,10 @@ impl Window {
             crate::devel::visible_toast(w.toasts.upcast_ref()).as_deref(),
             self.cursor.as_deref(),
             self.no_date_open,
+            crate::devel::DumpCounts::new(
+                &Counts::new(&data, &self.prefs.plan, now),
+                &self.prefs.sidebar_views(),
+            ),
         );
         let json = crate::devel::dump_json(&state);
         if path.is_empty() {

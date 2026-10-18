@@ -757,6 +757,7 @@ impl Sidebar {
             self.build_tiles(&shown, Rc::new(st.prefs.hidden_views()));
             self.tiles_box.set_visible(!shown.is_empty());
         }
+        let dot = st.counts.dot_on(&shown);
         for t in self.tiles.borrow().iter() {
             let n = st
                 .counts
@@ -764,8 +765,7 @@ impl Sidebar {
                 .filter(|n| *n > 0 && st.prefs.show_counts);
             t.count
                 .set_text(&n.map(|n| n.to_string()).unwrap_or_default());
-            t.dot
-                .set_visible(t.nav == Nav::Today && st.counts.overdue > 0);
+            t.dot.set_visible(dot.as_ref() == Some(&t.nav));
             if &t.nav == st.nav {
                 t.child.add_css_class("selected");
             } else {

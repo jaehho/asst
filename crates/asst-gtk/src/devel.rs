@@ -22,7 +22,7 @@ use relm4::adw::prelude::*;
 use relm4::gtk::{self, gio, glib, graphene};
 use serde::Serialize;
 
-use crate::model::{DayPlan, Kind, Nav, Section};
+use crate::model::{Counts, DayPlan, Kind, Nav, Section};
 use crate::window::{Msg, Tx};
 
 pub fn enabled() -> bool {
@@ -128,8 +128,8 @@ pub struct Shown {
 }
 
 /// Every mapped label, entry, text view, labelled or icon button (and a
-/// menu item that has a tooltip), icon and sidebar tile that has a tooltip
-/// under `roots`, in tree order.
+/// menu item that has a tooltip), icon, sidebar tile that has a tooltip and
+/// overdue dot (named by its tile) under `roots`, in tree order.
 pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
     let mut out = Vec::new();
     for (root, widget) in roots {
@@ -176,6 +176,10 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
                 let b = t.buffer();
                 let text = b.text(&b.start_iter(), &b.end_iter(), false);
                 out.push(item("text", text.to_string(), None));
+            } else if w.has_css_class("overdue-dot") {
+                // Named by the tile it sits on.
+                let tile = w.parent().and_then(|p| first_label(&p));
+                out.push(item("dot", tile.unwrap_or_default(), None));
             } else if w.is::<gtk::FlowBoxChild>() && w.tooltip_text().is_some() {
                 // The keys a tile's tooltip names are worth asserting on.
                 let title = label_with_class(&w, "tile-title").unwrap_or_default();
@@ -280,6 +284,31 @@ pub struct Dump {
     pub toast: Option<String>,
     /// The keyboard cursor's task.
     pub cursor: Option<String>,
+    pub counts: DumpCounts,
+}
+
+/// The sidebar's badges, before `show_counts` hides the numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DumpCounts {
+    pub inbox: usize,
+    pub today: usize,
+    pub overdue: usize,
+    /// Planned blocks plus the tray, for today (not for `day`).
+    pub day: usize,
+    /// The tile carrying the overdue dot, as a `Nav::key`.
+    pub dot: Option<String>,
+}
+
+impl DumpCounts {
+    pub fn new(counts: &Counts, shown: &[Nav]) -> DumpCounts {
+        DumpCounts {
+            inbox: counts.inbox,
+            today: counts.today,
+            overdue: counts.overdue,
+            day: counts.day,
+            dot: counts.dot_on(shown).map(|nav| nav.key()),
+        }
+    }
 }
 
 /// Section kind as a stable string for the dump.
@@ -310,6 +339,7 @@ pub fn build_dump(
     toast: Option<&str>,
     cursor: Option<&str>,
     no_date_open: bool,
+    counts: DumpCounts,
 ) -> Dump {
     let tray_row = |kind: &'static str| {
         move |t: &asst_core::api::TaskView| DumpRow {
@@ -371,6 +401,7 @@ pub fn build_dump(
         editor: editor.map(str::to_string),
         toast: toast.map(str::to_string),
         cursor: cursor.map(str::to_string),
+        counts,
     }
 }
 
@@ -591,8 +622,18 @@ mod tests {
             Some("Copied to the clipboard"),
             Some("/l/aa11.ics"),
             false,
+            DumpCounts::new(
+                &Counts {
+                    overdue: 1,
+                    day: 2,
+                    ..Counts::default()
+                },
+                &[Nav::Inbox, Nav::Day],
+            ),
         );
         let v: serde_json::Value = serde_json::from_str(&dump_json(&d)).unwrap();
+        assert_eq!(v["counts"]["day"], 2);
+        assert_eq!(v["counts"]["dot"], "day");
         assert_eq!(v["nav"], "today");
         assert_eq!(v["sidebar"], "today");
         assert_eq!(v["day"], "2026-10-09");
@@ -641,6 +682,7 @@ mod tests {
             None,
             None,
             false,
+            DumpCounts::default(),
         );
         let kinds: Vec<&str> = d.rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["plan", "tray"]);
@@ -659,6 +701,7 @@ mod tests {
             None,
             None,
             true,
+            DumpCounts::default(),
         );
         let kinds: Vec<&str> = d.rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["plan", "tray", "no-date"]);
@@ -688,6 +731,7 @@ mod tests {
             None,
             None,
             false,
+            DumpCounts::default(),
         );
         let v: serde_json::Value = serde_json::from_str(&dump_json(&d)).unwrap();
         assert!(v["editor"].is_null());
