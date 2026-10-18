@@ -122,4 +122,4 @@ alarm_before = 0       # minutes before the due time that reminder rings
 follow_rename = "list" # a renamed repo renames its exactly-named list; "off" only reports it
 ```
 
-The cache is `~/.local/state/asst/asst.db`; deleting it only costs a full re-sync.
+The cache is `~/.local/state/asst/asst.db`. A full re-sync brings back the lists and tasks, but not what only this file knows: which GitHub issue is which task (the links and their pairs), the log `asst projects log` reads, and snoozes. Back it up (`sqlite3 asst.db ".backup copy.db"`) before deleting it. The first time a build with repo ids opens an older file it keeps a copy beside it, `asst.db.pre-identity`, and never replaces or removes it.
