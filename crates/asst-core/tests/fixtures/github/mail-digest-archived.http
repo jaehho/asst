@@ -1,0 +1,22 @@
+HTTP/2 200
+content-type: application/json; charset=utf-8
+etag: "48ddd036314ea3196b25120ad03848c1d26bd37b5af76c6d7eedb54fb664b6e1"
+x-ratelimit-limit: 5000
+x-ratelimit-remaining: 4994
+x-ratelimit-reset: 1792299676
+
+{
+  "id": 1379104203,
+  "name": "mail-digest",
+  "full_name": "jaehho/mail-digest",
+  "private": true,
+  "owner": {
+    "login": "jaehho",
+    "type": "User"
+  },
+  "fork": false,
+  "default_branch": "main",
+  "archived": true,
+  "disabled": false,
+  "visibility": "private"
+}

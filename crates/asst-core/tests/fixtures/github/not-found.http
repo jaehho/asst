@@ -1,0 +1,11 @@
+HTTP/2 404
+content-type: application/json; charset=utf-8
+x-ratelimit-limit: 5000
+x-ratelimit-remaining: 4992
+x-ratelimit-reset: 1792299676
+
+{
+  "message": "Not Found",
+  "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository",
+  "status": "404"
+}

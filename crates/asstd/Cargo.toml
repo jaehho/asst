@@ -19,3 +19,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "process"] }
 zbus = { workspace = true }
 notify = "8"
+
+[dev-dependencies]
+asst-core = { workspace = true, features = ["testing"] }
