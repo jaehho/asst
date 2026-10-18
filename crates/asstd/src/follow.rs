@@ -300,7 +300,7 @@ async fn try_follow(
         }
     };
 
-    if renamed_lately(daemon, now)? >= RENAMES_PER_HOUR {
+    if renamed_lately(daemon, now, pending_id)? >= RENAMES_PER_HOUR {
         log::info!(
             "{old} is now {}; its list waits, since {RENAMES_PER_HOUR} lists were renamed in the last hour",
             link.repo
@@ -397,13 +397,17 @@ fn unfinished(daemon: &Daemon, link: &GhLinkRow, old: &str) -> Result<Option<Pen
     Ok(None)
 }
 
-/// How many lists were renamed this way in the hour before `now`.
-fn renamed_lately(daemon: &Daemon, now: DateTime<Utc>) -> Result<usize> {
+/// How many lists were renamed this way in the hour before `now`, other
+/// than the one at `row`. A rename begun and not finished counts: the server
+/// may have taken it and lost the reply, so what the log can say it did is
+/// what it was asked to.
+fn renamed_lately(daemon: &Daemon, now: DateTime<Utc>, row: Option<i64>) -> Result<usize> {
     let since = (now - chrono::Duration::hours(1)).timestamp();
     let rows: Vec<LogRow> = daemon.store().gh_log_recent(None, 500)?;
     Ok(rows
         .iter()
-        .filter(|r| r.kind == "list-renamed" && r.at > since)
+        .filter(|r| ["list-renamed", "list-renaming"].contains(&r.kind.as_str()))
+        .filter(|r| r.at > since && Some(r.id) != row)
         .count())
 }
 

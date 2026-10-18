@@ -2902,11 +2902,20 @@ mod tests {
         the_world_changes(1..=2, 16, 3).await;
     }
 
-    /// The same for a long time: `cargo test -p asstd soak -- --ignored`.
+    /// The same for a long time: `cargo test -p asstd soak -- --ignored`
+    /// (about 6 seconds a seed).
     #[tokio::test]
     #[ignore = "takes minutes"]
     async fn soak_whatever_happens_to_the_repos() {
-        the_world_changes(1..=150, 60, 4).await;
+        // ASST_SOAK_SEEDS=77-150 runs those seeds only
+        let range = std::env::var("ASST_SOAK_SEEDS")
+            .ok()
+            .and_then(|v| {
+                let (from, to) = v.split_once('-')?;
+                Some(from.parse().ok()?..=to.parse().ok()?)
+            })
+            .unwrap_or(1..=150);
+        the_world_changes(range, 60, 4).await;
     }
 
     async fn the_world_changes(seeds: std::ops::RangeInclusive<u64>, steps: usize, count: usize) {
@@ -3495,5 +3504,42 @@ mod tests {
             .filter(|r| r.kind == "list-renamed")
             .collect();
         assert_eq!(renamed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn renames_the_server_took_without_saying_so_count_towards_the_hour() {
+        // Four repos are renamed at once, and the server takes every rename
+        // and loses every reply: it is the same as four renames in an hour,
+        // and the limit is three
+        let repos = ["jaehho/a", "jaehho/b", "jaehho/c", "jaehho/d"];
+        let mut rig = Rig::new(&repos).await;
+        for (i, repo) in repos.iter().enumerate() {
+            rig.publish(10 + i as u64, repo, false);
+        }
+        rig.go().await;
+        for (i, repo) in repos.iter().enumerate() {
+            let new = format!("{repo}2");
+            rig.rename_on_github(10 + i as u64, repo, &new, "[]");
+        }
+        rig.lists
+            .with(|s| s.rename_reply_lost = Some(Fail::Network));
+
+        rig.go().await;
+        rig.later(5);
+        rig.go().await;
+
+        assert_eq!(rig.lists.renames(), 3, "{:?}", rig.lists.calls());
+        // The fourth waits for the hour, and then goes
+        rig.lists.with(|s| s.rename_reply_lost = None);
+        rig.later(70);
+        rig.go().await;
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 4);
+        for name in ["a2", "b2", "c2", "d2"] {
+            let href = format!("/cal/{}/", &name[..1]);
+            assert_eq!(rig.lists.name(&href), name);
+        }
+        assert!(rig.log().iter().all(|r| r.kind != "list-renaming"));
     }
 }
