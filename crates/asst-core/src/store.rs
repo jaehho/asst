@@ -164,8 +164,16 @@ pub struct NewLog<'a> {
     pub by: &'a str,
 }
 
+/// How many actual blocks carry a label, and how long they last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelTotal {
+    pub label: String,
+    pub blocks: usize,
+    pub seconds: i64,
+}
+
 /// The decision log keeps this many rows, the newest.
-const GH_LOG_KEEP: i64 = 500;
+pub const GH_LOG_KEEP: i64 = 500;
 
 pub struct Store {
     conn: Connection,
@@ -1331,6 +1339,40 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The labels of the actual blocks (`planned = 0`) of the database at
+    /// `path`, longest first, for a tool that only reads them. The file is
+    /// opened read-only and as it is: nothing is migrated, backed up or
+    /// written, so this is safe beside an asstd of any version, and a
+    /// database that has no blocks (or no file) has no labels.
+    pub fn label_totals(path: &Path) -> Result<Vec<LabelTotal>> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let has_blocks: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_blocks == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT label, COUNT(*), SUM(end - start) / 1000 FROM blocks
+             WHERE planned = 0 AND label IS NOT NULL
+             GROUP BY label ORDER BY SUM(end - start) DESC, label",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(LabelTotal {
+                label: r.get(0)?,
+                blocks: r.get::<_, i64>(1)?.try_into().unwrap_or(0),
+                seconds: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Drop actual blocks overlapping [start, end) and insert `rows`.
@@ -2521,6 +2563,77 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
         assert_eq!(kept.len(), 500);
         assert_eq!(kept[0].text, "row 509");
         assert_eq!(kept[499].text, "row 10");
+    }
+
+    #[test]
+    fn block_labels_are_read_without_touching_the_database() {
+        let dir = Scratch::new("labels");
+        // No file: no labels, and none is made
+        assert!(Store::label_totals(&dir.db()).unwrap().is_empty());
+        assert!(dir.files().is_empty());
+
+        let mut s = Store::open(&dir.db(), ny()).unwrap();
+        let hour = 3_600_000;
+        let block = |source: &str, label: Option<&str>, from: i64, hours: i64| Block {
+            id: None,
+            task_uid: None,
+            start: from * hour,
+            end: (from + hours) * hour,
+            label: label.map(str::to_string),
+            planned: false,
+            source: Some(source.to_string()),
+            created_at: 0,
+        };
+        s.replace_actual_blocks(
+            0,
+            i64::MAX,
+            &[
+                block("a", Some("lab"), 0, 2),
+                block("b", Some("lab"), 3, 1),
+                block("c", Some("champalimaud"), 5, 4),
+                block("d", Some("dotfiles"), 10, 1),
+                block("e", None, 12, 1),
+            ],
+        )
+        .unwrap();
+        // A plan is not time spent
+        s.conn
+            .execute(
+                "INSERT INTO blocks(start, end, label, planned, created_at)
+                 VALUES (0, 36000000, 'lab', 1, 0)",
+                [],
+            )
+            .unwrap();
+        drop(s);
+
+        let before = std::fs::read(dir.db()).unwrap();
+        let total = |label: &str, blocks, hours: i64| LabelTotal {
+            label: label.into(),
+            blocks,
+            seconds: hours * 3600,
+        };
+        assert_eq!(
+            Store::label_totals(&dir.db()).unwrap(),
+            [
+                total("champalimaud", 1, 4),
+                total("lab", 2, 3),
+                total("dotfiles", 1, 1)
+            ]
+        );
+        assert_eq!(std::fs::read(dir.db()).unwrap(), before, "not one byte");
+
+        // A database from before blocks and identity is read as it is
+        let old = Scratch::new("labels-old");
+        old_database(&old.db());
+        let before = std::fs::read(old.db()).unwrap();
+        assert!(Store::label_totals(&old.db()).unwrap().is_empty());
+        assert_eq!(std::fs::read(old.db()).unwrap(), before);
+        assert!(
+            !identity_backup_path(&old.db()).exists(),
+            "nothing migrated"
+        );
+        let conn = read_only(&old.db());
+        assert!(!has_column(&conn, "gh_links", "repo_id").unwrap());
     }
 
     #[test]

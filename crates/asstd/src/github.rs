@@ -14,7 +14,7 @@ use std::time::Duration;
 use asst_core::api::LinkState;
 use asst_core::caldav::RemoteError;
 use asst_core::github::{
-    self, Change, GitHub, Issue, Observed, Op, Pair, Ref, RepoInfo, Target, Verdict,
+    self, Change, GitHub, Issue, Observed, Op, Pair, Ref, RepoInfo, Target, Verdict, limits,
 };
 use asst_core::store::{GhLinkRow, NewLog, Store};
 use asst_core::task::Edit;
@@ -25,11 +25,11 @@ use crate::follow::{self, ListNames};
 
 /// A refusal that says nothing about when to come back is waited out this
 /// long.
-const REFUSED_WAIT: chrono::Duration = chrono::Duration::minutes(15);
+const REFUSED_WAIT: chrono::Duration = chrono::Duration::minutes(limits::REFUSED_WAIT_MINUTES);
 
 /// A repo whose id GitHub cannot find is asked for by its name this often
 /// at most, to tell a name taken by another repo from a repo that is gone.
-const NAME_LOOKUP_EVERY: chrono::Duration = chrono::Duration::hours(1);
+const NAME_LOOKUP_EVERY: chrono::Duration = chrono::Duration::minutes(limits::NAME_LOOKUP_MINUTES);
 
 /// Who made a log row.
 pub const AUTO: &str = "auto";

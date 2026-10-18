@@ -18,7 +18,7 @@
 //! the name again.
 
 use asst_core::caldav::{RemoteError, RemoteList};
-use asst_core::github::{self, FollowRename, KeepWhy};
+use asst_core::github::{self, FollowRename, KeepWhy, limits};
 use asst_core::store::{GhLinkRow, LogRow, NewLog};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,11 +28,11 @@ use crate::github::AUTO;
 
 /// The lists renamed this way in the last hour may not come to more than
 /// this, whatever the repos do. A rename past it waits.
-const RENAMES_PER_HOUR: usize = 3;
+const RENAMES_PER_HOUR: usize = limits::RENAMES_PER_HOUR;
 
 /// A marker this old is dropped: a name that has waited this long to change
 /// has had time to mean something else.
-const MARKER_EXPIRES: chrono::Duration = chrono::Duration::days(30);
+const MARKER_EXPIRES: chrono::Duration = chrono::Duration::days(limits::MARKER_EXPIRES_DAYS);
 
 type Remote<T> = std::result::Result<T, RemoteError>;
 

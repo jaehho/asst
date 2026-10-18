@@ -315,6 +315,26 @@ pub fn judge(
     }
 }
 
+/// What asstd holds itself to when it looks after a link. They are here,
+/// not in the daemon, so that `asst projects --json` says the numbers the
+/// daemon uses and not a copy of them.
+pub mod limits {
+    /// Lists renamed by following a repo, in any hour, at most; a rename
+    /// past it waits for the next pass.
+    pub const RENAMES_PER_HOUR: usize = 3;
+    /// A rename the list has not followed is given up on after this long.
+    pub const MARKER_EXPIRES_DAYS: i64 = 30;
+    /// A refusal that says nothing about when to come back (no
+    /// `Retry-After`, no rate-limit reset) is waited out this long.
+    pub const REFUSED_WAIT_MINUTES: i64 = 15;
+    /// A repo whose id GitHub cannot find is asked for by its name this
+    /// often at most, to tell a name taken by another repo from a repo that
+    /// is gone.
+    pub const NAME_LOOKUP_MINUTES: i64 = 60;
+    /// A repo GitHub cannot find for this long gets a hint at `asst unlink`.
+    pub const UNLINK_HINT_DAYS: i64 = 14;
+}
+
 /// Whether a renamed repo renames its list too (`follow_rename` in
 /// `config.toml`): `List` only for a list named exactly for the old repo,
 /// `Off` reports it and leaves the list.

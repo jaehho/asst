@@ -4,9 +4,13 @@ use std::io::IsTerminal;
 
 use asst_core::api::{LinkView, TaskView};
 use asst_core::fmt;
+use asst_core::github::{FollowRename, short};
+use asst_core::store::LogRow;
 use asst_core::task::priority_level;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+
+use crate::projects::{Pending, ProjectLink, Report};
 
 pub struct Style {
     color: bool,
@@ -127,9 +131,10 @@ fn needing_a_look(links: &[LinkView]) -> Option<String> {
     }
 }
 
-/// The last line of `asst link` when any link needs a look.
+/// The last line of `asst link` when any link needs a look, and where to
+/// look.
 pub fn links_hint(s: &Style, links: &[LinkView]) -> Option<String> {
-    needing_a_look(links).map(|hint| s.dim(&hint))
+    needing_a_look(links).map(|hint| s.dim(&format!("{hint}: asst projects")))
 }
 
 /// The GitHub line of `asst status`, when any link needs a look: how many,
@@ -148,6 +153,171 @@ pub fn links_status(s: &Style, links: &[LinkView]) -> Option<String> {
             line
         },
     )
+}
+
+/// A day as the person reads it, in their zone.
+fn day(at: DateTime<Utc>, zone: Tz) -> String {
+    at.with_timezone(&zone).format("%Y-%m-%d").to_string()
+}
+
+/// `asst projects`: the links as a table, then what is pending, what could
+/// be done about it, and which labels are behind. A section with nothing in
+/// it is left out.
+pub fn projects_text(s: &Style, r: &Report, zone: Tz) -> String {
+    let mut out: Vec<String> = Vec::new();
+    if r.links.is_empty() {
+        out.push(s.dim("no list is linked; `asst link <list> <owner/repo>`"));
+    } else {
+        out.extend(links_table(s, &r.links));
+    }
+
+    let pending: Vec<String> = r
+        .links
+        .iter()
+        .filter_map(|l| Some(pending_line(l, l.pending_rename.as_ref()?, r, zone)))
+        .collect();
+    if !pending.is_empty() {
+        out.push(String::new());
+        out.push(s.bold("Pending"));
+        out.extend(pending);
+    }
+
+    if !r.proposals.is_empty() {
+        out.push(String::new());
+        out.push(s.bold("Proposals (nothing has been changed)"));
+        for p in &r.proposals {
+            out.push(format!("  {}", p.why));
+            out.push(format!("    {}", p.command));
+        }
+    }
+
+    if !r.labels.is_empty() {
+        out.push(String::new());
+        out.push(s.bold("Labels"));
+        for l in &r.labels {
+            let blocks = match l.blocks {
+                1 => "1 block".to_string(),
+                n => format!("{n} blocks"),
+            };
+            out.push(format!(
+                "  {blocks} ({:.1} h) still say {:?}",
+                l.seconds as f64 / 3600.0,
+                l.label
+            ));
+            out.push(format!(
+                "    new days: [[rule]] project = {:?} tag = {:?} in tags.toml",
+                l.label, l.now
+            ));
+            out.push("    history: the relabel recipe in README, \"Renaming a project\"".into());
+        }
+    }
+
+    if !r.warnings.is_empty() {
+        out.push(String::new());
+        out.extend(r.warnings.iter().map(|w| s.yellow(w)));
+    }
+    out.join("\n")
+}
+
+/// `LIST  REPO  STATE  NOTE`, each column as wide as what is in it.
+fn links_table(s: &Style, links: &[ProjectLink]) -> Vec<String> {
+    let width = |head: &str, cell: fn(&ProjectLink) -> &str| {
+        links
+            .iter()
+            .map(|l| cell(l).chars().count())
+            .chain([head.len()])
+            .max()
+            .unwrap_or(0)
+    };
+    let (list_w, repo_w, state_w) = (
+        width("LIST", |l| &l.name),
+        width("REPO", |l| &l.repo),
+        width("STATE", |l| &l.state),
+    );
+    let mut rows = vec![s.dim(&format!(
+        "{:<list_w$}  {:<repo_w$}  {:<state_w$}  NOTE",
+        "LIST", "REPO", "STATE"
+    ))];
+    for l in links {
+        let note = table_note(l);
+        let cell = if note.is_empty() {
+            l.state.clone()
+        } else {
+            format!("{:<state_w$}", l.state)
+        };
+        let cell = match l.state.as_str() {
+            "ok" => cell,
+            "archived" | "renamed" => s.dim(&cell),
+            _ => s.yellow(&cell),
+        };
+        let line = format!("{:<list_w$}  {:<repo_w$}  {cell}  {note}", l.name, l.repo);
+        rows.push(line.trim_end().to_string());
+    }
+    rows
+}
+
+/// The daemon's note, and what only this machine knows.
+fn table_note(l: &ProjectLink) -> String {
+    let note = l.note.clone().unwrap_or_default();
+    if l.state == "archived" && l.archived_in_window {
+        format!("{note}; already archived in the window")
+    } else {
+        note
+    }
+}
+
+/// A list that waits to be renamed, and until when.
+fn pending_line(l: &ProjectLink, p: &Pending, r: &Report, zone: Tz) -> String {
+    let what = format!(
+        "list {:?} waits to be renamed {:?}: {} became {} on {}",
+        l.name,
+        short(&l.repo),
+        p.from,
+        l.repo,
+        day(p.since, zone)
+    );
+    let begun = if p.begun {
+        "; the rename was begun on the server and is not finished"
+    } else {
+        ""
+    };
+    match r.settings.follow_rename {
+        FollowRename::List => format!(
+            "  {what}{begun}; asstd tries on every pass until {}",
+            day(p.expires, zone)
+        ),
+        FollowRename::Off => {
+            format!("  {what}{begun}; follow_rename is off, so asstd will leave the list as it is")
+        }
+    }
+}
+
+/// `asst projects log`: newest first, one row per line. What a row did, and
+/// why, is its text; the undo is in it where there is one.
+pub fn log_text(s: &Style, rows: &[LogRow], zone: Tz) -> String {
+    if rows.is_empty() {
+        return s.dim("nothing logged");
+    }
+    let width = |cell: fn(&LogRow) -> &str| rows.iter().map(|r| cell(r).chars().count()).max();
+    let (kind_w, by_w) = (
+        width(|r| &r.kind).unwrap_or(0),
+        width(|r| &r.by).unwrap_or(0),
+    );
+    rows.iter()
+        .map(|r| {
+            let when = DateTime::from_timestamp(r.at, 0)
+                .map(|t| t.with_timezone(&zone).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "?".into());
+            format!(
+                "{}  {:<kind_w$}  {}  {}",
+                s.dim(&when),
+                r.kind,
+                s.dim(&format!("{:<by_w$}", r.by)),
+                r.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -193,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             links_hint(&plain(), &links).as_deref(),
-            Some("1 link needs a look")
+            Some("1 link needs a look: asst projects")
         );
         assert_eq!(
             links_status(&plain(), &links).as_deref(),
@@ -204,7 +374,7 @@ mod tests {
         let links = [archived, replaced];
         assert_eq!(
             links_hint(&plain(), &links).as_deref(),
-            Some("2 links need a look")
+            Some("2 links need a look: asst projects")
         );
         assert_eq!(
             links_status(&plain(), &links).as_deref(),
@@ -232,5 +402,249 @@ mod tests {
                 .unwrap()
                 .starts_with("\x1b[33m")
         );
+    }
+
+    // -- asst projects ---------------------------------------------------
+
+    use crate::projects::{Proposal, Rules, StaleLabel};
+    use chrono::TimeZone;
+
+    fn ny() -> Tz {
+        "America/New_York".parse().unwrap()
+    }
+
+    fn at(month: u32, day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, month, day, 16, 0, 0).unwrap()
+    }
+
+    fn row(repo: &str, name: &str, state: &str, note: &str) -> ProjectLink {
+        ProjectLink {
+            repo: repo.into(),
+            repo_id: None,
+            list: format!("/cal/{name}/"),
+            name: name.into(),
+            state: state.into(),
+            note: Some(note).filter(|n| !n.is_empty()).map(str::to_string),
+            since: None,
+            open_tasks: Some(0),
+            archived_in_window: false,
+            pending_rename: None,
+        }
+    }
+
+    fn report(links: Vec<ProjectLink>) -> Report {
+        Report {
+            links,
+            proposals: Vec::new(),
+            labels: Vec::new(),
+            settings: Rules::new(FollowRename::List),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_links_are_a_table_with_a_note_where_there_is_one() {
+        let mut md = row(
+            "jaehho/mail-digest",
+            "mail-digest",
+            "archived",
+            "first seen archived 2026-10-18; 0 open tasks",
+        );
+        md.archived_in_window = true;
+        let r = report(vec![
+            row("jaehho/lab", "lab", "ok", ""),
+            md,
+            row("jaehho/dash", "dash", "conflict", "two links claim it"),
+        ]);
+        assert_eq!(
+            projects_text(&plain(), &r, ny()),
+            "\
+LIST         REPO                STATE     NOTE
+lab          jaehho/lab          ok
+mail-digest  jaehho/mail-digest  archived  first seen archived 2026-10-18; 0 open tasks; already archived in the window
+dash         jaehho/dash         conflict  two links claim it"
+        );
+
+        // Archived in the window says nothing of a repo that is live
+        let mut live = row("jaehho/lab", "lab", "ok", "");
+        live.archived_in_window = true;
+        assert_eq!(
+            projects_text(&plain(), &report(vec![live]), ny()),
+            "LIST  REPO        STATE  NOTE\nlab   jaehho/lab  ok"
+        );
+
+        assert_eq!(
+            projects_text(&plain(), &report(vec![]), ny()),
+            "no list is linked; `asst link <list> <owner/repo>`"
+        );
+    }
+
+    #[test]
+    fn the_state_is_painted_in_its_own_cell_and_not_the_row() {
+        let color = Style { color: true };
+        let r = report(vec![
+            row("jaehho/lab", "lab", "ok", ""),
+            row("jaehho/a", "a", "archived", "n"),
+            row("jaehho/b", "b", "unreachable", "n"),
+        ]);
+        let text = projects_text(&color, &r, ny());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "\x1b[2mLIST  REPO        STATE        NOTE\x1b[0m"
+        );
+        assert_eq!(lines[1], "lab   jaehho/lab  ok");
+        assert_eq!(lines[2], "a     jaehho/a    \x1b[2marchived   \x1b[0m  n");
+        assert_eq!(lines[3], "b     jaehho/b    \x1b[33munreachable\x1b[0m  n");
+    }
+
+    #[test]
+    fn a_list_that_waits_for_its_name_says_until_when() {
+        let mut waiting = row("jaehho/lab", "champalimaud", "renamed", "n");
+        waiting.pending_rename = Some(Pending {
+            from: "jaehho/champalimaud".into(),
+            since: at(10, 18),
+            expires: at(11, 17),
+            begun: false,
+        });
+        let mut r = report(vec![waiting]);
+        let text = projects_text(&plain(), &r, ny());
+        assert_eq!(
+            text.lines().skip(3).collect::<Vec<_>>().join("\n"),
+            "\
+Pending
+  list \"champalimaud\" waits to be renamed \"lab\": jaehho/champalimaud became jaehho/lab on 2026-10-18; asstd tries on every pass until 2026-11-17"
+        );
+
+        // Begun on the server and not finished
+        r.links[0].pending_rename.as_mut().unwrap().begun = true;
+        let text = projects_text(&plain(), &r, ny());
+        assert!(
+            text.contains(
+                "on 2026-10-18; the rename was begun on the server and is not finished; asstd tries"
+            ),
+            "{text}"
+        );
+
+        // With following off, asstd will not do it
+        r.settings = Rules::new(FollowRename::Off);
+        let text = projects_text(&plain(), &r, ny());
+        assert!(
+            text.ends_with(
+                "is not finished; follow_rename is off, so asstd will leave the list as it is"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("until"));
+    }
+
+    #[test]
+    fn a_proposal_is_the_command_and_why() {
+        let mut r = report(vec![row("jaehho/lab", "champalimaud", "ok", "")]);
+        r.proposals.push(Proposal {
+            kind: "rename-list",
+            repo: "jaehho/lab".into(),
+            list: "/cal/champalimaud/".into(),
+            from: "champalimaud".into(),
+            to: "lab".into(),
+            command: "asst list rename \"champalimaud\" \"lab\"".into(),
+            why: "jaehho/champalimaud is now jaehho/lab; the list is still called \"champalimaud\""
+                .into(),
+        });
+        assert_eq!(
+            projects_text(&plain(), &r, ny()),
+            "\
+LIST          REPO        STATE  NOTE
+champalimaud  jaehho/lab  ok
+
+Proposals (nothing has been changed)
+  jaehho/champalimaud is now jaehho/lab; the list is still called \"champalimaud\"
+    asst list rename \"champalimaud\" \"lab\""
+        );
+    }
+
+    #[test]
+    fn old_labels_say_how_to_stop_and_how_to_catch_up() {
+        let mut r = report(vec![row("jaehho/lab", "lab", "ok", "")]);
+        r.labels.push(StaleLabel {
+            label: "champalimaud".into(),
+            now: "lab".into(),
+            repo: "jaehho/lab".into(),
+            blocks: 127,
+            seconds: 152_424,
+        });
+        r.labels.push(StaleLabel {
+            label: "Champalimaud".into(),
+            now: "lab".into(),
+            repo: "jaehho/lab".into(),
+            blocks: 1,
+            seconds: 60,
+        });
+        assert_eq!(
+            projects_text(&plain(), &r, ny()),
+            "\
+LIST  REPO        STATE  NOTE
+lab   jaehho/lab  ok
+
+Labels
+  127 blocks (42.3 h) still say \"champalimaud\"
+    new days: [[rule]] project = \"champalimaud\" tag = \"lab\" in tags.toml
+    history: the relabel recipe in README, \"Renaming a project\"
+  1 block (0.0 h) still say \"Champalimaud\"
+    new days: [[rule]] project = \"Champalimaud\" tag = \"lab\" in tags.toml
+    history: the relabel recipe in README, \"Renaming a project\""
+        );
+    }
+
+    #[test]
+    fn what_could_not_be_read_is_said_after_the_rest() {
+        let mut r = report(vec![row("jaehho/lab", "lab", "ok", "")]);
+        r.warnings.push("asstd did not give its log".into());
+        assert_eq!(
+            projects_text(&plain(), &r, ny()),
+            "LIST  REPO        STATE  NOTE\nlab   jaehho/lab  ok\n\nasstd did not give its log"
+        );
+    }
+
+    fn log_row(at: DateTime<Utc>, kind: &str, by: &str, text: &str) -> LogRow {
+        LogRow {
+            id: 1,
+            at: at.timestamp(),
+            repo: "jaehho/lab".into(),
+            list: None,
+            kind: kind.into(),
+            text: text.into(),
+            data: None,
+            by: by.into(),
+        }
+    }
+
+    #[test]
+    fn the_log_is_a_line_a_row_in_the_persons_time() {
+        let rows = [
+            log_row(
+                Utc.with_ymd_and_hms(2026, 10, 18, 1, 4, 0).unwrap(),
+                "list-renamed",
+                "auto",
+                "renamed list \"champalimaud\" to \"lab\": jaehho/champalimaud is now \
+                 jaehho/lab (GitHub id 1379104005). Undo: asst list rename lab champalimaud",
+            ),
+            log_row(
+                at(10, 17),
+                "repo-archived",
+                "cli",
+                "jaehho/mail-digest is archived on GitHub",
+            ),
+        ];
+        // 01:04 UTC is the evening before in New York
+        assert_eq!(
+            log_text(&plain(), &rows, ny()),
+            "\
+2026-10-17 21:04  list-renamed   auto  renamed list \"champalimaud\" to \"lab\": jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005). Undo: asst list rename lab champalimaud
+2026-10-17 12:00  repo-archived  cli   jaehho/mail-digest is archived on GitHub"
+        );
+        assert_eq!(log_text(&plain(), &[], ny()), "nothing logged");
+        let color = Style { color: true };
+        assert!(log_text(&color, &rows, ny()).starts_with("\x1b[2m2026-10-17 21:04\x1b[0m"));
     }
 }

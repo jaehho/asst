@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use asst_core::api::{
-    AddSpec, Added, Change, LinkState, LinkView, ListChange, ListSpec, ListView, Settings,
-    SettingsChange, StatusView, SyncState, TaskView, short_ids,
+    AddSpec, Added, Change, LinkState, LinkView, ListChange, ListSpec, ListView, PendingRename,
+    Settings, SettingsChange, StatusView, SyncState, TaskView, short_ids,
 };
 use asst_core::caldav::{self, Account, CalDav, RemoteError, RemoteList};
 use asst_core::config::{self, AccountConfig, Config};
 use asst_core::github;
 use asst_core::quickadd;
-use asst_core::store::{GhLinkRow, Query, Row, Store, StoreError};
+use asst_core::store::{GH_LOG_KEEP, GhLinkRow, LogRow, Query, Row, Store, StoreError};
 use asst_core::sync::{self, Report, SyncError};
 use asst_core::task::{Edit, priority_from_level};
 use asst_core::time::{Trigger, When};
@@ -96,7 +96,8 @@ pub struct Hold {
 }
 
 /// A link missing for this long gets a hint at the way out.
-const UNLINK_HINT_AFTER: chrono::Duration = chrono::Duration::days(14);
+const UNLINK_HINT_AFTER: chrono::Duration =
+    chrono::Duration::days(github::limits::UNLINK_HINT_DAYS);
 
 /// What a link needs a look for, if anything: a held pass first, then a
 /// rename its list has not followed, then an archived repo. `open` is the
@@ -154,6 +155,14 @@ fn link_condition(
         state: LinkState::Archived,
         note: format!("first seen archived {}; {tasks}", day(first_seen)),
         since: Some(first_seen),
+    })
+}
+
+/// The rename the link's list has yet to follow, if there is one.
+fn pending_rename(row: &GhLinkRow) -> Option<PendingRename> {
+    Some(PendingRename {
+        from: row.follow_from.clone()?,
+        since: DateTime::from_timestamp(row.follow_at?, 0)?,
     })
 }
 
@@ -922,11 +931,13 @@ impl Daemon {
                     .unwrap_or_default();
                 let open = counts.get(&row.list).map_or(0, |(open, _)| *open);
                 let found = link_condition(&row, &name, seen.hold.as_ref(), open, self.zone, now);
+                let waiting = pending_rename(&row);
                 Ok(LinkView {
                     repo_id: row.repo_id,
                     state: found.as_ref().map(|c| c.state),
                     since: found.as_ref().and_then(|c| c.since),
                     note: found.map(|c| c.note),
+                    pending_rename: waiting,
                     repo: row.repo,
                     list: row.list,
                     name,
@@ -935,6 +946,20 @@ impl Daemon {
                 })
             })
             .collect()
+    }
+
+    /// What asstd changed or decided about its links by itself, newest
+    /// first: one repo's rows (named in any case) or, with `""`, every
+    /// repo's. The log keeps 500 rows, so no call gets more than that.
+    pub fn link_log(&self, repo: &str, limit: u32) -> Result<Vec<LogRow>> {
+        let repo = repo.trim();
+        let kept = u32::try_from(GH_LOG_KEEP).unwrap_or(u32::MAX);
+        let rows = self.store().gh_log_recent(None, kept)?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| repo.is_empty() || r.repo.eq_ignore_ascii_case(repo))
+            .take(limit as usize)
+            .collect())
     }
 
     /// A GitHub pass over `repo` ended: it worked, or this is why not.
@@ -1526,6 +1551,113 @@ mod tests {
         assert!(daemon.unlink("jaehho/asst").unwrap());
         assert!(!daemon.unlink("jaehho/asst").unwrap());
         assert_eq!(daemon.links().unwrap().len(), 1);
+    }
+
+    fn two_lists() -> Arc<Daemon> {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        let list = |href: &str, name: &str| caldav::RemoteList {
+            href: href.into(),
+            name: name.into(),
+            color: None,
+            order: None,
+            sync_token: Some("t1".into()),
+            ctag: None,
+            writable: true,
+        };
+        store
+            .apply_lists(&[
+                list("/cal/lab/", "champalimaud"),
+                list("/cal/home/", "Home"),
+            ])
+            .unwrap();
+        Daemon::new(Config::default(), store, zone).0
+    }
+
+    #[test]
+    fn a_rename_the_list_has_yet_to_follow_is_told_apart_from_the_links_state() {
+        let daemon = two_lists();
+        daemon.link("champalimaud", "jaehho/champalimaud").unwrap();
+        let at = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+        let waiting = |daemon: &Daemon| daemon.links().unwrap().remove(0).pending_rename;
+        assert_eq!(waiting(&daemon), None);
+
+        // Seen by the daemon: the link has moved, the list has not
+        daemon
+            .store()
+            .gh_rename("jaehho/champalimaud", "jaehho/lab", Some(at), None)
+            .unwrap();
+        let link = daemon.links().unwrap().remove(0);
+        assert_eq!(link.repo, "jaehho/lab");
+        assert_eq!(link.state, Some(LinkState::Renamed));
+        assert_eq!(
+            link.pending_rename,
+            Some(PendingRename {
+                from: "jaehho/champalimaud".into(),
+                since: at
+            })
+        );
+
+        // Held for another reason, it is still a rename the list waits on
+        daemon.gh_hold("jaehho/lab", LinkState::Conflict, "two links".into(), at);
+        let link = daemon.links().unwrap().remove(0);
+        assert_eq!(link.state, Some(LinkState::Conflict));
+        assert!(link.pending_rename.is_some());
+
+        daemon.store().gh_clear_follow("jaehho/lab").unwrap();
+        assert_eq!(waiting(&daemon), None);
+    }
+
+    #[test]
+    fn the_log_is_asked_for_by_repo_in_any_case_newest_first_and_no_more_than_it_keeps() {
+        let daemon = two_lists();
+        let at = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+        let add = |n: usize, repo: &str| {
+            daemon
+                .store()
+                .gh_log_add(&asst_core::store::NewLog {
+                    at,
+                    repo,
+                    list: None,
+                    kind: "repo-renamed",
+                    text: &format!("row {n}"),
+                    data: None,
+                    by: "auto",
+                })
+                .unwrap();
+        };
+        for n in 0..6 {
+            add(
+                n,
+                if n % 2 == 0 {
+                    "jaehho/lab"
+                } else {
+                    "jaehho/asst"
+                },
+            );
+        }
+        let texts = |repo: &str, limit: u32| -> Vec<String> {
+            daemon
+                .link_log(repo, limit)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.text)
+                .collect()
+        };
+        assert_eq!(texts("", 3), ["row 5", "row 4", "row 3"]);
+        assert_eq!(texts("Jaehho/LAB", 10), ["row 4", "row 2", "row 0"]);
+        assert_eq!(texts(" jaehho/lab ", 2), ["row 4", "row 2"]);
+        assert!(texts("jaehho/nobody", 10).is_empty());
+        assert!(texts("", 0).is_empty());
+
+        // The log keeps 500 rows and no call gets more than that
+        for n in 6..520 {
+            add(n, "jaehho/lab");
+        }
+        let all = daemon.link_log("", u32::MAX).unwrap();
+        assert_eq!(all.len(), 500);
+        assert_eq!(all[0].text, "row 519");
+        assert_eq!(all[499].text, "row 20");
     }
 
     fn link_row(archived: Option<i64>, follow: Option<(&str, i64)>) -> GhLinkRow {

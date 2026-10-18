@@ -164,6 +164,10 @@ impl Service {
         json(&self.daemon.links().map_err(failed)?)
     }
 
+    async fn link_log(&self, repo: &str, limit: u32) -> fdo::Result<String> {
+        json(&self.daemon.link_log(repo, limit).map_err(failed)?)
+    }
+
     async fn settings(&self) -> fdo::Result<String> {
         json(&self.daemon.settings())
     }

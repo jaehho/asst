@@ -72,6 +72,10 @@ pub trait Asst {
     fn unlink(&self, repo: &str) -> zbus::Result<bool>;
     /// → `[LinkView]`
     fn links(&self) -> zbus::Result<String>;
+    /// `owner/repo` (any case; `""` for every repo), how many rows at most
+    /// (the log keeps 500) → `[store::LogRow]`, newest first: what asstd
+    /// changed or decided about a link by itself, and why.
+    fn link_log(&self, repo: &str, limit: u32) -> zbus::Result<String>;
     /// → `Settings`
     fn settings(&self) -> zbus::Result<String>;
     /// `SettingsChange` → `Settings`, saved to `config.toml`.
@@ -170,6 +174,15 @@ impl LinkState {
     }
 }
 
+/// A repo rename the repo's list has not followed yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRename {
+    /// The repo's name before the rename.
+    pub from: String,
+    /// When asstd saw the rename.
+    pub since: DateTime<Utc>,
+}
+
 /// A GitHub repo whose issues are synced with a list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkView {
@@ -198,6 +211,10 @@ pub struct LinkView {
     /// When the state began, if asst knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// The repo was renamed and its list has yet to follow. Kept apart from
+    /// `state`, which names only the most pressing thing about the link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_rename: Option<PendingRename>,
 }
 
 /// The GitHub issue a task is paired with.
@@ -536,8 +553,8 @@ mod tests {
         let old = r#"{"repo":"jaehho/lab","list":"/cal/lab/","name":"lab"}"#;
         let l: LinkView = serde_json::from_str(old).unwrap();
         assert_eq!(
-            (l.state, l.note, l.since, l.repo_id),
-            (None, None, None, None)
+            (l.state, l.note, l.since, l.repo_id, l.pending_rename),
+            (None, None, None, None, None)
         );
         let fine = LinkView {
             repo: "jaehho/lab".into(),
@@ -558,6 +575,19 @@ mod tests {
         assert_eq!(json["state"], "archived");
         assert_eq!(json["repo_id"], 1379104203);
         assert_eq!(serde_json::from_value::<LinkView>(json).unwrap(), archived);
+
+        // A rename the list has yet to follow is told apart from the state
+        let waiting = LinkView {
+            pending_rename: Some(PendingRename {
+                from: "jaehho/champalimaud".into(),
+                since: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
+            }),
+            ..archived
+        };
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["pending_rename"]["from"], "jaehho/champalimaud");
+        assert_eq!(json["state"], "archived");
+        assert_eq!(serde_json::from_value::<LinkView>(json).unwrap(), waiting);
         for (state, word) in [
             (LinkState::Archived, "archived"),
             (LinkState::Renamed, "renamed"),

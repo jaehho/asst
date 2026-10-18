@@ -125,6 +125,33 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// The window's own preferences, which the window alone writes.
+pub fn window_path() -> PathBuf {
+    config_dir().join("window.toml")
+}
+
+/// The lists (hrefs) the window has archived, for a tool that only reads
+/// them: `asst projects` says which of its lists are put away. A missing
+/// or unreadable file puts none away.
+pub fn archived_in_window() -> Vec<String> {
+    std::fs::read_to_string(window_path())
+        .map(|text| archived_lists(&text))
+        .unwrap_or_default()
+}
+
+/// The `archived` key of `window.toml`. The window writes the file whole and
+/// owns its other keys, so nothing else is read.
+pub fn archived_lists(text: &str) -> Vec<String> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Window {
+        archived: Vec<String>,
+    }
+    toml::from_str::<Window>(text)
+        .map(|w| w.archived)
+        .unwrap_or_default()
+}
+
 /// systemd's StateDirectory= when run as the service, else the XDG path.
 pub fn state_dir() -> PathBuf {
     std::env::var_os("STATE_DIRECTORY")
@@ -240,6 +267,18 @@ mod tests {
         let text = toml::to_string_pretty(&off).unwrap();
         assert!(text.contains("follow_rename = \"off\""), "{text}");
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), off);
+    }
+
+    #[test]
+    fn the_windows_archived_lists_are_read_and_nothing_else() {
+        let text = "width = 1080\narchived = [\"/cal/a/\", \"/cal/b/\"]\n\
+                    [views.x]\nsort = 1\n";
+        assert_eq!(archived_lists(text), ["/cal/a/", "/cal/b/"]);
+        assert!(archived_lists("").is_empty());
+        assert!(archived_lists("width = 1080\n").is_empty());
+        // A file that does not parse puts nothing away, and nothing fails
+        assert!(archived_lists("archived = [").is_empty());
+        assert!(archived_lists("archived = 3\n").is_empty());
     }
 
     #[test]

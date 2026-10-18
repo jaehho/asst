@@ -2,6 +2,7 @@
 
 mod bar;
 mod out;
+mod projects;
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -13,7 +14,7 @@ use asst_core::api::{
 };
 use asst_core::fmt;
 use asst_core::github::FollowRename;
-use asst_core::store::{Query, Store, View};
+use asst_core::store::{LogRow, Query, Store, View};
 use asst_core::sync::Report;
 use asst_core::task::priority_level;
 use asst_core::track;
@@ -99,6 +100,13 @@ enum Cmd {
     Unlink {
         #[arg(value_name = "OWNER/REPO")]
         repo: String,
+    },
+    /// What the ties to GitHub repos need: lists to rename, retired repos,
+    /// old labels. Reads and proposes; changes nothing. `asst projects log`
+    /// is what asstd did by itself
+    Projects {
+        #[command(subcommand)]
+        action: Option<ProjectsCmd>,
     },
     /// Show a task in the window
     Open { id: String },
@@ -200,6 +208,19 @@ enum Cmd {
     },
     /// A waybar module: prints a JSON line whenever tasks change
     Bar,
+}
+
+#[derive(Subcommand)]
+enum ProjectsCmd {
+    /// What asstd changed or decided about a link by itself, newest first
+    Log {
+        /// How many rows (the log keeps 500)
+        #[arg(short = 'n', long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
+        /// Only this repo's rows
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -668,6 +689,30 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             if !json {
                 println!("{} {repo}", style.dim("Unlinked:"));
             }
+        }
+        Cmd::Projects { action: None } => {
+            let report = projects::build(projects::gather(&proxy).await?);
+            if json {
+                return show_json(&serde_json::to_string(&report)?);
+            }
+            println!("{}", out::projects_text(&style, &report, zone));
+        }
+        Cmd::Projects {
+            action: Some(ProjectsCmd::Log { limit, repo }),
+        } => {
+            let raw = match proxy
+                .link_log(repo.as_deref().map_or("", str::trim), limit)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(e) if projects::is_unknown_method(&e) => bail!(projects::OLD_DAEMON),
+                Err(e) => return Err(e.into()),
+            };
+            if json {
+                return show_json(&raw);
+            }
+            let rows: Vec<LogRow> = serde_json::from_str(&raw)?;
+            println!("{}", out::log_text(&style, &rows, zone));
         }
         Cmd::Open { id } => {
             let t: TaskView = serde_json::from_str(&proxy.get(&id).await?)?;
