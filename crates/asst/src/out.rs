@@ -7,7 +7,7 @@ use asst_core::fmt;
 use asst_core::github::{FollowRename, short};
 use asst_core::store::LogRow;
 use asst_core::task::priority_level;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 
 use crate::projects::{Pending, ProjectLink, Report};
@@ -225,6 +225,31 @@ pub fn projects_text(s: &Style, r: &Report, zone: Tz) -> String {
         out.extend(r.warnings.iter().map(|w| s.yellow(w)));
     }
     out.join("\n")
+}
+
+/// How far back `log_pointer` looks.
+const RECENT_DAYS: i64 = 7;
+
+/// The last line of `asst projects` when asstd has logged something
+/// lately: that there is a record of what it did by itself, and where. A
+/// list renamed on the phone is otherwise a change with nowhere to be read
+/// about it. Nothing when the log is quiet. `rows` is newest first.
+pub fn log_pointer(s: &Style, rows: &[LogRow], now: DateTime<Utc>, zone: Tz) -> Option<String> {
+    let since = now - Duration::days(RECENT_DAYS);
+    let recent: Vec<DateTime<Utc>> = rows
+        .iter()
+        .filter_map(|r| DateTime::from_timestamp(r.at, 0))
+        .filter(|at| *at > since)
+        .collect();
+    let latest = recent.iter().max()?;
+    let count = match recent.len() {
+        1 => "1 row".to_string(),
+        n => format!("{n} rows"),
+    };
+    Some(s.dim(&format!(
+        "asstd logged {count} in the last {RECENT_DAYS} days, the latest on {}: asst projects log",
+        day(*latest, zone)
+    )))
 }
 
 /// `LIST  REPO  STATE  NOTE`, each column as wide as what is in it.
@@ -815,6 +840,35 @@ Labels
         );
         let color = Style { color: true };
         assert!(log_text(&color, &rows, ny(), None).starts_with("\x1b[2m2026-10-17 21:04\x1b[0m"));
+    }
+
+    #[test]
+    fn a_recent_log_is_pointed_to_from_the_report_and_an_old_one_is_not() {
+        let now = at(10, 20);
+        let row = |when: DateTime<Utc>| log_row(when, "list-renamed", "auto", "x");
+        // Newest first, as the daemon gives them
+        let rows = [row(at(10, 19)), row(at(10, 18)), row(at(10, 2))];
+        assert_eq!(
+            log_pointer(&plain(), &rows, now, ny()).as_deref(),
+            Some(
+                "asstd logged 2 rows in the last 7 days, the latest on 2026-10-19: asst projects log"
+            )
+        );
+        assert_eq!(
+            log_pointer(&plain(), &rows[1..2], now, ny()).as_deref(),
+            Some(
+                "asstd logged 1 row in the last 7 days, the latest on 2026-10-18: asst projects log"
+            )
+        );
+        // Nothing lately, or nothing at all: nothing to say
+        assert_eq!(log_pointer(&plain(), &rows[2..], now, ny()), None);
+        assert_eq!(log_pointer(&plain(), &[], now, ny()), None);
+        let color = Style { color: true };
+        assert!(
+            log_pointer(&color, &rows, now, ny())
+                .unwrap()
+                .starts_with("\x1b[2masstd logged")
+        );
     }
 
     #[test]

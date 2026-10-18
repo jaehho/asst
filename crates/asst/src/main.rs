@@ -691,11 +691,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Cmd::Projects { action: None } => {
-            let report = projects::build(projects::gather(&proxy).await?);
+            let facts = projects::gather(&proxy).await?;
+            let log = facts.log.clone();
+            let report = projects::build(facts);
             if json {
                 return show_json(&serde_json::to_string(&report)?);
             }
             println!("{}", out::projects_text(&style, &report, zone));
+            if let Some(line) = out::log_pointer(&style, &log, Utc::now(), zone) {
+                println!("\n{line}");
+            }
         }
         Cmd::Projects {
             action: Some(ProjectsCmd::Log { limit, repo }),
