@@ -104,7 +104,7 @@ async fn follow_rename(
     let Some(new) = gh.renamed(repo).await? else {
         return Err(RemoteError::Status(301).into());
     };
-    daemon.store().gh_rename(repo, &new)?;
+    daemon.store().gh_rename(repo, &new, None, None)?;
     cache.remove(repo);
     log::info!("{repo} is now {new}");
     daemon.wake_github.notify_one();

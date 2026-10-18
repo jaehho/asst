@@ -4,11 +4,13 @@
 //! which is what gets shown and sent).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
-use rusqlite::{Connection, OptionalExtension, Row as SqlRow, params};
+use rusqlite::{
+    Connection, OptionalExtension, Row as SqlRow, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::caldav::RemoteList;
@@ -32,6 +34,8 @@ pub enum StoreError {
     Edit(#[from] EditError),
     #[error("stored data is corrupt: {0}")]
     Corrupt(String),
+    #[error("backing up the database before a migration: {0}")]
+    Backup(String),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -117,6 +121,52 @@ pub struct Query {
     pub limit: Option<u32>,
 }
 
+/// A linked repo, with what is known about it beyond the name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhLinkRow {
+    pub repo: String,
+    pub list: String,
+    /// The repo's GitHub id, learned once; `None` until the first look.
+    pub repo_id: Option<u64>,
+    /// `None`: never looked at. `Some(0)`: looked at, not archived or
+    /// disabled. Otherwise when (epoch seconds) it was first seen so.
+    pub archived: Option<i64>,
+    /// The name the repo had before the rename that the list has yet to
+    /// follow, and when (epoch seconds) that rename was seen.
+    pub follow_from: Option<String>,
+    pub follow_at: Option<i64>,
+}
+
+/// A row of the decision log: what asst changed or decided about a link
+/// by itself, and why. `by` is `auto` or `cli`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRow {
+    pub id: i64,
+    pub at: i64,
+    pub repo: String,
+    pub list: Option<String>,
+    pub kind: String,
+    pub text: String,
+    pub data: Option<String>,
+    pub by: String,
+}
+
+/// A decision log row to write.
+#[derive(Debug, Clone, Copy)]
+pub struct NewLog<'a> {
+    pub at: DateTime<Utc>,
+    pub repo: &'a str,
+    pub list: Option<&'a str>,
+    pub kind: &'a str,
+    pub text: &'a str,
+    /// JSON for whatever an undo needs.
+    pub data: Option<&'a str>,
+    pub by: &'a str,
+}
+
+/// The decision log keeps this many rows, the newest.
+const GH_LOG_KEEP: i64 = 500;
+
 pub struct Store {
     conn: Connection,
     zone: Tz,
@@ -161,7 +211,24 @@ CREATE TABLE IF NOT EXISTS fired (href TEXT NOT NULL, at INTEGER NOT NULL, PRIMA
 CREATE TABLE IF NOT EXISTS snoozed (href TEXT PRIMARY KEY, until INTEGER NOT NULL);
 DROP TABLE IF EXISTS todo_seen;
 DROP TABLE IF EXISTS links;
-CREATE TABLE IF NOT EXISTS gh_links (repo TEXT PRIMARY KEY, list TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS gh_links (
+  repo TEXT PRIMARY KEY,
+  list TEXT NOT NULL UNIQUE,
+  repo_id INTEGER,
+  archived INTEGER,
+  follow_from TEXT,
+  follow_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS gh_log (
+  id INTEGER PRIMARY KEY,
+  at INTEGER NOT NULL,
+  repo TEXT NOT NULL,
+  list TEXT,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  data TEXT,
+  by TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS gh_pairs (
   repo TEXT NOT NULL REFERENCES gh_links(repo) ON DELETE CASCADE,
   number INTEGER NOT NULL,
@@ -186,6 +253,97 @@ CREATE INDEX IF NOT EXISTS blocks_task ON blocks(task_uid);
 CREATE INDEX IF NOT EXISTS blocks_start ON blocks(start);
 ";
 
+/// The columns a link gained for the repo's identity, in the order they
+/// were added.
+const IDENTITY_COLUMNS: [(&str, &str); 4] = [
+    ("repo_id", "INTEGER"),
+    ("archived", "INTEGER"),
+    ("follow_from", "TEXT"),
+    ("follow_at", "INTEGER"),
+];
+
+/// Whether `table` has `column`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+}
+
+/// A link made before repos had an identity has no `repo_id` and its
+/// neighbours: CREATE TABLE IF NOT EXISTS leaves the old table as it is.
+/// Every column starts out NULL, which means "not looked at yet"; nothing
+/// is read from GitHub or Nextcloud and nothing is logged. The check runs
+/// again inside the write lock, since asst, asstd and asst-gtk rebuild and
+/// start independently and any of them may be the first to migrate.
+fn add_identity_columns(conn: &Connection) -> Result<()> {
+    if has_column(conn, "gh_links", "repo_id")? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for (name, kind) in IDENTITY_COLUMNS {
+        if !has_column(&tx, "gh_links", name)? {
+            tx.execute_batch(&format!("ALTER TABLE gh_links ADD COLUMN {name} {kind}"))?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Where the copy of a database made before the identity columns goes.
+fn identity_backup_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(".pre-identity");
+    PathBuf::from(name)
+}
+
+/// Before the first migration to the identity columns, keep a copy of the
+/// database beside it as `<db>.pre-identity`: links and their pairs cannot
+/// be rebuilt from either server. Taken once, when a `gh_links` table
+/// exists without `repo_id` and the copy does not; a new database has
+/// nothing to lose. asst never deletes it.
+///
+/// `VACUUM INTO` writes a consistent snapshot even while another process
+/// has the file open in WAL mode. It goes to a name of this process's own
+/// and is checked before it is linked into place, so a crash or a full disk
+/// never leaves a half copy that later opens would take for the real one,
+/// and two processes that start together keep whichever finished first.
+/// A copy that cannot be made stops the open: the migration waits for it.
+fn back_up_before_identity(conn: &Connection, db: &Path) -> Result<()> {
+    let backup = identity_backup_path(db);
+    let old_table =
+        has_column(conn, "gh_links", "repo")? && !has_column(conn, "gh_links", "repo_id")?;
+    if !old_table || backup.exists() {
+        return Ok(());
+    }
+    let mut tmp = backup.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let copied = (|| -> Result<()> {
+        conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])?;
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let check: String =
+            Connection::open_with_flags(&tmp, flags)?
+                .query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if check != "ok" {
+            return Err(StoreError::Backup(format!("the copy is damaged: {check}")));
+        }
+        // A hard link fails when the name is taken, as a rename does not.
+        match std::fs::hard_link(&tmp, &backup) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) if !backup.exists() => std::fs::rename(&tmp, &backup)
+                .map_err(|e| StoreError::Backup(format!("{}: {e}", backup.display()))),
+            Err(e) => Err(StoreError::Backup(format!("{}: {e}", backup.display()))),
+        }
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    copied
+}
+
 const TASK_COLS: &str = "href, list, etag, (etag IS NULL OR edits != '[]' OR deleted = 1), json";
 
 fn row_from_sql(r: &SqlRow) -> rusqlite::Result<(String, String, Option<String>, bool, String)> {
@@ -208,6 +366,7 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        back_up_before_identity(&conn, path)?;
         Store::init(conn, zone)
     }
 
@@ -231,6 +390,7 @@ impl Store {
                  ALTER TABLE gh_pairs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        add_identity_columns(&conn)?;
         let mut store = Store { conn, zone };
         let stored: Option<String> = store.meta("zone")?;
         if stored.as_deref() != Some(zone.name()) {
@@ -944,8 +1104,30 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every link with what is known about its repo.
+    pub fn gh_link_rows(&self) -> Result<Vec<GhLinkRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT repo, list, repo_id, archived, follow_from, follow_at FROM gh_links ORDER BY repo",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(GhLinkRow {
+                    repo: r.get(0)?,
+                    list: r.get(1)?,
+                    repo_id: r
+                        .get::<_, Option<i64>>(2)?
+                        .and_then(|n| u64::try_from(n).ok()),
+                    archived: r.get(3)?,
+                    follow_from: r.get(4)?,
+                    follow_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Tie a repo to a list, one repo per list. Tied to another list
-    /// before, the repo's pairs go: they name that list's tasks.
+    /// before, the repo's pairs go: they name that list's tasks. A link
+    /// made anew starts without an id, which is learned on the next look.
     pub fn gh_link(&self, repo: &str, list: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM gh_links WHERE (repo = ?1 OR list = ?2) AND NOT (repo = ?1 AND list = ?2)",
@@ -958,15 +1140,74 @@ impl Store {
         Ok(())
     }
 
-    /// The repo is called `new` now: its link and pairs follow, nothing
-    /// is paired again. Fails, changing nothing, when `new` is linked.
-    pub fn gh_rename(&self, old: &str, new: &str) -> Result<()> {
+    /// Remember the repo's id, once. Nothing is written, and this says so,
+    /// when the link already has an id (it is never overwritten: that is
+    /// what makes it the identity) or another link has this one.
+    pub fn gh_learn_id(&self, repo: &str, id: u64) -> Result<bool> {
+        // SQLite integers are signed; a GitHub id is nowhere near the end.
+        let id = i64::try_from(id).map_err(|_| StoreError::Corrupt(format!("repo id {id}")))?;
+        Ok(self.conn.execute(
+            "UPDATE gh_links SET repo_id = ?2
+             WHERE repo = ?1 AND repo_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM gh_links WHERE repo_id = ?2)",
+            params![repo, id],
+        )? > 0)
+    }
+
+    /// Record whether the repo is archived or disabled as of `at`. Seen so
+    /// again, it keeps the time it was first seen; seen live, it is 0.
+    pub fn gh_set_archived(&self, repo: &str, archived: bool, at: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE gh_links SET archived = CASE
+                 WHEN NOT ?2 THEN 0
+                 WHEN archived > 0 THEN archived
+                 ELSE ?3 END
+             WHERE repo = ?1",
+            params![repo, archived, at.timestamp().max(1)],
+        )?;
+        Ok(())
+    }
+
+    /// The repo is called `new` now: its link and pairs move with it and
+    /// nothing is paired again. Its id and archived baseline stay, since
+    /// they are the repo's, not the name's. In the same transaction,
+    /// `follow_at` marks the list as having a rename to follow (from `old`,
+    /// when; a second rename before the first was followed replaces the
+    /// marker) and `log` is written. Fails, changing nothing, when `new` is
+    /// linked. Returns whether there was a link to move.
+    pub fn gh_rename(
+        &self,
+        old: &str,
+        new: &str,
+        follow_at: Option<DateTime<Utc>>,
+        log: Option<&NewLog>,
+    ) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
         // The pairs name the link by repo, and move with it.
         tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-        tx.execute("UPDATE gh_links SET repo = ?2 WHERE repo = ?1", [old, new])?;
+        let moved = tx.execute("UPDATE gh_links SET repo = ?2 WHERE repo = ?1", [old, new])? > 0;
         tx.execute("UPDATE gh_pairs SET repo = ?2 WHERE repo = ?1", [old, new])?;
+        if moved {
+            if let Some(at) = follow_at {
+                tx.execute(
+                    "UPDATE gh_links SET follow_from = ?2, follow_at = ?3 WHERE repo = ?1",
+                    params![new, old, at.timestamp()],
+                )?;
+            }
+            if let Some(row) = log {
+                insert_log(&tx, row)?;
+            }
+        }
         tx.commit()?;
+        Ok(moved)
+    }
+
+    /// The list has followed the rename, or will not: forget the marker.
+    pub fn gh_clear_follow(&self, repo: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE gh_links SET follow_from = NULL, follow_at = NULL WHERE repo = ?1",
+            [repo],
+        )?;
         Ok(())
     }
 
@@ -975,6 +1216,47 @@ impl Store {
             .conn
             .execute("DELETE FROM gh_links WHERE repo = ?1", [repo])?
             > 0)
+    }
+
+    // -- the decision log: no foreign key, so it outlives an unlink --------
+
+    /// Write a row; the log keeps its newest 500. Its id.
+    pub fn gh_log_add(&self, row: &NewLog) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = insert_log(&tx, row)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// The newest rows first, of one repo or all.
+    pub fn gh_log_recent(&self, repo: Option<&str>, limit: u32) -> Result<Vec<LogRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, at, repo, list, kind, text, data, by FROM gh_log
+             WHERE ?1 IS NULL OR repo = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![repo, limit], |r| {
+                Ok(LogRow {
+                    id: r.get(0)?,
+                    at: r.get(1)?,
+                    repo: r.get(2)?,
+                    list: r.get(3)?,
+                    kind: r.get(4)?,
+                    text: r.get(5)?,
+                    data: r.get(6)?,
+                    by: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Change what a row says it is, e.g. an intent (`list-renaming`) that
+    /// has been carried out (`list-renamed`). Whether the row was there.
+    pub fn gh_log_retag(&self, id: i64, kind: &str, text: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE gh_log SET kind = ?2, text = ?3 WHERE id = ?1",
+            params![id, kind, text],
+        )? > 0)
     }
 
     /// Every task of a list, open and completed, in the order they were
@@ -1125,6 +1407,28 @@ fn file_safe(uid: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Insert a log row and trim the log to its newest `GH_LOG_KEEP`.
+fn insert_log(conn: &Connection, row: &NewLog) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO gh_log(at, repo, list, kind, text, data, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row.at.timestamp(),
+            row.repo,
+            row.list,
+            row.kind,
+            row.text,
+            row.data,
+            row.by
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "DELETE FROM gh_log WHERE id NOT IN (SELECT id FROM gh_log ORDER BY id DESC LIMIT ?1)",
+        [GH_LOG_KEEP],
+    )?;
+    Ok(id)
 }
 
 fn write_derived(conn: &Connection, href: &str, t: &Task, zone: Tz) -> Result<()> {
@@ -1495,14 +1799,16 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
         );
         // A renamed repo keeps its link and pairs
         s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
-        s.gh_rename("jaehho/asst", "jaehho/assistant").unwrap();
+        s.gh_rename("jaehho/asst", "jaehho/assistant", None, None)
+            .unwrap();
         assert_eq!(
             s.gh_links().unwrap(),
             [("jaehho/assistant".to_string(), "/cal/inbox/".to_string())]
         );
         assert_eq!(s.gh_pairs("jaehho/assistant").unwrap(), [pair("One", true)]);
         assert!(s.gh_pairs("jaehho/asst").unwrap().is_empty());
-        s.gh_rename("jaehho/assistant", "jaehho/asst").unwrap();
+        s.gh_rename("jaehho/assistant", "jaehho/asst", None, None)
+            .unwrap();
         // Unlinking forgets them too
         s.gh_pair("jaehho/asst", &pair("One", true)).unwrap();
         s.gh_unpair("jaehho/asst", 7).unwrap();
@@ -1649,5 +1955,622 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             s.get(&local.href).unwrap().is_none(),
             "never sent: just gone"
         );
+    }
+
+    // -- repo identity: migration, backup, marker, log -----------------------
+
+    /// A scratch directory that goes with the test.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("asst-store-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("asst.db")
+        }
+
+        /// What is in the directory, by name.
+        fn files(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A database as the build before the identity columns left it: links
+    /// with only a repo and a list, and their pairs.
+    fn old_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gh_links (repo TEXT PRIMARY KEY, list TEXT NOT NULL UNIQUE);
+             CREATE TABLE gh_pairs (
+               repo TEXT NOT NULL REFERENCES gh_links(repo) ON DELETE CASCADE,
+               number INTEGER NOT NULL,
+               uid TEXT NOT NULL,
+               title TEXT NOT NULL,
+               open INTEGER NOT NULL,
+               body TEXT,
+               priority INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (repo, number)
+             );
+             INSERT INTO gh_links VALUES ('jaehho/lab', '/cal/lab/'), ('jaehho/asst', '/cal/asst/');
+             INSERT INTO gh_pairs VALUES
+               ('jaehho/lab', 1, 'u1', 'One', 1, NULL, 0),
+               ('jaehho/lab', 2, 'u2', 'Two', 0, 'notes', 5),
+               ('jaehho/asst', 7, 'u7', 'Seven', 1, NULL, 0);",
+        )
+        .unwrap();
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn read_only(path: &Path) -> Connection {
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+    }
+
+    fn at(day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, day, 12, 0, 0).unwrap()
+    }
+
+    fn new_log<'a>(repo: &'a str, kind: &'a str, text: &'a str) -> NewLog<'a> {
+        NewLog {
+            at: at(18),
+            repo,
+            list: Some("/cal/work/"),
+            kind,
+            text,
+            data: None,
+            by: "auto",
+        }
+    }
+
+    #[test]
+    fn an_old_database_gains_the_identity_columns_and_a_backup() {
+        let dir = Scratch::new("migrate");
+        old_database(&dir.db());
+        let backup = identity_backup_path(&dir.db());
+        assert!(!backup.exists());
+
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        // Everything that was there is there, and nothing is known yet
+        assert_eq!(
+            s.gh_links().unwrap(),
+            [
+                ("jaehho/asst".to_string(), "/cal/asst/".to_string()),
+                ("jaehho/lab".to_string(), "/cal/lab/".to_string()),
+            ]
+        );
+        let rows = s.gh_link_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.repo_id.is_none()
+            && r.archived.is_none()
+            && r.follow_from.is_none()
+            && r.follow_at.is_none()));
+        let pairs = s.gh_pairs("jaehho/lab").unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[1].body.as_deref(), Some("notes"));
+        assert_eq!(pairs[1].priority, 5);
+        assert_eq!(s.gh_pairs("jaehho/asst").unwrap().len(), 1);
+        // The migration reads nobody and says nothing
+        assert!(s.gh_log_recent(None, 10).unwrap().is_empty());
+
+        // The copy was taken before the columns were added
+        let copy = read_only(&backup);
+        assert_eq!(count(&copy, "gh_links"), 2);
+        assert_eq!(count(&copy, "gh_pairs"), 3);
+        assert!(!has_column(&copy, "gh_links", "repo_id").unwrap());
+        drop(copy);
+        assert_eq!(
+            dir.files(),
+            [
+                "asst.db",
+                "asst.db-shm",
+                "asst.db-wal",
+                "asst.db.pre-identity"
+            ]
+        );
+
+        // Opening again, with something learned in between, changes nothing
+        // about the copy: it is the only record of the way things were
+        let before = std::fs::read(&backup).unwrap();
+        assert!(s.gh_learn_id("jaehho/lab", 42).unwrap());
+        drop(s);
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        assert_eq!(s.gh_link_rows().unwrap()[1].repo_id, Some(42));
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        // Not even when it has gone: a migrated database has nothing to save
+        drop(s);
+        std::fs::remove_file(&backup).unwrap();
+        Store::open(&dir.db(), ny()).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn a_new_database_has_nothing_to_back_up() {
+        let dir = Scratch::new("fresh");
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        assert!(s.gh_link_rows().unwrap().is_empty());
+        assert!(has_column(&s.conn, "gh_links", "repo_id").unwrap());
+        assert!(!identity_backup_path(&dir.db()).exists());
+        drop(s);
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        drop(s);
+        assert!(!identity_backup_path(&dir.db()).exists());
+        // And a store in memory never takes one
+        let m = Store::in_memory(ny()).unwrap();
+        assert!(has_column(&m.conn, "gh_links", "repo_id").unwrap());
+        assert!(has_column(&m.conn, "gh_links", "follow_at").unwrap());
+    }
+
+    #[test]
+    fn a_copy_already_there_is_never_replaced_and_a_half_copy_never_counts() {
+        // A copy the owner made by hand stays, whatever it is
+        let dir = Scratch::new("kept");
+        old_database(&dir.db());
+        let backup = identity_backup_path(&dir.db());
+        std::fs::write(&backup, "mine").unwrap();
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        assert!(has_column(&s.conn, "gh_links", "repo_id").unwrap());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"mine");
+        drop(s);
+
+        // The leftover of a copy that died half way is not the copy: it is
+        // in the way of the next try only until that one starts over
+        let dir = Scratch::new("half");
+        old_database(&dir.db());
+        let backup = identity_backup_path(&dir.db());
+        let mut half = backup.as_os_str().to_owned();
+        half.push(format!(".tmp{}", std::process::id()));
+        std::fs::write(&half, "not a database").unwrap();
+        drop(Store::open(&dir.db(), ny()).unwrap());
+        let copy = read_only(&backup);
+        assert_eq!(count(&copy, "gh_links"), 2);
+        assert_eq!(count(&copy, "gh_pairs"), 3);
+        assert!(!PathBuf::from(&half).exists());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_made_stops_the_migration() {
+        let dir = Scratch::new("nocopy");
+        old_database(&dir.db());
+        let backup = identity_backup_path(&dir.db());
+        // Something in the way of the copy's working name
+        let mut blocked = backup.as_os_str().to_owned();
+        blocked.push(format!(".tmp{}", std::process::id()));
+        let blocked = PathBuf::from(blocked);
+        std::fs::create_dir(&blocked).unwrap();
+
+        // The open says so, and the database is as it was: no columns, no
+        // copy, nothing migrated without something to go back to
+        assert!(Store::open(&dir.db(), ny()).is_err());
+        assert!(!has_column(&read_only(&dir.db()), "gh_links", "repo_id").unwrap());
+        assert!(!backup.exists());
+
+        // Once it can be made, the migration goes ahead
+        std::fs::remove_dir(&blocked).unwrap();
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        assert!(has_column(&s.conn, "gh_links", "repo_id").unwrap());
+        assert!(backup.exists());
+    }
+
+    /// The statements of the build before this one, verbatim.
+    fn old_build(conn: &Connection) {
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let links: Vec<(String, String)> = conn
+            .prepare_cached("SELECT repo, list FROM gh_links ORDER BY repo")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(!links.is_empty());
+        conn.execute(
+            "DELETE FROM gh_links WHERE (repo = ?1 OR list = ?2) AND NOT (repo = ?1 AND list = ?2)",
+            ["jaehho/new", "/cal/new/"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO gh_links(repo, list) VALUES (?1, ?2)",
+            ["jaehho/new", "/cal/new/"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gh_pairs(repo, number, uid, title, open, body, priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(repo, number) DO UPDATE SET uid = excluded.uid, title = excluded.title,
+               open = excluded.open, body = excluded.body, priority = excluded.priority",
+            params!["jaehho/new", 1, "u", "T", true, None::<String>, 0],
+        )
+        .unwrap();
+        // A rename
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON").unwrap();
+        tx.execute(
+            "UPDATE gh_links SET repo = ?2 WHERE repo = ?1",
+            ["jaehho/lab", "jaehho/lab2"],
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE gh_pairs SET repo = ?2 WHERE repo = ?1",
+            ["jaehho/lab", "jaehho/lab2"],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        // An unlink takes its pairs
+        conn.execute("DELETE FROM gh_links WHERE repo = ?1", ["jaehho/asst"])
+            .unwrap();
+    }
+
+    #[test]
+    fn the_old_build_still_runs_on_the_migrated_database() {
+        let dir = Scratch::new("downgrade");
+        old_database(&dir.db());
+        let s = Store::open(&dir.db(), ny()).unwrap();
+        assert!(s.gh_learn_id("jaehho/lab", 42).unwrap());
+        assert!(s.gh_learn_id("jaehho/asst", 43).unwrap());
+        s.gh_set_archived("jaehho/lab", true, at(17)).unwrap();
+        s.gh_rename("jaehho/lab", "jaehho/lab-x", Some(at(17)), None)
+            .unwrap();
+        s.gh_rename("jaehho/lab-x", "jaehho/lab", None, None)
+            .unwrap();
+
+        // The downgraded build opens the file and works as it always did
+        let old = Connection::open(dir.db()).unwrap();
+        old.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        old_build(&old);
+
+        // What it did is there, and what it knows nothing of was left as
+        // it was: the id went with the renamed repo, the new link has none
+        let rows = s.gh_link_rows().unwrap();
+        let by = |repo: &str| rows.iter().find(|r| r.repo == repo).cloned();
+        let lab = by("jaehho/lab2").unwrap();
+        assert_eq!(
+            (lab.repo_id, lab.archived),
+            (Some(42), Some(at(17).timestamp()))
+        );
+        // (the second of the two renames above set none, so the first stays)
+        assert_eq!(lab.follow_from.as_deref(), Some("jaehho/lab"));
+        let new = by("jaehho/new").unwrap();
+        assert_eq!(
+            (new.repo_id, new.archived, new.follow_from),
+            (None, None, None)
+        );
+        assert!(by("jaehho/asst").is_none());
+        assert_eq!(s.gh_pairs("jaehho/lab2").unwrap().len(), 2);
+        assert!(s.gh_pairs("jaehho/asst").unwrap().is_empty());
+        // The new build learns what the old one left blank, and nothing else
+        assert!(s.gh_learn_id("jaehho/new", 44).unwrap());
+        assert!(!s.gh_learn_id("jaehho/lab2", 99).unwrap());
+    }
+
+    #[test]
+    fn an_old_build_running_during_the_migration_keeps_going() {
+        let dir = Scratch::new("running");
+        old_database(&dir.db());
+        // asstd of the old build, started before asst migrated the file
+        let old = Connection::open(dir.db()).unwrap();
+        old.pragma_update(None, "journal_mode", "WAL").unwrap();
+        old.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let first = || -> Vec<String> {
+            old.prepare_cached("SELECT repo, list FROM gh_links ORDER BY repo")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(first().len(), 2);
+
+        drop(Store::open(&dir.db(), ny()).unwrap());
+
+        // Its prepared statement meets a table with more columns
+        assert_eq!(first().len(), 2);
+        old_build(&old);
+        assert_eq!(first(), ["jaehho/lab2", "jaehho/new"]);
+    }
+
+    #[test]
+    fn a_rename_moves_the_link_keeps_the_id_and_marks_the_list() {
+        let s = store();
+        s.gh_link("jaehho/champalimaud", "/cal/work/").unwrap();
+        let pair = Pair {
+            number: 3,
+            uid: "u".into(),
+            title: "T".into(),
+            open: true,
+            body: None,
+            priority: 0,
+        };
+        s.gh_pair("jaehho/champalimaud", &pair).unwrap();
+        assert!(s.gh_learn_id("jaehho/champalimaud", 1379104005).unwrap());
+        s.gh_set_archived("jaehho/champalimaud", true, at(10))
+            .unwrap();
+
+        let log = new_log(
+            "jaehho/lab",
+            "repo-renamed",
+            "jaehho/champalimaud is now jaehho/lab",
+        );
+        assert!(
+            s.gh_rename(
+                "jaehho/champalimaud",
+                "jaehho/lab",
+                Some(at(18)),
+                Some(&log)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            s.gh_link_rows().unwrap(),
+            [GhLinkRow {
+                repo: "jaehho/lab".into(),
+                list: "/cal/work/".into(),
+                repo_id: Some(1379104005),
+                archived: Some(at(10).timestamp()),
+                follow_from: Some("jaehho/champalimaud".into()),
+                follow_at: Some(at(18).timestamp()),
+            }]
+        );
+        assert_eq!(s.gh_pairs("jaehho/lab").unwrap(), [pair]);
+        assert!(s.gh_pairs("jaehho/champalimaud").unwrap().is_empty());
+        let rows = s.gh_log_recent(None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0].repo.as_str(),
+                rows[0].kind.as_str(),
+                rows[0].by.as_str()
+            ),
+            ("jaehho/lab", "repo-renamed", "auto")
+        );
+        assert_eq!(rows[0].list.as_deref(), Some("/cal/work/"));
+
+        // A rename with no marker (found after the fact) leaves the one
+        // that is there; clearing it is its own step
+        s.gh_rename("jaehho/lab", "jaehho/lab2", None, None)
+            .unwrap();
+        let row = &s.gh_link_rows().unwrap()[0];
+        assert_eq!(row.follow_from.as_deref(), Some("jaehho/champalimaud"));
+        s.gh_clear_follow("jaehho/lab2").unwrap();
+        let row = &s.gh_link_rows().unwrap()[0];
+        assert_eq!((row.follow_from.clone(), row.follow_at), (None, None));
+        assert_eq!(row.repo_id, Some(1379104005));
+        // A second rename before the list followed the first replaces the
+        // marker with the newer one
+        s.gh_rename("jaehho/lab2", "jaehho/lab3", Some(at(19)), None)
+            .unwrap();
+        s.gh_rename("jaehho/lab3", "jaehho/lab4", Some(at(20)), None)
+            .unwrap();
+        let row = &s.gh_link_rows().unwrap()[0];
+        assert_eq!(row.follow_from.as_deref(), Some("jaehho/lab3"));
+        assert_eq!(row.follow_at, Some(at(20).timestamp()));
+    }
+
+    #[test]
+    fn a_rename_that_cannot_happen_changes_nothing() {
+        let s = store();
+        s.gh_link("jaehho/a", "/cal/work/").unwrap();
+        s.gh_link("jaehho/b", "/cal/inbox/").unwrap();
+        s.gh_learn_id("jaehho/a", 1).unwrap();
+        let before = s.gh_link_rows().unwrap();
+        let log = new_log("jaehho/b", "repo-renamed", "x");
+        // b is linked already: the link, the marker and the row all stay
+        assert!(
+            s.gh_rename("jaehho/a", "jaehho/b", Some(at(18)), Some(&log))
+                .is_err()
+        );
+        assert_eq!(s.gh_link_rows().unwrap(), before);
+        assert!(s.gh_log_recent(None, 10).unwrap().is_empty());
+        // Nothing linked under that name: nothing to mark or to say
+        assert!(
+            !s.gh_rename("jaehho/none", "jaehho/c", Some(at(18)), Some(&log))
+                .unwrap()
+        );
+        assert_eq!(s.gh_link_rows().unwrap(), before);
+        assert!(s.gh_log_recent(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_link_made_anew_starts_without_an_id() {
+        let s = store();
+        s.gh_link("jaehho/a", "/cal/work/").unwrap();
+        s.gh_learn_id("jaehho/a", 1).unwrap();
+        s.gh_set_archived("jaehho/a", true, at(10)).unwrap();
+        // The same link again is the link it was
+        s.gh_link("jaehho/a", "/cal/work/").unwrap();
+        let row = s.gh_link_rows().unwrap().remove(0);
+        assert_eq!(
+            (row.repo_id, row.archived),
+            (Some(1), Some(at(10).timestamp()))
+        );
+        // Another repo for the list replaces it, and is not that repo
+        s.gh_link("jaehho/b", "/cal/work/").unwrap();
+        let rows = s.gh_link_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].repo.as_str(), rows[0].repo_id, rows[0].archived),
+            ("jaehho/b", None, None)
+        );
+        // The repo for another list is a new link too
+        s.gh_link("jaehho/b", "/cal/inbox/").unwrap();
+        assert_eq!(s.gh_link_rows().unwrap()[0].repo_id, None);
+    }
+
+    #[test]
+    fn an_id_is_learned_once_and_belongs_to_one_link() {
+        let s = store();
+        s.gh_link("jaehho/a", "/cal/work/").unwrap();
+        s.gh_link("jaehho/b", "/cal/inbox/").unwrap();
+        let id_of = |repo: &str| {
+            s.gh_link_rows()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.repo == repo)
+                .unwrap()
+                .repo_id
+        };
+        assert!(s.gh_learn_id("jaehho/a", 1).unwrap());
+        // Never overwritten, whatever GitHub says later
+        assert!(!s.gh_learn_id("jaehho/a", 2).unwrap());
+        assert!(!s.gh_learn_id("jaehho/a", 1).unwrap());
+        assert_eq!(id_of("jaehho/a"), Some(1));
+        // An id another link holds is not taken
+        assert!(!s.gh_learn_id("jaehho/b", 1).unwrap());
+        assert_eq!(id_of("jaehho/b"), None);
+        assert!(s.gh_learn_id("jaehho/b", 2).unwrap());
+        assert!(!s.gh_learn_id("jaehho/nobody", 3).unwrap());
+        // The largest id SQLite can hold, and none it cannot
+        s.gh_link("jaehho/c", "/cal/c/").unwrap();
+        assert!(s.gh_learn_id("jaehho/c", i64::MAX as u64).unwrap());
+        assert_eq!(id_of("jaehho/c"), Some(i64::MAX as u64));
+        s.gh_link("jaehho/d", "/cal/d/").unwrap();
+        assert!(s.gh_learn_id("jaehho/d", u64::MAX).is_err());
+        assert_eq!(id_of("jaehho/d"), None);
+    }
+
+    #[test]
+    fn the_archived_baseline_keeps_when_it_was_first_seen() {
+        let s = store();
+        s.gh_link("jaehho/a", "/cal/work/").unwrap();
+        let archived = || s.gh_link_rows().unwrap()[0].archived;
+        assert_eq!(archived(), None);
+        s.gh_set_archived("jaehho/a", false, at(10)).unwrap();
+        assert_eq!(archived(), Some(0));
+        s.gh_set_archived("jaehho/a", true, at(11)).unwrap();
+        assert_eq!(archived(), Some(at(11).timestamp()));
+        // Seen again later, it has been archived since the first time
+        s.gh_set_archived("jaehho/a", true, at(12)).unwrap();
+        assert_eq!(archived(), Some(at(11).timestamp()));
+        s.gh_set_archived("jaehho/a", false, at(13)).unwrap();
+        assert_eq!(archived(), Some(0));
+        s.gh_set_archived("jaehho/a", true, at(14)).unwrap();
+        assert_eq!(archived(), Some(at(14).timestamp()));
+        // A link that is not there takes nothing
+        s.gh_set_archived("jaehho/nobody", true, at(14)).unwrap();
+        assert_eq!(s.gh_link_rows().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_log_outlives_an_unlink_and_keeps_the_newest_500() {
+        let s = store();
+        s.gh_link("jaehho/a", "/cal/work/").unwrap();
+        let first = s
+            .gh_log_add(&new_log("jaehho/a", "list-renaming", "intent"))
+            .unwrap();
+        s.gh_log_add(&new_log("jaehho/b", "repo-archived", "b"))
+            .unwrap();
+        s.gh_log_add(&NewLog {
+            list: None,
+            data: Some(r#"{"from":"x"}"#),
+            by: "cli",
+            ..new_log("jaehho/a", "list-kept", "kept")
+        })
+        .unwrap();
+        // An unlink takes the link and its pairs, not what was said of it
+        assert!(s.gh_unlink("jaehho/a").unwrap());
+        let all = s.gh_log_recent(None, 10).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            ["list-kept", "repo-archived", "list-renaming"]
+        );
+        let mine = s.gh_log_recent(Some("jaehho/a"), 10).unwrap();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(mine[0].data.as_deref(), Some(r#"{"from":"x"}"#));
+        assert_eq!((mine[0].list.clone(), mine[0].by.as_str()), (None, "cli"));
+        assert_eq!(s.gh_log_recent(None, 1).unwrap().len(), 1);
+
+        // An intent that was carried out says so
+        assert!(s.gh_log_retag(first, "list-renamed", "done").unwrap());
+        let row = s
+            .gh_log_recent(Some("jaehho/a"), 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            (row.kind.as_str(), row.text.as_str()),
+            ("list-renamed", "done")
+        );
+        assert_eq!(row.id, first);
+        assert!(!s.gh_log_retag(9999, "x", "y").unwrap());
+
+        // The log is not for ever
+        for n in 0..510 {
+            s.gh_log_add(&new_log("jaehho/c", "repo-archived", &format!("row {n}")))
+                .unwrap();
+        }
+        let kept = s.gh_log_recent(None, 1000).unwrap();
+        assert_eq!(kept.len(), 500);
+        assert_eq!(kept[0].text, "row 509");
+        assert_eq!(kept[499].text, "row 10");
+    }
+
+    #[test]
+    #[ignore = "needs ASST_TEST_DB, a copy of the live asst.db (sqlite3 asst.db '.backup copy.db')"]
+    fn a_copy_of_the_live_database_migrates() {
+        let path = PathBuf::from(
+            std::env::var("ASST_TEST_DB").expect("ASST_TEST_DB names a copy of asst.db"),
+        );
+        let copy = read_only(&path);
+        let was_old = !has_column(&copy, "gh_links", "repo_id").unwrap();
+        let (links, pairs) = (count(&copy, "gh_links"), count(&copy, "gh_pairs"));
+        drop(copy);
+        println!(
+            "before: {links} links, {pairs} pairs, identity columns there: {}",
+            !was_old
+        );
+
+        let backup = identity_backup_path(&path);
+        let had_backup = backup.exists();
+        let s = Store::open(&path, ny()).unwrap();
+        let rows = s.gh_link_rows().unwrap();
+        assert_eq!(rows.len() as i64, links);
+        assert_eq!(count(&s.conn, "gh_pairs"), pairs);
+        assert!(s.gh_log_recent(None, 10).unwrap().is_empty());
+        if was_old {
+            assert!(
+                rows.iter()
+                    .all(|r| r.repo_id.is_none() && r.archived.is_none())
+            );
+            assert!(backup.exists() || had_backup);
+        }
+        println!(
+            "after: {} links, {pairs} pairs, all ids unknown: {}",
+            rows.len(),
+            rows.iter().all(|r| r.repo_id.is_none())
+        );
+
+        // The second open is a no-op
+        let kept = std::fs::read(&backup).ok();
+        drop(s);
+        let s = Store::open(&path, ny()).unwrap();
+        assert_eq!(s.gh_link_rows().unwrap(), rows);
+        assert_eq!(count(&s.conn, "gh_pairs"), pairs);
+        assert_eq!(std::fs::read(&backup).ok(), kept);
+        if !had_backup && was_old {
+            let copy = read_only(&backup);
+            assert_eq!(
+                (count(&copy, "gh_links"), count(&copy, "gh_pairs")),
+                (links, pairs)
+            );
+        }
     }
 }
