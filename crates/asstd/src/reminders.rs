@@ -6,7 +6,7 @@
 //! that came due while the laptop was suspended fires on wake (monotonic
 //! sleeps stop during suspend).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,8 +56,38 @@ trait Notifications {
 
 type Shown = Arc<Mutex<HashMap<u32, String>>>;
 
-/// Alarms due now, each with the instant it was due.
-type Due = Vec<(Row, DateTime<Utc>)>;
+/// A reminder to show now.
+struct Ring {
+    row: Row,
+    /// When it was due.
+    at: DateTime<Utc>,
+    /// A snooze running out, not one of the task's own alarms.
+    snoozed: bool,
+}
+
+type Due = Vec<Ring>;
+
+/// What the notification server has refused since it last took a
+/// reminder, so an outage is said once and not on every pass.
+#[derive(Default)]
+struct Outage(HashSet<String>);
+
+impl Outage {
+    /// Whether this failure is news: its kind is new since the last success.
+    fn failed(&mut self, e: &zbus::Error) -> bool {
+        self.0.insert(match e {
+            zbus::Error::MethodError(name, ..) => name.to_string(),
+            other => other.to_string(),
+        })
+    }
+
+    /// Whether the server was refusing until now.
+    fn over(&mut self) -> bool {
+        let was = !self.0.is_empty();
+        self.0.clear();
+        was
+    }
+}
 
 pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
     let proxy = match NotificationsProxy::new(&conn).await {
@@ -72,31 +102,16 @@ pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
     let _ = daemon
         .store()
         .prune_fired(Utc::now() - chrono::Duration::days(30));
+    let started = Utc::now();
+    let mut outage = Outage::default();
     loop {
         let now = Utc::now();
         let (due, next) = collect(&daemon, now);
-        for (row, at) in due {
-            if let Err(e) = daemon.store().mark_fired(&row.href, at) {
-                log::warn!("recording a reminder: {e}");
-            }
-            // One notification per task: a new one replaces the last.
-            let replaces = shown
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .find(|(_, h)| **h == row.href)
-                .map(|(id, _)| *id);
-            match show(&proxy, &daemon, &row, replaces.unwrap_or(0)).await {
-                Ok(id) => {
-                    let mut s = shown.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(old) = replaces {
-                        s.remove(&old);
-                    }
-                    s.insert(id, row.href.clone());
-                }
-                Err(e) => log::warn!("showing a reminder: {e}"),
-            }
-        }
+        let notify = |row: Row, replaces| {
+            let (proxy, daemon) = (&proxy, &daemon);
+            async move { show(proxy, daemon, &row, replaces).await }
+        };
+        ring(&daemon, due, &shown, &mut outage, started, notify).await;
         let wait = next
             .and_then(|n| (n - Utc::now()).to_std().ok())
             .unwrap_or(Duration::from_secs(60))
@@ -108,10 +123,70 @@ pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
     }
 }
 
+/// Show what is due. A reminder counts as fired only once the
+/// notification server has taken it. With none answering (swaync
+/// restarting, a login before it is up) it stays due and the next pass
+/// tries again, until GRACE has gone by; passes are at most a minute
+/// apart, so an outage costs one failed call per reminder a minute.
+async fn ring<F>(
+    daemon: &Daemon,
+    due: Due,
+    shown: &Shown,
+    outage: &mut Outage,
+    started: DateTime<Utc>,
+    show: impl Fn(Row, u32) -> F,
+) where
+    F: Future<Output = zbus::Result<u32>>,
+{
+    for Ring { row, at, snoozed } in due {
+        // One notification per task: a new one replaces the last.
+        let replaces = shown
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(_, h)| **h == row.href)
+            .map(|(id, _)| *id);
+        match show(row.clone(), replaces.unwrap_or(0)).await {
+            Ok(id) => {
+                if outage.over() {
+                    log::info!("the notification server is back; reminders show again");
+                }
+                {
+                    let store = daemon.store();
+                    if let Err(e) = store.mark_fired(&row.href, at) {
+                        log::warn!("recording a reminder: {e}");
+                    }
+                    if snoozed {
+                        let _ = store.unsnooze_at(&row.href, at);
+                    }
+                }
+                let mut s = shown.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(old) = replaces {
+                    s.remove(&old);
+                }
+                s.insert(id, row.href.clone());
+            }
+            Err(e) => {
+                if outage.failed(&e) {
+                    log::warn!("showing a reminder, will try again: {e}");
+                }
+                // An alarm falls out of `collect` after GRACE. A snooze
+                // has no such limit when it rings late (a laptop that was
+                // off for days), so a failing one is dropped GRACE after
+                // it was due or asstd started, whichever is later.
+                if snoozed && Utc::now() - at.max(started) > GRACE {
+                    log::warn!("dropping a snoozed reminder that would not show");
+                    let _ = daemon.store().unsnooze_at(&row.href, at);
+                }
+            }
+        }
+    }
+}
+
 /// Alarms due now, and when the next one is.
 fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) {
     let store = daemon.store();
-    let mut due: HashMap<String, (Row, DateTime<Utc>)> = HashMap::new();
+    let mut due: HashMap<String, Ring> = HashMap::new();
     let mut next: Option<DateTime<Utc>> = None;
     let mut later = |at: DateTime<Utc>| next = Some(next.map_or(at, |n| n.min(at)));
     for row in store.with_alarms().unwrap_or_default() {
@@ -119,9 +194,14 @@ fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) 
             if at > now {
                 later(at);
             } else if now - at <= GRACE && !store.fired(&row.href, at).unwrap_or(true) {
-                let keep = due.get(&row.href).is_none_or(|(_, prev)| *prev < at);
+                let keep = due.get(&row.href).is_none_or(|prev| prev.at < at);
                 if keep {
-                    due.insert(row.href.clone(), (row.clone(), at));
+                    let ring = Ring {
+                        row: row.clone(),
+                        at,
+                        snoozed: false,
+                    };
+                    due.insert(row.href.clone(), ring);
                 }
             }
         }
@@ -131,11 +211,24 @@ fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) 
             later(until);
             continue;
         }
-        let _ = store.unsnooze(&href);
-        if let Ok(Some(row)) = store.get(&href)
-            && row.task.is_open()
-        {
-            due.insert(href, (row, until));
+        // The snooze stays until `ring` has shown it.
+        match store.get(&href) {
+            Ok(Some(row)) if row.task.is_open() => {
+                due.insert(
+                    href,
+                    Ring {
+                        row,
+                        at: until,
+                        snoozed: true,
+                    },
+                );
+            }
+            // Completed or gone meanwhile.
+            Ok(_) => {
+                let _ = store.unsnooze(&href);
+            }
+            // The store would not answer: try again next pass.
+            Err(_) => {}
         }
     }
     (due.into_values().collect(), next)
@@ -346,7 +439,156 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use asst_core::api::AddSpec;
+    use asst_core::caldav::RemoteList;
+    use asst_core::config::Config;
+    use asst_core::store::Store;
+    use asst_core::time::Trigger;
+    use chrono_tz::Tz;
+
     use super::*;
+
+    /// A daemon with one open task that has these alarms, and its href.
+    fn with_task(alarms: Vec<Trigger>) -> (Arc<Daemon>, String) {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        store
+            .apply_lists(&[RemoteList {
+                href: "/cal/work/".into(),
+                name: "Work".into(),
+                color: None,
+                order: None,
+                sync_token: Some("t1".into()),
+                ctag: None,
+                writable: true,
+            }])
+            .unwrap();
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        let spec = AddSpec {
+            text: "Call the bank".into(),
+            list: Some("work".into()),
+            alarms: Some(alarms),
+            ..AddSpec::default()
+        };
+        let href = daemon.add(&spec).unwrap().task.href;
+        (daemon, href)
+    }
+
+    /// One pass of `run` against a notification server that is up or not.
+    /// Returns how many reminders were due.
+    async fn pass(
+        daemon: &Daemon,
+        server_up: &Cell<bool>,
+        shown: &Shown,
+        outage: &mut Outage,
+        started: DateTime<Utc>,
+    ) -> usize {
+        let (due, _) = collect(daemon, Utc::now());
+        let count = due.len();
+        let notify = |_row: Row, _replaces| async move {
+            if server_up.get() {
+                Ok(7)
+            } else {
+                Err(zbus::Error::Failure("no such name".into()))
+            }
+        };
+        ring(daemon, due, shown, outage, started, notify).await;
+        count
+    }
+
+    /// A whole second, as the store keeps it.
+    fn ago(minutes: i64) -> DateTime<Utc> {
+        let at = Utc::now() - chrono::Duration::minutes(minutes);
+        DateTime::from_timestamp(at.timestamp(), 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_alarm_the_server_will_not_take_rings_when_it_will() {
+        let at = ago(5);
+        let (daemon, href) = with_task(vec![Trigger::Absolute { at }]);
+        let (up, shown, mut outage) = (Cell::new(false), Shown::default(), Outage::default());
+        let started = ago(60);
+
+        for _ in 0..3 {
+            assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 1);
+            assert!(!daemon.store().fired(&href, at).unwrap(), "still pending");
+            assert!(shown.lock().unwrap().is_empty());
+        }
+
+        up.set(true);
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 1);
+        assert!(daemon.store().fired(&href, at).unwrap());
+        assert_eq!(shown.lock().unwrap().get(&7), Some(&href));
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_alarm_older_than_the_grace_is_not_retried() {
+        let at = Utc::now() - GRACE - chrono::Duration::minutes(1);
+        let (daemon, href) = with_task(vec![Trigger::Absolute { at }]);
+        let (up, shown, mut outage) = (Cell::new(true), Shown::default(), Outage::default());
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, ago(60)).await, 0);
+        assert!(!daemon.store().fired(&href, at).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_snooze_the_server_will_not_take_waits_for_it_within_the_grace() {
+        let (daemon, href) = with_task(vec![]);
+        let (up, shown, mut outage) = (Cell::new(false), Shown::default(), Outage::default());
+        let until = ago(1);
+        let snoozed = || daemon.store().snoozed().unwrap();
+        daemon.store().snooze(&href, until).unwrap();
+
+        let started = ago(60);
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 1);
+        assert_eq!(snoozed(), [(href.clone(), until)]);
+
+        up.set(true);
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 1);
+        assert!(snoozed().is_empty());
+        assert!(daemon.store().fired(&href, until).unwrap());
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_snooze_that_never_shows_is_dropped_after_the_grace() {
+        let (daemon, href) = with_task(vec![]);
+        let (up, shown, mut outage) = (Cell::new(false), Shown::default(), Outage::default());
+        let snoozed = || daemon.store().snoozed().unwrap().len();
+        let long_ago = Utc::now() - GRACE - chrono::Duration::hours(1);
+
+        // Due while the laptop was off, and asstd has only just started:
+        // one more GRACE of tries, not none.
+        daemon.store().snooze(&href, long_ago).unwrap();
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, ago(1)).await, 1);
+        assert_eq!(snoozed(), 1);
+
+        // Failing since before GRACE ago.
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, long_ago).await, 1);
+        assert_eq!(snoozed(), 0);
+
+        // Late but within it, however long asstd has been failing.
+        daemon.store().snooze(&href, ago(1)).unwrap();
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, long_ago).await, 1);
+        assert_eq!(snoozed(), 1);
+    }
+
+    #[test]
+    fn an_outage_is_said_once_per_kind() {
+        let down = zbus::Error::Failure("no such name".into());
+        let other = zbus::Error::Failure("timed out".into());
+        let mut outage = Outage::default();
+        assert!(!outage.over());
+        assert!(outage.failed(&down));
+        assert!(!outage.failed(&down));
+        assert!(outage.failed(&other));
+        assert!(!outage.failed(&down));
+        assert!(outage.over(), "the server took one");
+        assert!(!outage.over());
+        assert!(outage.failed(&down), "the next outage is said again");
+    }
 
     fn plan(uid: Option<&str>, step: Step) -> Plan<'_> {
         Plan {

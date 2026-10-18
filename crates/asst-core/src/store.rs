@@ -1102,6 +1102,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a snooze that has rung, unless the task was snoozed again
+    /// since: that one is still waiting.
+    pub fn unsnooze_at(&self, href: &str, until: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM snoozed WHERE href = ?1 AND until = ?2",
+            params![href, until.timestamp()],
+        )?;
+        Ok(())
+    }
+
     pub fn snoozed(&self) -> Result<Vec<(String, DateTime<Utc>)>> {
         let mut stmt = self
             .conn
@@ -1787,6 +1797,21 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
                 .iter()
                 .any(|p| p.href == "/cal/inbox/a.ics" && p.op == Op::Delete)
         );
+    }
+
+    #[test]
+    fn a_snooze_that_rang_is_forgotten_unless_it_was_renewed() {
+        let s = store();
+        let href = "/cal/work/a.ics";
+        let first = now();
+        let again = first + chrono::Duration::minutes(10);
+        s.snooze(href, first).unwrap();
+        // Snoozed again while the first one was being shown.
+        s.snooze(href, again).unwrap();
+        s.unsnooze_at(href, first).unwrap();
+        assert_eq!(s.snoozed().unwrap(), [(href.to_string(), again)]);
+        s.unsnooze_at(href, again).unwrap();
+        assert!(s.snoozed().unwrap().is_empty());
     }
 
     #[test]
