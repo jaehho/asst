@@ -2899,7 +2899,7 @@ mod tests {
     /// named for its repo.
     #[tokio::test]
     async fn whatever_happens_to_the_repos_nothing_is_lost_or_written() {
-        the_world_changes(1..=2, 16, 3).await;
+        the_world_changes(1..=2, 16, 3, true).await;
     }
 
     /// The same for a long time: `cargo test -p asstd soak -- --ignored`
@@ -2915,10 +2915,25 @@ mod tests {
                 Some(from.parse().ok()?..=to.parse().ok()?)
             })
             .unwrap_or(1..=150);
-        the_world_changes(range, 60, 4).await;
+        the_world_changes(range.clone(), 60, 4, true).await;
+        the_world_changes(range, 40, 4, false).await;
     }
 
-    async fn the_world_changes(seeds: std::ops::RangeInclusive<u64>, steps: usize, count: usize) {
+    /// The upgrade day with the world already moving: no id is known yet,
+    /// so a name is trusted as it was linked (a repo made again or a name
+    /// taken before the first look is not told from the repo), and the rest
+    /// holds all the same.
+    #[tokio::test]
+    async fn whatever_happens_on_the_upgrade_day_nothing_is_lost_or_written() {
+        the_world_changes(1..=1, 14, 3, false).await;
+    }
+
+    async fn the_world_changes(
+        seeds: std::ops::RangeInclusive<u64>,
+        steps: usize,
+        count: usize,
+        learned: bool,
+    ) {
         const FRESH: usize = 70;
         let started = std::time::Instant::now();
         for seed in seeds {
@@ -2972,17 +2987,27 @@ mod tests {
             serve_world(&rig.fake, &world, &names, &ids);
             // A busy machine may time out the first look: try again
             for _ in 0..5 {
+                if !learned {
+                    break;
+                }
                 rig.go().await;
                 if rig.rows().iter().all(|r| r.repo_id.is_some()) {
                     break;
                 }
             }
-            let known: HashMap<String, u64> = rig
-                .rows()
-                .into_iter()
-                .map(|r| (r.list, r.repo_id.expect("learned")))
-                .collect();
             let hrefs: Vec<String> = rig.rows().into_iter().map(|r| r.list).collect();
+            let known: HashMap<String, u64> = hrefs
+                .iter()
+                .enumerate()
+                .map(|(i, href)| (href.clone(), 100 + i as u64))
+                .collect();
+            assert!(
+                !learned
+                    || rig
+                        .rows()
+                        .iter()
+                        .all(|r| known[&r.list] == r.repo_id.unwrap())
+            );
             let sorted = |mut tasks: Vec<(String, String, bool)>| {
                 tasks.sort();
                 tasks
@@ -3006,6 +3031,13 @@ mod tests {
                 for _ in 0..1 + dice.roll(2) {
                     let pick = dice.roll(count as u64) as usize;
                     let what = dice.roll(19);
+                    // Before an id is known, a name is the repo: nothing
+                    // that makes the name another repo's is asked of it
+                    let what = if !learned && [5, 6, 16].contains(&what) {
+                        99
+                    } else {
+                        what
+                    };
                     let mut w = world.lock().unwrap();
                     match what {
                         0..=3 if fresh < FRESH => {
@@ -3185,7 +3217,8 @@ mod tests {
                 assert_eq!(pairs, pairs_before, "a pair was lost\n{at}");
                 // The id is the repo's, and stays
                 for row in &snap.links {
-                    assert_eq!(row.repo_id, Some(known[&row.list]), "{}\n{at}", row.repo);
+                    let id = row.repo_id.unwrap_or(known[&row.list]);
+                    assert_eq!(id, known[&row.list], "{}\n{at}", row.repo);
                 }
                 // A list is called what it was, what its repo was called,
                 // or what someone made it
