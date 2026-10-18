@@ -311,7 +311,11 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
         (
             "Sidebar",
             &[
+                ("Next / previous view or list", "j k Down Up"),
+                ("First / last view or list", "g <Shift>g"),
+                ("Back to the tasks", "Escape"),
                 ("Move the focused view", "<Alt>Left <Alt>Right"),
+                ("Move the focused list", "<Alt>Up <Alt>Down"),
                 ("Context menu", "Menu <Shift>F10"),
             ],
         ),
@@ -378,9 +382,18 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             "Alt+1 is the first tile. It works in a field too",
         ),
         (
-            "Move the focused view",
-            "With the keyboard on a tile (Tab to it). Delete hides it",
+            "Next / previous view or list",
+            "With the keyboard in the sidebar (Tab to it). Return or space opens it",
         ),
+        (
+            "Move the focused view",
+            "With the keyboard on a tile. Delete hides it",
+        ),
+        (
+            "Move the focused list",
+            "With the keyboard on a list. Delete is no list's: use its menu",
+        ),
+        ("Context menu", "Of the tile or list that has the keyboard"),
         ("Zoom the day grid", "Or hold Ctrl and scroll"),
         (
             "Complete or reopen",

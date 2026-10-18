@@ -46,6 +46,13 @@ struct ListRow {
     hidden: Option<Why>,
 }
 
+/// A place the keyboard stops in the sidebar.
+struct Stop {
+    /// `tile:<view>`, `list:<href>` or `hidden` (the Hidden lists row).
+    id: String,
+    widget: gtk::Widget,
+}
+
 /// What a dragged list carries.
 const LIST_PREFIX: &str = "asst-list:";
 
@@ -184,9 +191,20 @@ fn show_tile_menu(
     crate::row::show_at(&tile_menu(nav, hidden, tx), tile, at);
 }
 
-/// Where a menu opened from the keyboard points: the middle of the tile.
-fn middle(tile: &gtk::FlowBoxChild) -> gdk::Rectangle {
-    gdk::Rectangle::new(tile.width() / 2, tile.height() / 2, 1, 1)
+fn show_list_menu(
+    row: &gtk::ListBoxRow,
+    list: &ListView,
+    archived: bool,
+    tx: &Tx,
+    at: gdk::Rectangle,
+) {
+    crate::row::show_at(&list_menu(list, archived, tx, false), row, at);
+}
+
+/// Where a menu opened from the keyboard points: the middle of the tile or
+/// row.
+fn middle(widget: &impl IsA<gtk::Widget>) -> gdk::Rectangle {
+    gdk::Rectangle::new(widget.width() / 2, widget.height() / 2, 1, 1)
 }
 
 /// What a key does on a focused tile.
@@ -198,21 +216,86 @@ enum TileKey {
     Menu,
 }
 
-fn tile_key(key: gdk::Key, state: gdk::ModifierType) -> Option<TileKey> {
-    // Caps Lock does not count.
-    let mods = state
+/// The modifiers that count in a sidebar key. Caps Lock does not.
+fn key_mods(state: gdk::ModifierType) -> gdk::ModifierType {
+    state
         & (gdk::ModifierType::SHIFT_MASK
             | gdk::ModifierType::CONTROL_MASK
             | gdk::ModifierType::ALT_MASK
-            | gdk::ModifierType::SUPER_MASK);
+            | gdk::ModifierType::SUPER_MASK)
+}
+
+/// Menu, or Shift+F10: the keys that open a context menu.
+fn menu_key(key: gdk::Key, mods: gdk::ModifierType) -> bool {
+    match key {
+        gdk::Key::Menu => mods.is_empty(),
+        gdk::Key::F10 => mods == gdk::ModifierType::SHIFT_MASK,
+        _ => false,
+    }
+}
+
+fn tile_key(key: gdk::Key, state: gdk::ModifierType) -> Option<TileKey> {
+    let mods = key_mods(state);
     match key {
         gdk::Key::Left if mods == gdk::ModifierType::ALT_MASK => Some(TileKey::Move(-1)),
         gdk::Key::Right if mods == gdk::ModifierType::ALT_MASK => Some(TileKey::Move(1)),
         gdk::Key::Delete if mods.is_empty() => Some(TileKey::Hide),
-        gdk::Key::Menu if mods.is_empty() => Some(TileKey::Menu),
-        gdk::Key::F10 if mods == gdk::ModifierType::SHIFT_MASK => Some(TileKey::Menu),
+        _ if menu_key(key, mods) => Some(TileKey::Menu),
         _ => None,
     }
+}
+
+/// What a key does on a focused list row. There is no Delete: a list goes
+/// only through its menu.
+#[derive(Debug, PartialEq)]
+enum RowKey {
+    /// Alt+Up, Alt+Down: a place earlier or later.
+    Move(i32),
+    Menu,
+}
+
+fn row_key(key: gdk::Key, state: gdk::ModifierType) -> Option<RowKey> {
+    let mods = key_mods(state);
+    match key {
+        gdk::Key::Up if mods == gdk::ModifierType::ALT_MASK => Some(RowKey::Move(-1)),
+        gdk::Key::Down if mods == gdk::ModifierType::ALT_MASK => Some(RowKey::Move(1)),
+        _ if menu_key(key, mods) => Some(RowKey::Menu),
+        _ => None,
+    }
+}
+
+/// `order` with `href` `by` places on (negative: earlier), or `None` when
+/// that is past an end or `href` is not in it.
+fn moved(order: &[String], href: &str, by: i32) -> Option<Vec<String>> {
+    let at = order.iter().position(|h| h == href)?;
+    let to = at
+        .checked_add_signed(by as isize)
+        .filter(|to| *to < order.len())?;
+    let mut new = order.to_vec();
+    let h = new.remove(at);
+    new.insert(to, h);
+    Some(new)
+}
+
+/// Where a key sends the keyboard among the sidebar's stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Next,
+    Prev,
+    First,
+    Last,
+}
+
+/// The stop of `len` that `to` reaches from stop `at`. The ends hold: `j`
+/// on the last stop stays there, as it does in the task column.
+fn reach_index(len: usize, at: usize, to: Reach) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    Some(match to {
+        Reach::First => 0,
+        Reach::Last => last,
+        Reach::Next => (at + 1).min(last),
+        Reach::Prev => at.saturating_sub(1),
+    })
 }
 
 /// One line of the options menu's Views list.
@@ -703,8 +786,12 @@ impl Sidebar {
                 .collect::<Vec<_>>(),
             st.prefs.list_icons
         );
+        // The keyboard stays on its row through a move or an archive: read
+        // before the old rows go, which takes the focus with them.
+        let mut kept = None;
         if *self.lists_key.borrow() != lists_key {
             *self.lists_key.borrow_mut() = lists_key;
+            kept = self.focused_row();
             self.build_lists(st.lists, st.hidden);
         }
         // Hidden lists open by themselves for a hidden list that has just
@@ -718,6 +805,9 @@ impl Sidebar {
         }
         *self.opened_for.borrow_mut() = st.nav.clone();
         self.show_hidden();
+        if let Some(kept) = kept {
+            self.refocus_row(kept);
+        }
         for r in self.rows.borrow().iter() {
             if r.hidden.is_none() {
                 let n = st.counts.lists.get(&r.href).copied().unwrap_or(0);
@@ -794,13 +884,112 @@ impl Sidebar {
         self.lists_menu.popup();
     }
 
+    /// Where the keyboard stops, top to bottom: the tiles, the lists, the
+    /// Hidden lists row, and the lists under it while it is open.
+    fn stops(&self) -> Vec<Stop> {
+        let mut stops: Vec<Stop> = self
+            .tiles
+            .borrow()
+            .iter()
+            .map(|t| Stop {
+                id: format!("tile:{}", t.nav.key()),
+                widget: t.child.clone().upcast(),
+            })
+            .collect();
+        stops.extend(self.row_stops());
+        stops
+    }
+
+    /// The stops below the tiles.
+    fn row_stops(&self) -> Vec<Stop> {
+        let rows = self.rows.borrow();
+        let row = |r: &ListRow| Stop {
+            id: format!("list:{}", r.href),
+            widget: r.row.clone().upcast(),
+        };
+        let mut stops: Vec<Stop> = rows
+            .iter()
+            .filter(|r| r.hidden.is_none())
+            .map(row)
+            .collect();
+        if self.hidden_head.is_visible() {
+            stops.push(Stop {
+                id: "hidden".into(),
+                widget: self.hidden_head.clone().upcast(),
+            });
+        }
+        if self.hidden_box.is_visible() {
+            stops.extend(rows.iter().filter(|r| r.hidden.is_some()).map(row));
+        }
+        stops
+    }
+
+    /// The row that has the keyboard: its place among `row_stops` and its id.
+    fn focused_row(&self) -> Option<(usize, String)> {
+        self.row_stops()
+            .into_iter()
+            .enumerate()
+            .find(|(_, s)| s.widget.is_focus())
+            .map(|(at, s)| (at, s.id))
+    }
+
+    /// Gives the keyboard back to the row `focused_row` found, or to the one
+    /// that has its place now when it is gone.
+    fn refocus_row(&self, (at, id): (usize, String)) {
+        let stops = self.row_stops();
+        let stop = stops
+            .iter()
+            .find(|s| s.id == id)
+            .or_else(|| stops.get(at).or(stops.last()));
+        if let Some(stop) = stop {
+            stop.widget.grab_focus();
+        }
+    }
+
+    /// Which stop has the keyboard, by its id (the harness reports it).
+    pub fn focused(&self) -> Option<String> {
+        self.stops()
+            .into_iter()
+            .find(|s| s.widget.is_focus())
+            .map(|s| s.id)
+    }
+
+    /// Moves the keyboard to another stop. From one of them it goes on to
+    /// the next, back to the previous, or to either end, across the tiles
+    /// and the lists, which the arrow keys do not cross on their own. From
+    /// a button in the sidebar, a step goes where the arrow key would.
+    pub fn reach(&self, to: Reach) {
+        let stops = self.stops();
+        let at = stops.iter().position(|s| s.widget.is_focus());
+        let target = match (at, to) {
+            (Some(at), _) => reach_index(stops.len(), at, to),
+            (None, Reach::First | Reach::Last) => reach_index(stops.len(), 0, to),
+            (None, Reach::Next | Reach::Prev) => {
+                let dir = if to == Reach::Next {
+                    gtk::DirectionType::Down
+                } else {
+                    gtk::DirectionType::Up
+                };
+                self.root.child_focus(dir);
+                return;
+            }
+        };
+        if let Some(stop) = target.and_then(|i| stops.get(i)) {
+            stop.widget.grab_focus();
+            // A key that this handler took never reached the window's own,
+            // which is what turns the focus ring on after a click.
+            if let Some(window) = stop.widget.root().and_downcast::<gtk::Window>() {
+                window.set_focus_visible(true);
+            }
+        }
+    }
+
     /// The menu of the row for list `href`, as a right-click opens it.
     pub fn open_list_menu(&self, href: &str) {
         let rows = self.rows.borrow();
         if let Some(r) = rows.iter().find(|r| r.href == href) {
-            let at = gdk::Rectangle::new(r.row.width() / 2, r.row.height() / 2, 1, 1);
             let archived = r.hidden == Some(Why::Archived);
-            crate::row::show_at(&list_menu(&r.list, archived, &self.tx, false), &r.row, at);
+            show_list_menu(&r.row, &r.list, archived, &self.tx, middle(&r.row));
         }
     }
 
@@ -987,10 +1176,45 @@ impl Sidebar {
             let Some(row) = row_weak.upgrade() else {
                 return;
             };
-            let menu = list_menu(&list, archived, &tx, false);
-            crate::row::show_at(&menu, &row, gdk::Rectangle::new(x as i32, y as i32, 1, 1));
+            let at = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            show_list_menu(&row, &list, archived, &tx, at);
         });
         row.add_controller(menu_click);
+    }
+
+    /// The keys of a focused row: Menu and Shift+F10 open its menu, and on
+    /// a row that is not hidden, Alt+Up and Alt+Down move it. `order` is
+    /// the lists that have a row, top to bottom.
+    fn list_keys_on(
+        &self,
+        row: &gtk::ListBoxRow,
+        list: &ListView,
+        archived: bool,
+        order: Option<Rc<Vec<String>>>,
+    ) {
+        let keys = gtk::EventControllerKey::new();
+        let (tx, list) = (self.tx.clone(), list.clone());
+        let row_weak = row.downgrade();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            match row_key(key, state) {
+                Some(RowKey::Move(by)) => {
+                    let Some(order) = &order else {
+                        return glib::Propagation::Proceed;
+                    };
+                    if let Some(new) = moved(order, &list.href, by) {
+                        tx.emit(Msg::ReorderLists(new));
+                    }
+                }
+                Some(RowKey::Menu) => {
+                    if let Some(row) = row_weak.upgrade() {
+                        show_list_menu(&row, &list, archived, &tx, middle(&row));
+                    }
+                }
+                None => return glib::Propagation::Proceed,
+            }
+            glib::Propagation::Stop
+        });
+        row.add_controller(keys);
     }
 
     /// Dragging a row works whether the lists were last put in order by hand
@@ -1021,6 +1245,7 @@ impl Sidebar {
             row.add_controller(drag);
             self.list_drops(&row, l, order.clone());
             self.list_menu_on(&row, l, false);
+            self.list_keys_on(&row, l, false, Some(order.clone()));
             self.lists_box.append(&row);
             rows.push(ListRow {
                 href: l.href.clone(),
@@ -1039,6 +1264,7 @@ impl Sidebar {
             row.add_css_class("hidden-list");
             row.set_child(Some(&line));
             self.list_menu_on(&row, l, *why == Why::Archived);
+            self.list_keys_on(&row, l, *why == Why::Archived, None);
             self.hidden_box.append(&row);
             rows.push(ListRow {
                 href: l.href.clone(),
@@ -1246,6 +1472,65 @@ mod tests {
             (gdk::Key::Up, M::ALT_MASK),
         ] {
             assert_eq!(tile_key(key, mods), None, "{key:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn a_list_row_moves_and_opens_its_menu_from_the_keyboard() {
+        let none = M::empty();
+        assert_eq!(row_key(gdk::Key::Up, M::ALT_MASK), Some(RowKey::Move(-1)));
+        assert_eq!(row_key(gdk::Key::Down, M::ALT_MASK), Some(RowKey::Move(1)));
+        assert_eq!(row_key(gdk::Key::Menu, none), Some(RowKey::Menu));
+        assert_eq!(row_key(gdk::Key::F10, M::SHIFT_MASK), Some(RowKey::Menu));
+        // Caps Lock changes nothing.
+        assert_eq!(
+            row_key(gdk::Key::Down, M::ALT_MASK | M::LOCK_MASK),
+            Some(RowKey::Move(1))
+        );
+        // Delete is no row's: a list goes only through its menu. The plain
+        // arrows and Alt+Left/Right are the list's and the tiles'.
+        for (key, mods) in [
+            (gdk::Key::Delete, none),
+            (gdk::Key::Up, none),
+            (gdk::Key::Down, M::SHIFT_MASK),
+            (gdk::Key::Left, M::ALT_MASK),
+            (gdk::Key::Up, M::ALT_MASK | M::CONTROL_MASK),
+            (gdk::Key::F10, none),
+        ] {
+            assert_eq!(row_key(key, mods), None, "{key:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn a_moved_list_changes_places_with_its_neighbour_and_not_past_an_end() {
+        let order: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let got = |href, by| moved(&order, href, by);
+        assert_eq!(
+            got("b", -1),
+            Some(["b", "a", "c"].map(String::from).to_vec())
+        );
+        assert_eq!(
+            got("b", 1),
+            Some(["a", "c", "b"].map(String::from).to_vec())
+        );
+        assert_eq!(got("a", -1), None);
+        assert_eq!(got("c", 1), None);
+        assert_eq!(got("zz", 1), None);
+    }
+
+    #[test]
+    fn the_keyboard_goes_on_to_the_next_stop_and_holds_at_the_ends() {
+        // Four stops, say two tiles and two lists.
+        let from = |at, to| reach_index(4, at, to);
+        assert_eq!(from(0, Reach::Next), Some(1));
+        assert_eq!(from(3, Reach::Next), Some(3));
+        assert_eq!(from(2, Reach::Prev), Some(1));
+        assert_eq!(from(0, Reach::Prev), Some(0));
+        assert_eq!(from(2, Reach::First), Some(0));
+        assert_eq!(from(1, Reach::Last), Some(3));
+        // Nothing to reach with no stops.
+        for to in [Reach::Next, Reach::Prev, Reach::First, Reach::Last] {
+            assert_eq!(reach_index(0, 0, to), None);
         }
     }
 }

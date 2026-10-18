@@ -29,7 +29,7 @@ use crate::model::{self, Counts, Data, LinkEdit, Nav, Quadrant, Sort, ViewOpts};
 use crate::motion;
 use crate::pickers::{self, DateOpts};
 use crate::prefs::{PrefPatch, Prefs};
-use crate::sidebar::{self, Sidebar};
+use crate::sidebar::{self, Reach, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
 use crate::{client, dialogs, find, plan, settings};
@@ -326,6 +326,11 @@ pub enum Key {
     Sync,
     Select,
     Escape,
+    /// Move the keyboard among the sidebar's tiles and rows (`j`, `k`, the
+    /// arrows, `g`, `G`), while it is in the sidebar.
+    Reach(Reach),
+    /// Esc in the sidebar: back to the task column.
+    ToColumn,
     NewList,
     Shortcuts,
     Preferences,
@@ -3215,6 +3220,14 @@ impl Window {
                     w.add_card.leave();
                 }
             }
+            Key::Reach(to) => w.sidebar.reach(to),
+            Key::ToColumn => {
+                // An overlaid sidebar would otherwise stay over the column.
+                if w.outer.is_collapsed() {
+                    w.outer.set_show_sidebar(false);
+                }
+                w.scroller.grab_focus();
+            }
             Key::Step(walk, step) => {
                 let next = match walk {
                     Walk::Tiles => model::tile_cycle(&self.prefs.sidebar_views(), &self.nav, step),
@@ -4277,11 +4290,12 @@ impl Window {
                         .map(|(h, _)| h.rsplit('/').next().unwrap_or(h).to_string())
                 });
                 eprintln!(
-                    "focus: {:?} in editor: {} in add card: {} in column: {} row: {row:?}",
+                    "focus: {:?} in editor: {} in add card: {} in column: {} row: {row:?} sidebar: {:?}",
                     focus.as_ref().map(|f| f.type_().name()),
                     inside(w.editor.root.upcast_ref()),
                     inside(w.add_card.root.upcast_ref()),
                     inside(w.scroller.upcast_ref()),
+                    w.sidebar.focused(),
                 );
             }
             // A click on the column's background at a point in the window.
@@ -4762,6 +4776,19 @@ fn vim_key(key: gdk::Key) -> Option<Key> {
     })
 }
 
+/// What a key does with the keyboard in the sidebar, instead of what it
+/// does in the task column. Left and Right stay the tiles' own.
+fn sidebar_key(key: gdk::Key) -> Option<Key> {
+    Some(match key {
+        gdk::Key::j | gdk::Key::Down => Key::Reach(Reach::Next),
+        gdk::Key::k | gdk::Key::Up => Key::Reach(Reach::Prev),
+        gdk::Key::g | gdk::Key::Home => Key::Reach(Reach::First),
+        gdk::Key::G | gdk::Key::End => Key::Reach(Reach::Last),
+        gdk::Key::Escape => Key::ToColumn,
+        _ => return None,
+    })
+}
+
 /// Whether `key` changes the cursor task. No wildcard: a new key has to
 /// say which side it is on.
 fn acts_on_task(key: Key) -> bool {
@@ -4791,6 +4818,8 @@ fn acts_on_task(key: Key) -> bool {
         | Key::Sync
         | Key::Select
         | Key::Escape
+        | Key::Reach(_)
+        | Key::ToColumn
         | Key::NewList
         | Key::Shortcuts
         | Key::Preferences
@@ -4886,6 +4915,12 @@ fn key_action(
     if ctrl || state.contains(gdk::ModifierType::ALT_MASK) {
         return glib::Propagation::Proceed;
     }
+    if scope == Scope::Sidebar
+        && let Some(action) = sidebar_key(key)
+    {
+        tx.emit(Msg::Key(action));
+        return glib::Propagation::Stop;
+    }
     if !routes_to_tasks(scope, key) {
         return glib::Propagation::Proceed;
     }
@@ -4953,6 +4988,40 @@ mod tests {
         for key in on_task.into_iter().chain(elsewhere) {
             assert!(routes_to_tasks(Scope::Content, key), "{key:?}");
             assert!(!routes_to_tasks(Scope::Typing, key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_sidebar_walks_with_j_k_the_arrows_and_escape_leaves_it() {
+        use gdk::Key as K;
+        let reach = |key| match sidebar_key(key) {
+            Some(Key::Reach(to)) => Some(to),
+            _ => None,
+        };
+        // Up and Down are `j` and `k` here: the lists' own arrows stop at
+        // the ends of the list, and the tiles are a grid.
+        assert_eq!(reach(K::j), Some(Reach::Next));
+        assert_eq!(reach(K::Down), Some(Reach::Next));
+        assert_eq!(reach(K::k), Some(Reach::Prev));
+        assert_eq!(reach(K::Up), Some(Reach::Prev));
+        assert_eq!(reach(K::g), Some(Reach::First));
+        assert_eq!(reach(K::Home), Some(Reach::First));
+        assert_eq!(reach(K::G), Some(Reach::Last));
+        assert_eq!(reach(K::End), Some(Reach::Last));
+        assert!(matches!(sidebar_key(K::Escape), Some(Key::ToColumn)));
+        // The rest is the focused widget's (Space, Return, Left, Right,
+        // Delete) or the same as anywhere (the global letters).
+        for key in [
+            K::space,
+            K::Return,
+            K::Left,
+            K::Right,
+            K::Delete,
+            K::x,
+            K::s,
+            K::p,
+        ] {
+            assert!(sidebar_key(key).is_none(), "{key:?}");
         }
     }
 
