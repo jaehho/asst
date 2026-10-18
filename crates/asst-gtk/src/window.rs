@@ -2917,6 +2917,9 @@ impl Window {
                 };
                 match key {
                     Key::Open => sender.input(Msg::Open(t.href)),
+                    // Selecting, Space and `x` pick the task rather than
+                    // finish it.
+                    Key::Toggle if self.select_mode => sender.input(Msg::SelectToggle(t.href)),
                     Key::Toggle => sender.input(Msg::Check(
                         t.href.clone(),
                         t.task.is_open() && !self.completing.contains_key(&t.href),
@@ -4208,6 +4211,120 @@ fn file_name(title: &str) -> String {
     }
 }
 
+/// Where the keyboard is, which decides who gets a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// A field, or anything in the task open in place: its buttons take
+    /// Space and Enter, and letters only act on tasks once it is closed.
+    Typing,
+    /// The sidebar's tiles, list rows and buttons.
+    Sidebar,
+    /// Any other button, which has Space for itself.
+    Native,
+    /// The task column, where the vim keys act on the cursor task.
+    Content,
+}
+
+fn scope(focus: Option<&gtk::Widget>) -> Scope {
+    let Some(f) = focus else {
+        return Scope::Content;
+    };
+    let within = |class: &str| {
+        std::iter::successors(Some(f.clone()), |w| w.parent()).any(|w| w.has_css_class(class))
+    };
+    if f.is::<gtk::Text>() || f.is::<gtk::TextView>() || within("task-editor") {
+        Scope::Typing
+    } else if within("app-sidebar") {
+        Scope::Sidebar
+    } else if f.is::<gtk::Button>() || f.ancestor(gtk::MenuButton::static_type()).is_some() {
+        Scope::Native
+    } else {
+        Scope::Content
+    }
+}
+
+/// What a key does in the task column, outside a field.
+fn vim_key(key: gdk::Key) -> Option<Key> {
+    Some(match key {
+        gdk::Key::j => Key::Down,
+        gdk::Key::k => Key::Up,
+        gdk::Key::g | gdk::Key::Home => Key::First,
+        gdk::Key::G | gdk::Key::End => Key::Last,
+        gdk::Key::e | gdk::Key::l => Key::Open,
+        gdk::Key::x | gdk::Key::space => Key::Toggle,
+        gdk::Key::a | gdk::Key::o => Key::Add,
+        gdk::Key::slash => Key::Find,
+        gdk::Key::d | gdk::Key::Delete => Key::Delete,
+        gdk::Key::n => Key::PlanPlace,
+        gdk::Key::Left | gdk::Key::Up => Key::PlanNudge(-(model::PLAN_SNAP as i32)),
+        gdk::Key::Right | gdk::Key::Down => Key::PlanNudge(model::PLAN_SNAP as i32),
+        gdk::Key::_1 => Key::Priority(1),
+        gdk::Key::_2 => Key::Priority(2),
+        gdk::Key::_3 => Key::Priority(3),
+        gdk::Key::_4 => Key::Priority(4),
+        gdk::Key::t => Key::Today,
+        gdk::Key::m => Key::Tomorrow,
+        gdk::Key::w => Key::NextWeek,
+        gdk::Key::bracketleft | gdk::Key::H => Key::PrevView,
+        gdk::Key::bracketright | gdk::Key::L => Key::NextView,
+        gdk::Key::s => Key::Sync,
+        gdk::Key::v => Key::Select,
+        gdk::Key::p => Key::NewList,
+        gdk::Key::question | gdk::Key::F1 => Key::Shortcuts,
+        gdk::Key::Escape => Key::Escape,
+        _ => return None,
+    })
+}
+
+/// Whether `key` changes the cursor task. No wildcard: a new key has to
+/// say which side it is on.
+fn acts_on_task(key: Key) -> bool {
+    match key {
+        Key::Open
+        | Key::Toggle
+        | Key::Delete
+        | Key::PlanPlace
+        | Key::PlanNudge(_)
+        | Key::Priority(_)
+        | Key::Today
+        | Key::Tomorrow
+        | Key::NextWeek => true,
+        Key::Down
+        | Key::Up
+        | Key::First
+        | Key::Last
+        | Key::Add
+        | Key::Find
+        | Key::ZoomIn
+        | Key::ZoomOut
+        | Key::PrevView
+        | Key::NextView
+        | Key::Sync
+        | Key::Select
+        | Key::Escape
+        | Key::NewList
+        | Key::Shortcuts
+        | Key::Preferences
+        | Key::Sidebar
+        | Key::Close
+        | Key::Quit
+        | Key::Paste
+        | Key::Go(_) => false,
+    }
+}
+
+/// Whether `key` may act on the cursor task with the keyboard in `scope`.
+/// In the sidebar and on a button it may not: Space, the arrows and the
+/// task letters belong to the focused widget, so a tile opens its view
+/// instead of completing a task the cursor was left on.
+fn routes_to_tasks(scope: Scope, key: gdk::Key) -> bool {
+    match scope {
+        Scope::Typing => false,
+        Scope::Content => true,
+        Scope::Sidebar | Scope::Native => !vim_key(key).is_some_and(acts_on_task),
+    }
+}
+
 /// Vim keys and shortcuts; typing in a field is left alone.
 fn key_action(
     window: &adw::ApplicationWindow,
@@ -4248,15 +4365,8 @@ fn key_action(
         tx.emit(Msg::Key(a));
         return glib::Propagation::Stop;
     }
-    // A field, or anything in the task open in place: its buttons take
-    // Space and Enter, and letters only act on tasks once it is closed.
-    let typing = focus.as_ref().is_some_and(|f| {
-        f.is::<gtk::Text>()
-            || f.is::<gtk::TextView>()
-            || std::iter::successors(Some(f.clone()), |w| w.parent())
-                .any(|w| w.has_css_class("task-editor"))
-    });
-    if typing {
+    let scope = scope(focus.as_ref());
+    if scope == Scope::Typing {
         // With a popover over the field (the add card's list suggestions),
         // Esc closes that first.
         if key == gdk::Key::Escape && !ui::popovers_open() {
@@ -4274,35 +4384,71 @@ fn key_action(
     if ctrl || state.contains(gdk::ModifierType::ALT_MASK) {
         return glib::Propagation::Proceed;
     }
-    let action = match key {
-        gdk::Key::j => Key::Down,
-        gdk::Key::k => Key::Up,
-        gdk::Key::g | gdk::Key::Home => Key::First,
-        gdk::Key::G | gdk::Key::End => Key::Last,
-        gdk::Key::e | gdk::Key::l => Key::Open,
-        gdk::Key::x | gdk::Key::space => Key::Toggle,
-        gdk::Key::a | gdk::Key::o => Key::Add,
-        gdk::Key::slash => Key::Find,
-        gdk::Key::d | gdk::Key::Delete => Key::Delete,
-        gdk::Key::n => Key::PlanPlace,
-        gdk::Key::Left | gdk::Key::Up => Key::PlanNudge(-(model::PLAN_SNAP as i32)),
-        gdk::Key::Right | gdk::Key::Down => Key::PlanNudge(model::PLAN_SNAP as i32),
-        gdk::Key::_1 => Key::Priority(1),
-        gdk::Key::_2 => Key::Priority(2),
-        gdk::Key::_3 => Key::Priority(3),
-        gdk::Key::_4 => Key::Priority(4),
-        gdk::Key::t => Key::Today,
-        gdk::Key::m => Key::Tomorrow,
-        gdk::Key::w => Key::NextWeek,
-        gdk::Key::bracketleft | gdk::Key::H => Key::PrevView,
-        gdk::Key::bracketright | gdk::Key::L => Key::NextView,
-        gdk::Key::s => Key::Sync,
-        gdk::Key::v => Key::Select,
-        gdk::Key::p => Key::NewList,
-        gdk::Key::question | gdk::Key::F1 => Key::Shortcuts,
-        gdk::Key::Escape => Key::Escape,
-        _ => return glib::Propagation::Proceed,
+    if !routes_to_tasks(scope, key) {
+        return glib::Propagation::Proceed;
+    }
+    let Some(action) = vim_key(key) else {
+        return glib::Propagation::Proceed;
     };
     tx.emit(Msg::Key(action));
     glib::Propagation::Stop
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sidebar_and_buttons_keep_the_task_keys_to_themselves() {
+        use gdk::Key as K;
+        let on_task = [
+            K::x,
+            K::d,
+            K::t,
+            K::m,
+            K::w,
+            K::e,
+            K::l,
+            K::n,
+            K::_1,
+            K::_2,
+            K::_3,
+            K::_4,
+            K::space,
+            K::Left,
+            K::Right,
+            K::Up,
+            K::Down,
+            K::Delete,
+        ];
+        // Moving the cursor and the global keys still work from anywhere.
+        let elsewhere = [
+            K::j,
+            K::k,
+            K::g,
+            K::G,
+            K::a,
+            K::o,
+            K::s,
+            K::p,
+            K::v,
+            K::slash,
+            K::question,
+            K::bracketleft,
+            K::bracketright,
+            K::Escape,
+        ];
+        for scope in [Scope::Sidebar, Scope::Native] {
+            for key in on_task {
+                assert!(!routes_to_tasks(scope, key), "{scope:?} {key:?}");
+            }
+            for key in elsewhere {
+                assert!(routes_to_tasks(scope, key), "{scope:?} {key:?}");
+            }
+        }
+        for key in on_task.into_iter().chain(elsewhere) {
+            assert!(routes_to_tasks(Scope::Content, key), "{key:?}");
+            assert!(!routes_to_tasks(Scope::Typing, key), "{key:?}");
+        }
+    }
 }
