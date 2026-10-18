@@ -994,15 +994,14 @@ impl Sidebar {
     }
 
     fn build_tiles(&self, shown: &[Nav], hidden: Rc<Vec<Nav>>) {
-        // The keyboard stays on the tile it was on through a move or a hide:
-        // read before the old tiles go, which takes the focus with them.
+        // The keyboard stays on the tile it was on through a move: read
+        // before the old tiles go, which takes the focus with them.
         let focused = self
             .tiles
             .borrow()
             .iter()
-            .enumerate()
-            .find(|(_, t)| t.child.is_focus())
-            .map(|(at, t)| (t.nav.clone(), at));
+            .find(|t| t.child.is_focus())
+            .map(|t| t.nav.clone());
         self.tiles_box.remove_all();
         let mut tiles = Vec::new();
         for (at, nav) in shown.iter().enumerate() {
@@ -1100,14 +1099,15 @@ impl Sidebar {
                 hidden: hidden.clone(),
             });
         }
-        // The place it had, when the tile itself went.
-        if let Some((nav, at)) = focused
-            && let Some(t) = tiles
-                .iter()
-                .find(|t| t.nav == nav)
-                .or_else(|| tiles.get(at.min(tiles.len().saturating_sub(1))))
-        {
-            t.child.grab_focus();
+        // When the tile itself went, the keyboard goes to the `...` button,
+        // not to the next tile: Delete would hide that one too, and a held
+        // key would empty the sidebar. The button is also the way back.
+        if let Some(nav) = focused {
+            let to: gtk::Widget = match tiles.iter().find(|t| t.nav == nav) {
+                Some(t) => t.child.clone().upcast(),
+                None => self.lists_menu.clone().upcast(),
+            };
+            to.grab_focus();
         }
         *self.tiles.borrow_mut() = tiles;
     }
