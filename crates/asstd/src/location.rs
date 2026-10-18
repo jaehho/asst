@@ -223,7 +223,8 @@ fn write_told(path: &std::path::Path, all: &[Alarmed]) {
     }
 }
 
-async fn tell(session: &zbus::Connection, summary: &str, body: &str) -> zbus::Result<()> {
+/// One notification with no buttons, from asst.
+pub async fn tell(session: &zbus::Connection, summary: &str, body: &str) -> zbus::Result<()> {
     let proxy = NotificationsProxy::new(session).await?;
     let mut hints = HashMap::new();
     hints.insert("desktop-entry", Value::from(asst_core::config::APP_ID));

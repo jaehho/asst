@@ -10,7 +10,7 @@ use asst_core::api::{
     AddSpec, Added, Change, LinkState, LinkView, ListChange, ListSpec, ListView, Settings,
     SettingsChange, StatusView, SyncState, TaskView, short_ids,
 };
-use asst_core::caldav::{self, Account, CalDav, RemoteError};
+use asst_core::caldav::{self, Account, CalDav, RemoteError, RemoteList};
 use asst_core::config::{self, AccountConfig, Config};
 use asst_core::github;
 use asst_core::quickadd;
@@ -162,6 +162,12 @@ pub enum Event {
     Changed,
     Status(StatusView),
     LoginDone(bool, String),
+    /// Something to tell the person with a desktop notification, for what
+    /// the daemon did without being asked.
+    Notice {
+        summary: String,
+        body: String,
+    },
 }
 
 impl Daemon {
@@ -221,6 +227,14 @@ impl Daemon {
 
     fn emit(&self, e: Event) {
         let _ = self.events.send(e);
+    }
+
+    /// Tell the person something with a desktop notification.
+    pub fn notify(&self, summary: &str, body: &str) {
+        self.emit(Event::Notice {
+            summary: summary.to_string(),
+            body: body.to_string(),
+        });
     }
 
     /// Tasks changed here: tell clients, rearm reminders, send soon.
@@ -423,6 +437,12 @@ impl Daemon {
     }
 
     // -- reads ------------------------------------------------------------------
+
+    /// Whether quick add files to this list when none is named: the one
+    /// `config.inbox` names, else a list called Inbox, else the first.
+    pub fn is_inbox(&self, href: &str) -> bool {
+        self.inbox(&self.store()).as_deref() == Some(href)
+    }
 
     fn inbox(&self, store: &Store) -> Option<String> {
         let lists = store.lists().ok()?;
@@ -1014,10 +1034,27 @@ impl Daemon {
         }
     }
 
+    /// The server for a caller that sorts failures by what the server said:
+    /// not being signed in, or no way to the app password, is a failure to
+    /// get through, and says nothing about the request.
+    pub async fn server(&self) -> std::result::Result<Arc<CalDav>, RemoteError> {
+        match self.remote().await {
+            Ok(Some(remote)) => Ok(remote),
+            Ok(None) => Err(RemoteError::Unauthorized),
+            Err(e) => Err(RemoteError::Protocol(e)),
+        }
+    }
+
     /// After a change to lists on the server: take its listing, tell clients.
     async fn lists_changed(&self, remote: &CalDav) -> Result<()> {
         let lists = remote.lists().await.map_err(remote_error)?;
-        self.store().apply_lists(&lists)?;
+        self.adopt_lists(&lists)
+    }
+
+    /// The server's listing of lists, as just read, is the cache's: tell
+    /// clients, and sync soon.
+    pub fn adopt_lists(&self, lists: &[RemoteList]) -> Result<()> {
+        self.store().apply_lists(lists)?;
         self.emit(Event::Changed);
         self.wake_reminders.notify_one();
         self.refresh_pending();
@@ -1265,6 +1302,7 @@ fn settings_of(cfg: &Config) -> Settings {
         snooze: cfg.snooze.clone(),
         alarm_at_due: cfg.alarm_at_due,
         alarm_before: cfg.alarm_before,
+        follow_rename: cfg.follow_rename,
     }
 }
 
@@ -1319,6 +1357,9 @@ fn apply_settings(
     if let Some(m) = change.alarm_before {
         cfg.alarm_before = m;
     }
+    if let Some(f) = change.follow_rename {
+        cfg.follow_rename = f;
+    }
     Ok(())
 }
 
@@ -1350,6 +1391,7 @@ mod tests {
             snooze: Some(vec![60, 5, 5]),
             alarm_at_due: Some(false),
             alarm_before: Some(30),
+            follow_rename: Some(github::FollowRename::Off),
         };
         apply_settings(&mut cfg, &change, Some(Some("Work".into()))).unwrap();
         assert_eq!(
@@ -1360,11 +1402,13 @@ mod tests {
                 snooze: vec![5, 60],
                 alarm_at_due: false,
                 alarm_before: 30,
+                follow_rename: github::FollowRename::Off,
             }
         );
         apply_settings(&mut cfg, &SettingsChange::default(), Some(None)).unwrap();
         assert_eq!(cfg.inbox, None);
         assert_eq!(cfg.interval, 300, "absent fields stay");
+        assert_eq!(cfg.follow_rename, github::FollowRename::Off);
     }
 
     #[test]

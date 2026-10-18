@@ -2,6 +2,7 @@
 //! serves `dev.jaeho.Asst1` to the CLI, the window and quick add.
 
 mod daemon;
+mod follow;
 mod github;
 mod location;
 mod reminders;

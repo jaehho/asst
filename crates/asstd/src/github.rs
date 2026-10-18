@@ -3,7 +3,9 @@
 //! looking at the repo itself (the id a rename leaves alone, its name, its
 //! archived flag) and reads its issues only when that is the repo that was
 //! linked. The first page's ETag is kept per repo, so a quiet repo costs
-//! requests that GitHub doesn't count against the rate limit.
+//! requests that GitHub doesn't count against the rate limit. A link that has
+//! followed its repo to a new name then hands its list to `follow`, which may
+//! rename the list to match.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use asst_core::task::Edit;
 use chrono::{DateTime, Utc};
 
 use crate::daemon::{Daemon, Error, Result};
+use crate::follow::{self, ListNames};
 
 /// A refusal that says nothing about when to come back is waited out this
 /// long.
@@ -29,7 +32,7 @@ const REFUSED_WAIT: chrono::Duration = chrono::Duration::minutes(15);
 const NAME_LOOKUP_EVERY: chrono::Duration = chrono::Duration::hours(1);
 
 /// Who made a log row.
-const AUTO: &str = "auto";
+pub const AUTO: &str = "auto";
 
 /// What the GitHub task remembers between rounds. None of it survives a
 /// restart: it only saves requests, and what a restart forgets is looked at
@@ -62,7 +65,10 @@ enum Round {
 enum Gate {
     /// It is the linked repo: read its issues.
     Go,
-    /// Not now: it moved, is not the linked repo, or could not be told.
+    /// It is the linked repo, and the link has just moved to its new name:
+    /// its issues wait for the next round.
+    Moved,
+    /// Not now: it is not the linked repo, or could not be told.
     Stop,
 }
 
@@ -99,7 +105,7 @@ pub async fn run(daemon: Arc<Daemon>) {
             }
         }
         if let Some(gh) = &client
-            && round(&daemon, gh, &mut memory, Utc::now()).await == Round::Rejected
+            && round(&daemon, gh, &*daemon, &mut memory, Utc::now()).await == Round::Rejected
         {
             client = None;
         }
@@ -130,11 +136,18 @@ async fn token() -> Option<String> {
 /// Every link once: look at its repo, and if that is the linked repo, sync
 /// its issues. A link that fails does not stop the ones after it, but a lost
 /// connection or a rejected token does, since nothing else will get through.
+/// `lists` is the server's lists, for a list that follows a renamed repo.
 /// `now` is a parameter so a test can move the clock.
-async fn round(daemon: &Daemon, gh: &GitHub, memory: &mut Memory, now: DateTime<Utc>) -> Round {
+async fn round(
+    daemon: &Daemon,
+    gh: &GitHub,
+    lists: &impl ListNames,
+    memory: &mut Memory,
+    now: DateTime<Utc>,
+) -> Round {
     let links = daemon.store().gh_link_rows().unwrap_or_default();
     for row in &links {
-        match link_round(daemon, gh, memory, row, now).await {
+        match link_round(daemon, gh, lists, memory, row, now).await {
             Ok(true) => daemon.gh_pass_done(&row.repo, Ok(())),
             Ok(false) => {}
             Err(Error::Remote(RemoteError::Unauthorized)) => {
@@ -155,19 +168,26 @@ async fn round(daemon: &Daemon, gh: &GitHub, memory: &mut Memory, now: DateTime<
     Round::Done
 }
 
-/// One link: whether its issues were synced.
+/// One link: whether its issues were synced. A link that is the repo, or
+/// has just followed it to a new name, goes on to its list: the name the list
+/// has been waiting to take. That step is the list side's and never an error
+/// here, so Nextcloud being out of reach cannot end GitHub's round.
 async fn link_round(
     daemon: &Daemon,
     gh: &GitHub,
+    lists: &impl ListNames,
     memory: &mut Memory,
     row: &GhLinkRow,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    if identify(daemon, gh, memory, row, now).await? == Gate::Stop {
-        return Ok(false);
+    let gate = identify(daemon, gh, memory, row, now).await?;
+    if gate == Gate::Go {
+        pass(daemon, gh, memory, row).await?;
     }
-    pass(daemon, gh, memory, row).await?;
-    Ok(true)
+    if gate != Gate::Stop {
+        follow::follow(daemon, lists, &row.list, now).await;
+    }
+    Ok(gate == Gate::Go)
 }
 
 /// Look at the link's repo and judge it against what is stored. Nothing is
@@ -413,7 +433,7 @@ fn rename(
     memory.lookups.remove(repo);
     log::info!("{repo} is now {to}");
     daemon.wake_github.notify_one();
-    Ok(Gate::Stop)
+    Ok(Gate::Moved)
 }
 
 /// The name now belongs to another repo than the linked one (made again
@@ -788,14 +808,18 @@ fn edit_task(store: &mut Store, href: &str, change: &Change) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asst_core::caldav::RemoteList;
+    use crate::daemon::Event;
+    use asst_core::caldav::{RemoteError, RemoteList};
     use asst_core::config::Config;
-    use asst_core::store::LogRow;
+    use asst_core::github::FollowRename;
+    use asst_core::store::{ListRow, LogRow};
     use asst_core::testing::{FakeGitHub, Reply};
     use chrono::TimeZone;
     use chrono_tz::Tz;
+    use std::sync::Mutex;
 
     const LAB: u64 = 1379104005;
+    const INBOX: &str = "/cal/inbox/";
 
     /// The name part of `owner/repo`: the list a test links it to.
     fn short(repo: &str) -> &str {
@@ -812,6 +836,158 @@ mod tests {
         format!("\"{id}:{name}:{archived}\"")
     }
 
+    /// How the fake server fails, as the real one does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fail {
+        /// The connection is lost.
+        Network,
+        /// The server answers with this status.
+        Status(u16),
+    }
+
+    impl Fail {
+        fn error(self) -> RemoteError {
+            match self {
+                Fail::Network => RemoteError::Network("timed out".into()),
+                Fail::Status(code) => RemoteError::Status(code),
+            }
+        }
+    }
+
+    /// The server's lists as a fake that records every call it gets, and
+    /// fails the way it is told to. Renaming changes its own lists only: it
+    /// is the server, and the cache hears of it by reading it.
+    #[derive(Default)]
+    struct FakeLists(Mutex<Server>);
+
+    #[derive(Default)]
+    struct Server {
+        lists: Vec<RemoteList>,
+        /// "fresh", and "rename <href> <name>", in order, failed or not.
+        calls: Vec<String>,
+        /// A reading fails.
+        fresh_fails: Option<Fail>,
+        /// A rename is not done, and fails.
+        rename_fails: Option<Fail>,
+        /// A rename is done, and its reply is lost.
+        rename_reply_lost: Option<Fail>,
+        /// Looked at as a rename comes in, with what it saw kept in
+        /// `watched`.
+        watch: Option<Box<dyn Fn() -> bool + Send>>,
+        watched: Vec<bool>,
+    }
+
+    impl ListNames for FakeLists {
+        async fn fresh(&self) -> std::result::Result<Vec<RemoteList>, RemoteError> {
+            let mut server = self.0.lock().unwrap();
+            server.calls.push("fresh".into());
+            match server.fresh_fails {
+                Some(fail) => Err(fail.error()),
+                None => Ok(server.lists.clone()),
+            }
+        }
+
+        async fn rename(&self, href: &str, name: &str) -> std::result::Result<(), RemoteError> {
+            let mut server = self.0.lock().unwrap();
+            server.calls.push(format!("rename {href} {name}"));
+            if let Some(watch) = &server.watch {
+                let seen = watch();
+                server.watched.push(seen);
+            }
+            if let Some(fail) = server.rename_fails {
+                return Err(fail.error());
+            }
+            let list = server
+                .lists
+                .iter_mut()
+                .find(|l| l.href == href)
+                .ok_or(RemoteError::NotFound)?;
+            list.name = name.to_string();
+            match server.rename_reply_lost {
+                Some(fail) => Err(fail.error()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl FakeLists {
+        /// A server that has the lists the store has.
+        fn of(store: &Store) -> FakeLists {
+            let lists = store.lists().unwrap().iter().map(remote).collect();
+            FakeLists(Mutex::new(Server {
+                lists,
+                ..Server::default()
+            }))
+        }
+
+        fn with<T>(&self, f: impl FnOnce(&mut Server) -> T) -> T {
+            f(&mut self.0.lock().unwrap())
+        }
+
+        /// What it was asked, in order.
+        fn calls(&self) -> Vec<String> {
+            self.with(|s| s.calls.clone())
+        }
+
+        /// How many renames it was asked for, done or not.
+        fn renames(&self) -> usize {
+            self.with(|s| s.calls.iter().filter(|c| c.starts_with("rename")).count())
+        }
+
+        fn name(&self, href: &str) -> String {
+            self.with(|s| {
+                s.lists
+                    .iter()
+                    .find(|l| l.href == href)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
+        }
+
+        /// Someone renames a list on the server, or makes one.
+        fn set_name(&self, href: &str, name: &str) {
+            self.with(|s| match s.lists.iter_mut().find(|l| l.href == href) {
+                Some(l) => l.name = name.to_string(),
+                None => s.lists.push(RemoteList {
+                    href: href.into(),
+                    name: name.into(),
+                    color: None,
+                    order: None,
+                    sync_token: Some("t1".into()),
+                    ctag: None,
+                    writable: true,
+                }),
+            });
+        }
+
+        fn set_writable(&self, href: &str, writable: bool) {
+            self.with(|s| {
+                s.lists
+                    .iter_mut()
+                    .find(|l| l.href == href)
+                    .unwrap()
+                    .writable = writable;
+            });
+        }
+
+        fn remove(&self, href: &str) {
+            self.with(|s| s.lists.retain(|l| l.href != href));
+        }
+    }
+
+    fn remote(l: &ListRow) -> RemoteList {
+        RemoteList {
+            href: l.href.clone(),
+            name: l.name.clone(),
+            color: l.color.clone(),
+            order: l.order,
+            sync_token: l.sync_token.clone(),
+            ctag: None,
+            writable: l.writable,
+        }
+    }
+
     /// Everything a round could have written for the links, short of the
     /// clock: compared before and after to show it wrote nothing.
     #[derive(Debug, PartialEq)]
@@ -826,19 +1002,26 @@ mod tests {
     /// pointed at it, the way `run` drives them one round at a time.
     struct Rig {
         daemon: Arc<Daemon>,
+        events: tokio::sync::mpsc::UnboundedReceiver<Event>,
         fake: FakeGitHub,
         gh: GitHub,
+        lists: FakeLists,
         memory: Memory,
         now: DateTime<Utc>,
     }
 
     impl Rig {
         /// One list per repo, named for the repo and linked to it, with no
-        /// id known. GitHub knows nothing yet; every issue listing is empty.
+        /// id known, and an Inbox, as the real install has. GitHub knows
+        /// nothing yet; every issue listing is empty.
         async fn new(repos: &[&str]) -> Rig {
+            Rig::configured(repos, Config::default()).await
+        }
+
+        async fn configured(repos: &[&str], config: Config) -> Rig {
             let zone: Tz = "America/New_York".parse().unwrap();
             let mut store = Store::in_memory(zone).unwrap();
-            let lists: Vec<RemoteList> = repos
+            let mut lists: Vec<RemoteList> = repos
                 .iter()
                 .map(|repo| RemoteList {
                     href: format!("/cal/{}/", short(repo)),
@@ -850,8 +1033,17 @@ mod tests {
                     writable: true,
                 })
                 .collect();
+            lists.push(RemoteList {
+                href: INBOX.into(),
+                name: "Inbox".into(),
+                color: None,
+                order: Some(7),
+                sync_token: Some("t1".into()),
+                ctag: None,
+                writable: true,
+            });
             store.apply_lists(&lists).unwrap();
-            let rig = Rig::over(store, zone).await;
+            let rig = Rig::over(store, zone, config).await;
             for repo in repos {
                 rig.daemon.link(short(repo), repo).unwrap();
                 rig.fake.reply(
@@ -863,17 +1055,21 @@ mod tests {
             rig
         }
 
-        /// A daemon over this store, and a fake GitHub that knows nothing.
-        async fn over(store: Store, zone: Tz) -> Rig {
-            let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        /// A daemon over this store, a fake GitHub that knows nothing, and
+        /// a server with the store's lists.
+        async fn over(store: Store, zone: Tz, config: Config) -> Rig {
+            let lists = FakeLists::of(&store);
+            let (daemon, events) = Daemon::new(config, store, zone);
             let fake = FakeGitHub::start().await;
             let gh = GitHub::with_base("tok", &fake.base())
                 .unwrap()
                 .with_timeout(Duration::from_millis(300));
             Rig {
                 daemon,
+                events,
                 fake,
                 gh,
+                lists,
                 memory: Memory::default(),
                 now: Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap(),
             }
@@ -939,7 +1135,26 @@ mod tests {
         }
 
         async fn go(&mut self) -> Round {
-            round(&self.daemon, &self.gh, &mut self.memory, self.now).await
+            round(
+                &self.daemon,
+                &self.gh,
+                &self.lists,
+                &mut self.memory,
+                self.now,
+            )
+            .await
+        }
+
+        /// The notifications asked for since this last looked: (summary,
+        /// body).
+        fn notices(&mut self) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            while let Ok(event) = self.events.try_recv() {
+                if let Event::Notice { summary, body } = event {
+                    out.push((summary, body));
+                }
+            }
+            out
         }
 
         fn later(&mut self, minutes: i64) {
@@ -1091,7 +1306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_witnessed_rename_moves_the_link_and_its_pairs_and_leaves_a_marker() {
+    async fn a_witnessed_rename_moves_the_link_and_its_pairs_whatever_the_server_does() {
         let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
         rig.publish(LAB, "jaehho/champalimaud", false);
         rig.go().await;
@@ -1101,6 +1316,8 @@ mod tests {
         let pairs = rig.daemon.store().gh_pairs("jaehho/champalimaud").unwrap();
         assert_eq!(pairs.len(), 1);
         rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", &issues);
+        // Nextcloud cannot be reached: GitHub sync does not wait for it
+        rig.lists.with(|s| s.fresh_fails = Some(Fail::Network));
         rig.woken().await;
 
         assert_eq!(rig.go().await, Round::Done);
@@ -1143,7 +1360,12 @@ mod tests {
         assert_eq!(rig.issues_asked("jaehho/lab"), 0);
         assert!(rig.woken().await);
         // The list keeps its name for now, and the link says so
-        assert_eq!(rig.daemon.lists().unwrap()[0].name, "champalimaud");
+        let list = |rig: &Rig| {
+            let lists = rig.daemon.lists().unwrap();
+            lists.into_iter().find(|l| l.href == "/cal/champalimaud/")
+        };
+        assert_eq!(list(&rig).unwrap().name, "champalimaud");
+        assert_eq!(rig.lists.renames(), 0);
         let link = rig.link("jaehho/lab");
         assert_eq!(link.state, Some(asst_core::api::LinkState::Renamed));
         assert!(link.note.unwrap().contains("jaehho/champalimaud"));
@@ -1153,6 +1375,7 @@ mod tests {
         assert_eq!(rig.issues_asked("jaehho/lab"), 1);
         assert_eq!(rig.log().len(), 1, "nothing more to say");
         assert_eq!(rig.daemon.store().gh_pairs("jaehho/lab").unwrap(), pairs);
+        assert!(rig.row("jaehho/lab").follow_from.is_some(), "still waiting");
     }
 
     #[tokio::test]
@@ -1186,6 +1409,10 @@ mod tests {
         assert_eq!(rig.issues_asked("jaehho/lab"), 1);
         assert_eq!(rig.log().len(), 1);
         assert_eq!(rig.row("jaehho/lab").archived, Some(0));
+        assert!(
+            rig.lists.calls().is_empty(),
+            "a rename found late is reported, and the server is not asked"
+        );
     }
 
     #[tokio::test]
@@ -1512,12 +1739,13 @@ mod tests {
         rig.go().await;
         let other = {
             let mut store = rig.daemon.store();
-            let list = store.lists().unwrap()[0].clone();
+            let lists = store.lists().unwrap();
+            let lab = lists.iter().find(|l| l.name == "lab").unwrap();
             store
                 .apply_lists(&[
                     RemoteList {
-                        href: list.href.clone(),
-                        name: list.name.clone(),
+                        href: lab.href.clone(),
+                        name: lab.name.clone(),
                         color: None,
                         order: None,
                         sync_token: Some("t1".into()),
@@ -1662,6 +1890,461 @@ mod tests {
         assert_eq!(ask.header("if-none-match"), None, "not answered by a tag");
         assert_eq!(rig.link("jaehho/x").error, None);
     }
+    const CHAMPALIMAUD: &str = "/cal/champalimaud/";
+
+    /// The repo champalimaud, known by its id, is lab on GitHub now and the
+    /// link has moved, but the server cannot be reached: the list waits.
+    async fn waiting_to_follow() -> Rig {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.lists.with(|s| s.fresh_fails = Some(Fail::Network));
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        rig.go().await;
+        assert!(rig.row("jaehho/lab").follow_from.is_some());
+        rig
+    }
+
+    fn kinds(log: &[LogRow]) -> Vec<&str> {
+        log.iter().map(|r| r.kind.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_renamed_repo_renames_its_exactly_named_list_once() {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        assert!(rig.lists.calls().is_empty(), "nothing to follow yet");
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        // What the log holds at the moment the server is asked to rename
+        let daemon = rig.daemon.clone();
+        rig.lists.with(|s| {
+            s.watch = Some(Box::new(move || {
+                let log = daemon.store().gh_log_recent(None, 10).unwrap();
+                log.iter().any(|r| r.kind == "list-renaming")
+            }));
+        });
+
+        // Pass 1: the link moves, and the list follows it, once
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(
+            rig.lists.with(|s| s.watched.clone()),
+            [true],
+            "the intent was written before the server was asked"
+        );
+        let row = rig.row("jaehho/lab");
+        assert_eq!((row.list.as_str(), row.repo_id), (CHAMPALIMAUD, Some(LAB)));
+        assert_eq!((&row.follow_from, row.follow_at), (&None, None), "followed");
+        assert_eq!(
+            rig.lists.calls(),
+            ["fresh", "rename /cal/champalimaud/ lab"],
+            "the server is read, then written once"
+        );
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab");
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-renamed", "repo-renamed"]);
+        let sentence = "renamed list \"champalimaud\" to \"lab\": jaehho/champalimaud is now \
+                        jaehho/lab (GitHub id 1379104005). Undo: asst list rename lab champalimaud";
+        assert_eq!(log[0].text, sentence);
+        assert_eq!(
+            (
+                log[0].repo.as_str(),
+                log[0].list.as_deref(),
+                log[0].by.as_str()
+            ),
+            ("jaehho/lab", Some(CHAMPALIMAUD), "auto")
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(log[0].data.as_deref().unwrap()).unwrap();
+        assert_eq!(data["href"], CHAMPALIMAUD, "the undo and the proposals key");
+        assert_eq!(
+            (&data["from"], &data["to"]),
+            (&"champalimaud".into(), &"lab".into())
+        );
+        let told = rig.notices();
+        assert_eq!(told.len(), 1, "told once");
+        assert_eq!(told[0].1, sentence);
+        assert_eq!(rig.link("jaehho/lab").state, None, "nothing left to follow");
+
+        // Pass 2: nothing to do and nothing to say
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.lists.calls().len(), 2, "the server is not asked again");
+        assert_eq!(rig.log().len(), 2);
+        assert!(rig.notices().is_empty());
+        assert_eq!(rig.issues_asked("jaehho/lab"), 1, "and the issues go on");
+    }
+
+    #[tokio::test]
+    async fn a_list_that_is_not_the_repos_to_rename_keeps_its_name() {
+        struct Case {
+            label: &'static str,
+            config: Config,
+            setup: fn(&Rig),
+            slug: &'static str,
+            why: &'static str,
+        }
+        let config = Config::default;
+        let cases = [
+            Case {
+                label: "a name of its own",
+                config: config(),
+                setup: |rig| rig.lists.set_name(CHAMPALIMAUD, "Lab work"),
+                slug: "custom",
+                why: "the list is called \"Lab work\", not \"champalimaud\"",
+            },
+            Case {
+                label: "the old name in another case",
+                config: config(),
+                setup: |rig| rig.lists.set_name(CHAMPALIMAUD, "Champalimaud"),
+                slug: "custom",
+                why: "the list is called \"Champalimaud\", not \"champalimaud\"",
+            },
+            Case {
+                label: "already renamed by hand",
+                config: config(),
+                setup: |rig| rig.lists.set_name(CHAMPALIMAUD, "lab"),
+                slug: "already-named",
+                why: "the list is already named lab",
+            },
+            Case {
+                label: "another list has the name, in any case",
+                config: config(),
+                setup: |rig| rig.lists.set_name("/cal/other/", "LAB"),
+                slug: "clash",
+                why: "another list is already named \"lab\"",
+            },
+            Case {
+                label: "the inbox of the settings",
+                config: Config {
+                    inbox: Some("champalimaud".into()),
+                    ..config()
+                },
+                setup: |_| {},
+                slug: "inbox",
+                why: "the list is the inbox",
+            },
+            Case {
+                label: "the first list when there is no Inbox",
+                config: config(),
+                setup: |rig| rig.lists.remove(INBOX),
+                slug: "inbox",
+                why: "the list is the inbox",
+            },
+            Case {
+                label: "a list shared read-only",
+                config: config(),
+                setup: |rig| rig.lists.set_writable(CHAMPALIMAUD, false),
+                slug: "read-only",
+                why: "the list is read-only",
+            },
+            Case {
+                label: "follow_rename off",
+                config: Config {
+                    follow_rename: FollowRename::Off,
+                    ..config()
+                },
+                setup: |_| {},
+                slug: "off",
+                why: "follow_rename is off",
+            },
+        ];
+        for case in cases {
+            let label = case.label;
+            let mut rig = Rig::configured(&["jaehho/champalimaud"], case.config).await;
+            rig.publish(LAB, "jaehho/champalimaud", false);
+            rig.go().await;
+            (case.setup)(&rig);
+            let name = rig.lists.name(CHAMPALIMAUD);
+            rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+
+            assert_eq!(rig.go().await, Round::Done, "{label}");
+
+            // The link follows the repo, whatever the list does
+            let row = rig.row("jaehho/lab");
+            assert_eq!((row.list.as_str(), row.repo_id), (CHAMPALIMAUD, Some(LAB)));
+            assert_eq!((&row.follow_from, row.follow_at), (&None, None), "{label}");
+            // The list is left alone, and the log says why
+            assert_eq!(rig.lists.renames(), 0, "{label}");
+            assert_eq!(rig.lists.name(CHAMPALIMAUD), name, "{label}");
+            let log = rig.log();
+            assert_eq!(kinds(&log), ["list-kept", "repo-renamed"], "{label}");
+            assert_eq!(log[0].text, format!("rename not followed: {}", case.why));
+            assert_eq!(
+                (log[0].repo.as_str(), log[0].by.as_str()),
+                ("jaehho/lab", "auto")
+            );
+            assert_eq!(log[0].list.as_deref(), Some(CHAMPALIMAUD), "{label}");
+            let data: serde_json::Value =
+                serde_json::from_str(log[0].data.as_deref().unwrap()).unwrap();
+            assert_eq!(data["reason"], case.slug, "{label}");
+            assert!(rig.notices().is_empty(), "{label}: nothing was done");
+            assert_eq!(rig.link("jaehho/lab").state, None, "{label}");
+            if case.slug == "off" {
+                assert!(rig.lists.calls().is_empty(), "off asks the server nothing");
+            }
+
+            // And it is not asked again
+            let calls = rig.lists.calls().len();
+            rig.later(5);
+            rig.go().await;
+            assert_eq!(rig.log().len(), 2, "{label}");
+            assert_eq!(rig.lists.calls().len(), calls, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_out_of_reach_waits_and_does_not_end_the_github_round() {
+        // E7: the lost connection of the list side is the very error that
+        // ends a round when GitHub's side has it
+        let mut rig = Rig::new(&["jaehho/champalimaud", "jaehho/zeta"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.publish(2, "jaehho/zeta", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        rig.lists.with(|s| s.fresh_fails = Some(Fail::Network));
+        let zeta = rig.issues_asked("jaehho/zeta");
+
+        // Cannot even read the lists: the marker stays, the later link syncs
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.issues_asked("jaehho/zeta"), zeta + 1, "zeta was synced");
+        assert!(rig.link("jaehho/zeta").synced.is_some());
+        assert!(
+            rig.row("jaehho/lab").follow_from.is_some(),
+            "the marker stays"
+        );
+        assert_eq!(kinds(&rig.log()), ["repo-renamed"]);
+        assert_eq!(rig.lists.renames(), 0);
+        assert!(rig.notices().is_empty());
+        let note = rig.link("jaehho/lab").note.unwrap();
+        assert!(note.contains("the list is still called \"champalimaud\""));
+
+        // Read, and then the write fails: the intent is in the log
+        rig.lists.with(|s| {
+            s.fresh_fails = None;
+            s.rename_fails = Some(Fail::Network);
+        });
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.issues_asked("jaehho/zeta"), zeta + 2);
+        assert!(rig.row("jaehho/lab").follow_from.is_some());
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-renaming", "repo-renamed"]);
+        assert!(
+            log[0]
+                .text
+                .starts_with("renaming list \"champalimaud\" to \"lab\":")
+        );
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "champalimaud");
+        assert!(rig.notices().is_empty());
+
+        // Again, it is not written twice: the next pass is the same intent
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(kinds(&rig.log()), ["list-renaming", "repo-renamed"]);
+
+        // Back online: the next pass renames, and the intent becomes the deed
+        rig.lists.with(|s| s.rename_fails = None);
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab");
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-renamed", "repo-renamed"]);
+        assert!(
+            log[0]
+                .text
+                .starts_with("renamed list \"champalimaud\" to \"lab\":")
+        );
+        assert!(
+            !log[0].text.contains("interruption"),
+            "it was not found done"
+        );
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        assert_eq!(rig.notices().len(), 1, "told once, when it was done");
+        assert_eq!(rig.link("jaehho/lab").state, None);
+    }
+
+    #[tokio::test]
+    async fn a_rename_not_followed_in_thirty_days_is_dropped_without_asking_the_server() {
+        // A minute short of the thirty days, with the server back: it follows
+        let mut rig = waiting_to_follow().await;
+        rig.lists.with(|s| s.fresh_fails = None);
+        rig.later(30 * 24 * 60 - 1);
+        rig.go().await;
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab");
+        assert_eq!(kinds(&rig.log()), ["list-renamed", "repo-renamed"]);
+
+        // A minute past them: dropped, and the server is never asked
+        let mut rig = waiting_to_follow().await;
+        rig.lists.with(|s| s.fresh_fails = None);
+        let asked = rig.lists.calls().len();
+        rig.later(30 * 24 * 60 + 1);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.lists.calls().len(), asked, "no word from the server");
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-kept", "repo-renamed"]);
+        assert_eq!(log[0].text, "rename not followed: expired");
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "champalimaud");
+        assert!(rig.notices().is_empty());
+        assert_eq!(rig.link("jaehho/lab").state, None, "nothing left waiting");
+    }
+
+    #[tokio::test]
+    async fn a_rename_that_was_begun_and_not_finished_is_told_as_it_turned_out() {
+        // The write got through and its reply was lost: the same as a crash
+        // between the write and the row that says so
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        rig.lists
+            .with(|s| s.rename_reply_lost = Some(Fail::Network));
+        rig.go().await;
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab", "done on the server");
+        assert_eq!(kinds(&rig.log()), ["list-renaming", "repo-renamed"]);
+        assert!(rig.row("jaehho/lab").follow_from.is_some());
+        assert!(rig.notices().is_empty());
+
+        // A restart, and the name is already the new one: finished, not redone
+        rig.restart();
+        rig.lists.with(|s| s.rename_reply_lost = None);
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 1, "not written again");
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-renamed", "repo-renamed"]);
+        assert_eq!(
+            log[0].text,
+            "renamed list \"champalimaud\" to \"lab\" (completed after an interruption): \
+             jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005). \
+             Undo: asst list rename lab champalimaud"
+        );
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        assert_eq!(rig.notices().len(), 1, "told, since it never was");
+
+        // The other way: the write never got through, and someone else gave
+        // the list a name meanwhile. That name is theirs.
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        rig.lists.with(|s| s.rename_fails = Some(Fail::Network));
+        rig.go().await;
+        assert_eq!(kinds(&rig.log()), ["list-renaming", "repo-renamed"]);
+        rig.lists.with(|s| s.rename_fails = None);
+        rig.lists.set_name(CHAMPALIMAUD, "Lab notes");
+        rig.restart();
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 1, "not written over theirs");
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "Lab notes");
+        let log = rig.log();
+        assert_eq!(
+            kinds(&log),
+            ["list-kept", "repo-renamed"],
+            "the intent is closed"
+        );
+        assert_eq!(
+            log[0].text,
+            "rename not followed: the list was renamed to \"Lab notes\" meanwhile"
+        );
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        assert!(rig.notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_says_no_closes_the_intent_as_kept() {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        // Shared read-only with us in a way the cached list did not show
+        rig.lists.with(|s| s.rename_fails = Some(Fail::Status(403)));
+
+        assert_eq!(rig.go().await, Round::Done);
+
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-kept", "repo-renamed"]);
+        assert_eq!(
+            log[0].text,
+            "rename not followed: the server refused: the server answered 403"
+        );
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        assert_eq!(rig.lists.renames(), 1, "asked once");
+        assert!(rig.notices().is_empty());
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 1, "and not again");
+
+        // A server in trouble is not a refusal: it is waited out
+        for status in [500, 503, 423] {
+            let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+            rig.publish(LAB, "jaehho/champalimaud", false);
+            rig.go().await;
+            rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+            rig.lists
+                .with(|s| s.rename_fails = Some(Fail::Status(status)));
+            rig.go().await;
+            assert_eq!(
+                kinds(&rig.log()),
+                ["list-renaming", "repo-renamed"],
+                "{status}"
+            );
+            assert!(rig.row("jaehho/lab").follow_from.is_some(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn three_lists_renamed_in_an_hour_is_enough() {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        // Three renames, 10, 20 and 30 minutes ago
+        for minutes in [10, 20, 30] {
+            let repo = format!("jaehho/other{minutes}");
+            rig.daemon
+                .store()
+                .gh_log_add(&NewLog {
+                    at: rig.now - chrono::Duration::minutes(minutes),
+                    repo: &repo,
+                    list: Some("/cal/else/"),
+                    kind: "list-renamed",
+                    text: "renamed list",
+                    data: None,
+                    by: "auto",
+                })
+                .unwrap();
+        }
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+
+        // The link moves, the list waits: nothing logged for the waiting
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.row("jaehho/lab").list, CHAMPALIMAUD);
+        assert!(
+            rig.row("jaehho/lab").follow_from.is_some(),
+            "the marker waits"
+        );
+        assert_eq!(rig.lists.renames(), 0);
+        let log = rig.log();
+        assert_eq!(log.len(), 4, "the three, and the repo's rename");
+        assert_eq!(log[0].kind, "repo-renamed");
+        assert!(rig.notices().is_empty());
+        rig.later(10);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 0, "still three in the hour");
+        assert_eq!(rig.log().len(), 4);
+
+        // The oldest is out of the hour: two are left, and the list goes
+        rig.later(21);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.lists.renames(), 1);
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab");
+        assert_eq!(rig.log()[0].kind, "list-renamed");
+        assert_eq!(rig.log().len(), 5);
+        assert_eq!(rig.notices().len(), 1);
+    }
+
     /// Needs `ASST_TEST_DB`, a copy of the live database made with
     /// `sqlite3 <db> ".backup <copy>"`. GitHub is a fake that agrees with
     /// what the copy holds (every repo exists under its name, its issues are
@@ -1673,7 +2356,7 @@ mod tests {
         let path = std::env::var("ASST_TEST_DB").expect("ASST_TEST_DB");
         let zone: Tz = "America/New_York".parse().unwrap();
         let store = Store::open(std::path::Path::new(&path), zone).unwrap();
-        let mut rig = Rig::over(store, zone).await;
+        let mut rig = Rig::over(store, zone, Config::default()).await;
         let before = rig.snap();
         assert!(before.links.iter().all(|l| l.repo_id.is_none()));
         let pairs: usize = before.pairs.iter().map(|(_, p)| p.len()).sum();

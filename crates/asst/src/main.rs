@@ -12,12 +12,13 @@ use asst_core::api::{
     SettingsChange, StatusView, SyncState, TaskView,
 };
 use asst_core::fmt;
+use asst_core::github::FollowRename;
 use asst_core::store::{Query, Store, View};
 use asst_core::sync::Report;
 use asst_core::task::priority_level;
 use asst_core::track;
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use out::Style;
 
@@ -169,6 +170,10 @@ enum Cmd {
         /// Minutes before the due time that reminder rings (0: at the due time)
         #[arg(long)]
         alarm_before: Option<u32>,
+        /// What a list does when its repo is renamed: `list` renames a list
+        /// named exactly for the old repo, `off` leaves it (and says so)
+        #[arg(long, value_enum)]
+        follow_rename: Option<Follow>,
     },
     /// Sync with the server now
     Sync,
@@ -218,6 +223,22 @@ enum TrackCmd {
         #[arg(long)]
         date: Option<String>,
     },
+}
+
+/// `--follow-rename`'s two words.
+#[derive(Clone, Copy, ValueEnum)]
+enum Follow {
+    List,
+    Off,
+}
+
+impl From<Follow> for FollowRename {
+    fn from(f: Follow) -> FollowRename {
+        match f {
+            Follow::List => FollowRename::List,
+            Follow::Off => FollowRename::Off,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -771,6 +792,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             snooze,
             alarm_at_due,
             alarm_before,
+            follow_rename,
         } => {
             let change = SettingsChange {
                 inbox: inbox.map(|i| Some(i).filter(|i| !i.eq_ignore_ascii_case("default"))),
@@ -778,6 +800,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 snooze,
                 alarm_at_due,
                 alarm_before,
+                follow_rename: follow_rename.map(FollowRename::from),
             };
             let raw = if change == SettingsChange::default() {
                 proxy.settings().await?
@@ -810,6 +833,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     m => format!("{} before", fmt::minutes(u64::from(m))),
                 },
             );
+            row("follow-rename", s.follow_rename.as_str().into());
         }
 
         Cmd::Lists => {
@@ -1100,5 +1124,29 @@ mod tests {
         assert_eq!(link_of_repo(&links, "Jaehho/Dash"), Some(&links[1]));
         assert_eq!(link_of_repo(&links, "jaehho/other"), None);
         assert_eq!(link_of_repo(&[], "jaehho/lab"), None);
+    }
+
+    #[test]
+    fn a_list_follows_its_repo_or_not_and_there_is_no_third_word() {
+        let change = |word: &str| {
+            let cli = Cli::try_parse_from(["asst", "settings", "--follow-rename", word]).ok()?;
+            match cli.command {
+                Some(Cmd::Settings { follow_rename, .. }) => follow_rename.map(FollowRename::from),
+                _ => None,
+            }
+        };
+        assert_eq!(change("list"), Some(FollowRename::List));
+        assert_eq!(change("off"), Some(FollowRename::Off));
+        assert_eq!(change("on"), None);
+        assert_eq!(change("yes"), None);
+        // Left out, the setting is left alone
+        let cli = Cli::try_parse_from(["asst", "settings", "--interval", "300"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Settings {
+                follow_rename: None,
+                ..
+            })
+        ));
     }
 }

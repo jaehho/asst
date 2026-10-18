@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::github::FollowRename;
 use crate::store::{Block, Query, Row};
 use crate::task::Task;
 use crate::time::{Trigger, When};
@@ -417,6 +418,9 @@ pub struct Settings {
     /// Minutes before the due time that reminder rings.
     #[serde(default)]
     pub alarm_before: u32,
+    /// Whether a list named for a repo is renamed when the repo is.
+    #[serde(default)]
+    pub follow_rename: FollowRename,
 }
 
 /// Absent means unchanged; `inbox: null` goes back to the default.
@@ -436,6 +440,8 @@ pub struct SettingsChange {
     pub alarm_at_due: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alarm_before: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_rename: Option<FollowRename>,
 }
 
 fn double<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -565,6 +571,30 @@ mod tests {
             );
             assert_eq!(state.as_str(), word);
         }
+    }
+
+    #[test]
+    fn following_a_rename_is_a_setting_older_peers_do_not_know() {
+        // An older asstd sends settings without it: the default
+        let old = r#"{"interval":60,"snooze":[10],"alarm_at_due":true}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.follow_rename, FollowRename::List);
+        // A change that leaves it alone does not mention it
+        let change = SettingsChange {
+            interval: Some(300),
+            ..SettingsChange::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&change).unwrap(),
+            r#"{"interval":300}"#
+        );
+        let off = SettingsChange {
+            follow_rename: Some(FollowRename::Off),
+            ..SettingsChange::default()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(json, r#"{"follow_rename":"off"}"#);
+        assert_eq!(serde_json::from_str::<SettingsChange>(&json).unwrap(), off);
     }
 
     #[test]

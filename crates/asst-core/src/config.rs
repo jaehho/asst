@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::github::FollowRename;
+
 pub const APP_ID: &str = "dev.jaeho.Asst";
 
 /// The window's app ID. Development builds (`ASST_DEVEL`) have their own, so
@@ -37,6 +39,10 @@ pub struct Config {
     pub alarm_at_due: bool,
     /// Minutes before the due time that reminder rings.
     pub alarm_before: u32,
+    /// What a list does when its linked repo is renamed on GitHub: `list`
+    /// renames a list that is named exactly for the old repo, `off` only
+    /// reports it. Either way the link follows the repo.
+    pub follow_rename: FollowRename,
 }
 
 impl Default for Config {
@@ -48,6 +54,7 @@ impl Default for Config {
             snooze: DEFAULT_SNOOZE.to_vec(),
             alarm_at_due: true,
             alarm_before: 0,
+            follow_rename: FollowRename::List,
         }
     }
 }
@@ -217,6 +224,22 @@ mod tests {
         assert!(c.account.is_none());
         let round: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(round, c);
+    }
+
+    #[test]
+    fn a_list_follows_its_repo_unless_told_not_to() {
+        let read = |s: &str| toml::from_str::<Config>(s).unwrap().follow_rename;
+        assert_eq!(read(""), FollowRename::List, "the default");
+        assert_eq!(read("follow_rename = \"list\"\n"), FollowRename::List);
+        assert_eq!(read("follow_rename = \"off\"\n"), FollowRename::Off);
+        assert!(toml::from_str::<Config>("follow_rename = \"on\"\n").is_err());
+        let off = Config {
+            follow_rename: FollowRename::Off,
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&off).unwrap();
+        assert!(text.contains("follow_rename = \"off\""), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), off);
     }
 
     #[test]

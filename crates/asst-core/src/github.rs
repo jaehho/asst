@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use http::{Method, Request, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::caldav::{self, RemoteError};
 
@@ -318,11 +318,22 @@ pub fn judge(
 /// Whether a renamed repo renames its list too (`follow_rename` in
 /// `config.toml`): `List` only for a list named exactly for the old repo,
 /// `Off` reports it and leaves the list.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FollowRename {
     #[default]
     List,
     Off,
+}
+
+impl FollowRename {
+    /// As `config.toml` and `asst settings` spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FollowRename::List => "list",
+            FollowRename::Off => "off",
+        }
+    }
 }
 
 /// Why a list keeps its name when its repo is renamed.
@@ -347,7 +358,7 @@ pub enum KeepWhy {
 }
 
 /// The name part of `owner/repo`.
-fn short(repo: &str) -> &str {
+pub fn short(repo: &str) -> &str {
     repo.split_once('/').map_or(repo, |(_, name)| name)
 }
 
