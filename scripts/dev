@@ -50,9 +50,11 @@ build() {
 }
 
 # Fixture tasks for `seed`: key, title, due, priority, repeat, optional
-# plan placement as "HH:MM minutes" on today. Empty fields are skipped.
-# `--source dev:<key>` keeps a re-run from duplicating; the same keys own
-# their plan slots.
+# plan placement as "HH:MM minutes" on today, optional source stamp.
+# Empty fields are skipped. The source defaults to `dev:<key>`, which keeps
+# a re-run from duplicating; the same keys own their plan slots. A
+# `steno:` or `gh:` stamp gives the row an origin caption (the rest get
+# none).
 seed_list() {
   local past next_mon
   past="$(date -d '2 days ago' +%F)"
@@ -65,6 +67,8 @@ today-anki|Review flashcards|today|3||
 soon-report|Write the report|tomorrow|2||14:00 60
 someday-gym|Gym||||
 week-meeting|Team meeting|$next_mon||every monday|
+steno-notes|Send the meeting notes|||||steno:dev/notes
+gh-issue|Fix the sync bug|||||gh:dev/1
 SEED
 }
 
@@ -97,9 +101,9 @@ seed_lists() {
 seed_tasks() {
   local slots="[]" key title due prio repeat plan uid json
   local -a args
-  while IFS='|' read -r key title due prio repeat plan; do
+  while IFS='|' read -r key title due prio repeat plan source; do
     [ -n "$key" ] || continue
-    args=(--json add --source "dev:$key" --literal)
+    args=(--json add --source "${source:-dev:$key}" --literal)
     if [ -n "$due" ]; then args+=(--due "$due"); fi
     if [ -n "$prio" ]; then args+=(--priority "$prio"); fi
     if [ -n "$repeat" ]; then args+=(--repeat "$repeat"); fi

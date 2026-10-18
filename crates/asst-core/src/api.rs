@@ -253,9 +253,10 @@ pub struct TaskView {
     /// The paired GitHub issue, when the list is linked to a repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<IssueLink>,
-    /// Where the task came from: `steno`, `github`, `asst`, `mail`, or
-    /// `phone` (another CalDAV client, no stamp). Derived from `source`
-    /// and the issue pair; not stored twice.
+    /// Where the task came from: `steno`, `github`, `asst`, `phone`
+    /// (another CalDAV client, no stamp), or `other` (a stamp of a kind
+    /// not listed). Derived from `source` and the issue pair; not stored
+    /// twice.
     pub origin: String,
     #[serde(flatten)]
     pub task: Task,
@@ -283,7 +284,7 @@ impl TaskView {
     }
 }
 
-/// `steno` / `github` / `asst` / `mail` / `phone` — creation site, not the
+/// `steno` / `github` / `asst` / `phone` / `other` — creation site, not the
 /// last editor. `source` wins when present; a GitHub pair is the fallback
 /// for issues that arrived without a stamp.
 pub fn origin_of(source: Option<&str>, has_issue: bool) -> &'static str {
@@ -291,7 +292,6 @@ pub fn origin_of(source: Option<&str>, has_issue: bool) -> &'static str {
         return match kind {
             "steno" => "steno",
             "asst" => "asst",
-            "mail" => "mail",
             "gh" | "github" => "github",
             _ => "other",
         };
@@ -652,7 +652,8 @@ mod tests {
     fn origin_prefers_the_source_kind() {
         assert_eq!(origin_of(Some("steno:2026/send"), false), "steno");
         assert_eq!(origin_of(Some("asst:abc123"), true), "asst");
-        assert_eq!(origin_of(Some("mail:1"), false), "mail");
+        assert_eq!(origin_of(Some("gh:7"), false), "github");
+        assert_eq!(origin_of(Some("mail:1"), false), "other");
     }
 
     #[test]

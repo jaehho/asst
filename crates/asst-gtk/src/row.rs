@@ -59,6 +59,25 @@ pub struct RowOpts<'a> {
 /// `(moved, target, after)`
 pub type Dropped = std::rc::Rc<dyn Fn(&str, &str, bool)>;
 
+/// The grey caption after a row's title and its tooltip, or none. Only an
+/// origin that tells the reader something is named (`steno`, `github`);
+/// `asst`, `phone` and `other` would sit on every row of an ordinary list.
+/// A paired issue's number rides on the same line (#18) whatever the
+/// origin: a task made in asst on a linked list has one too.
+fn origin_caption(origin: &str, issue: Option<u32>) -> Option<(String, &'static str)> {
+    let (name, tip) = match origin {
+        "steno" => (Some("steno"), "Filed from a Steno meeting"),
+        "github" => (Some("github"), "GitHub issue"),
+        _ => (None, "GitHub issue"),
+    };
+    let parts: Vec<String> = name
+        .map(str::to_string)
+        .into_iter()
+        .chain(issue.map(|n| format!("#{n}")))
+        .collect();
+    (!parts.is_empty()).then(|| (parts.join(" "), tip))
+}
+
 /// The change a schedule picker's answer makes, or none.
 pub fn schedule_change(before: &TaskView, s: &Schedule) -> Option<Change> {
     let mut c = Change::default();
@@ -173,22 +192,12 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         i.set_tooltip_text(Some("Not on the server yet"));
         body.append(&i);
     }
-    if !o.compact {
-        // Creation site, not the last editor. Grey caption, same weight as
-        // the list name — provenance is context, not a state colour.
-        let tip = match t.origin.as_str() {
-            "steno" => "Filed from a Steno meeting",
-            "github" => "GitHub issue",
-            "asst" => "Created in asst",
-            "mail" => "From email",
-            _ => "Another CalDAV client",
-        };
-        // A paired issue's number rides on the same line (#18).
-        let label = match &t.issue {
-            Some(issue) => format!("{} #{}", t.origin, issue.number),
-            None => t.origin.clone(),
-        };
-        let o = gtk::Label::builder().label(&label).build();
+    if !o.compact
+        && let Some((text, tip)) = origin_caption(&t.origin, t.issue.as_ref().map(|i| i.number))
+    {
+        // Grey caption, same weight as the list name — provenance is
+        // context, not a state colour.
+        let o = gtk::Label::builder().label(&text).build();
         o.add_css_class("caption");
         o.add_css_class("dim-label");
         o.set_tooltip_text(Some(tip));
@@ -586,4 +595,29 @@ pub fn task_menu(
     let p = ui::menu(&items);
     p.set_width_request(260);
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(origin: &str, issue: Option<u32>) -> Option<String> {
+        origin_caption(origin, issue).map(|(text, _)| text)
+    }
+
+    #[test]
+    fn only_informative_origins_get_a_caption() {
+        assert_eq!(text("steno", None).as_deref(), Some("steno"));
+        assert_eq!(text("github", None).as_deref(), Some("github"));
+        for plain in ["asst", "phone", "other"] {
+            assert_eq!(text(plain, None), None, "{plain}");
+        }
+    }
+
+    #[test]
+    fn a_paired_issue_keeps_its_number() {
+        assert_eq!(text("github", Some(18)).as_deref(), Some("github #18"));
+        assert_eq!(text("steno", Some(4)).as_deref(), Some("steno #4"));
+        assert_eq!(text("asst", Some(18)).as_deref(), Some("#18"));
+    }
 }
