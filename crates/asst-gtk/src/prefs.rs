@@ -384,8 +384,26 @@ impl Prefs {
         self.sidebar.take()
     }
 
-    pub fn is_archived(&self, href: &str) -> bool {
+    /// Whether the list is out of sight. The inbox list never is: it may
+    /// have been archived before it became the inbox (`asst settings
+    /// --inbox`), and the entry is left alone, so the list is hidden again
+    /// should it stop being the inbox.
+    pub fn is_archived(&self, href: &str, lists: &[ListView]) -> bool {
         self.archived.iter().any(|a| a == href)
+            && !crate::model::inbox(lists).is_some_and(|l| l.href == href)
+    }
+
+    /// Archive `href`, or bring it back. The inbox list is where new tasks
+    /// go, so it cannot be archived: `false`, and nothing changed.
+    pub fn set_archived(&mut self, href: &str, on: bool, lists: &[ListView]) -> bool {
+        if on && crate::model::inbox(lists).is_some_and(|l| l.href == href) {
+            return false;
+        }
+        self.archived.retain(|h| h != href);
+        if on {
+            self.archived.push(href.to_string());
+        }
+        true
     }
 
     /// Forget what is kept for a list that was deleted: its place in the
@@ -420,7 +438,7 @@ impl Prefs {
     pub fn arrange(&self, lists: &[ListView]) -> Vec<ListView> {
         let mut out: Vec<ListView> = lists
             .iter()
-            .filter(|l| !self.is_archived(&l.href))
+            .filter(|l| !self.is_archived(&l.href, lists))
             .cloned()
             .collect();
         if self.lists_by_name {
@@ -1152,6 +1170,56 @@ day_zoom = 52.0
         // Archived lists stay out either way.
         p.archived.push("/w/".into());
         assert_eq!(names(p.sidebar_lists(&lists)), ["Inbox", "Home"]);
+    }
+
+    /// Work, Inbox and Home, with `inbox` the list new tasks go to.
+    fn lists_with_inbox(inbox: &str) -> Vec<ListView> {
+        [("/w/", "Work"), ("/i/", "Inbox"), ("/h/", "Home")]
+            .map(|(href, name)| ListView {
+                inbox: href == inbox,
+                ..list(href, name)
+            })
+            .to_vec()
+    }
+
+    #[test]
+    fn the_inbox_list_cannot_be_archived() {
+        let lists = lists_with_inbox("/i/");
+        let mut p = Prefs::default();
+        assert!(!p.set_archived("/i/", true, &lists));
+        assert!(p.archived.is_empty());
+        // Any other list can, once however often it is asked.
+        assert!(p.set_archived("/w/", true, &lists));
+        assert!(p.set_archived("/w/", true, &lists));
+        assert_eq!(p.archived, ["/w/"]);
+        assert!(p.set_archived("/w/", false, &lists));
+        assert!(p.archived.is_empty());
+        // Bringing the inbox back is always allowed: it clears an entry
+        // made before the list was the inbox.
+        p.archived.push("/i/".into());
+        assert!(p.set_archived("/i/", false, &lists));
+        assert!(p.archived.is_empty());
+    }
+
+    #[test]
+    fn an_archived_inbox_href_is_ignored() {
+        let p = Prefs {
+            archived: strings(&["/i/", "/w/"]),
+            ..Prefs::default()
+        };
+        // The inbox was archived, then `asst settings --inbox` chose it.
+        let lists = lists_with_inbox("/i/");
+        assert!(!p.is_archived("/i/", &lists));
+        assert!(p.is_archived("/w/", &lists));
+        assert_eq!(names(p.arrange(&lists)), ["Home", "Inbox"]);
+        // Read, not rewritten: the entry waits, and counts again once
+        // another list is the inbox.
+        assert_eq!(p.archived, ["/i/", "/w/"]);
+        let moved = lists_with_inbox("/h/");
+        assert!(p.is_archived("/i/", &moved));
+        assert_eq!(names(p.arrange(&moved)), ["Home"]);
+        // Before any list is known, an entry is what it says.
+        assert!(p.is_archived("/i/", &[]));
     }
 
     #[test]

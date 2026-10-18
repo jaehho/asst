@@ -126,8 +126,8 @@ pub struct Shown {
     pub bounds: Option<[f32; 4]>,
 }
 
-/// Every mapped label, entry, text view, labelled or icon button and icon
-/// under `roots`, in tree order.
+/// Every mapped label, entry, text view, labelled or icon button (and a
+/// menu item that has a tooltip) and icon under `roots`, in tree order.
 pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
     let mut out = Vec::new();
     for (root, widget) in roots {
@@ -151,8 +151,14 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
             if let Some(l) = w.downcast_ref::<gtk::Label>() {
                 out.push(item("label", l.text().to_string(), None));
             } else if let Some(b) = w.downcast_ref::<gtk::Button>() {
-                let text = b.label().map(|t| t.to_string()).unwrap_or_default();
+                let mut text = b.label().map(|t| t.to_string()).unwrap_or_default();
                 let icon = b.icon_name().map(|i| i.to_string());
+                // A menu item is a button around a box: it has no label of
+                // its own, but a tooltip (why it is disabled) is worth
+                // seeing, so it is named by its first label.
+                if text.is_empty() && icon.is_none() && w.tooltip_text().is_some() {
+                    text = first_label(&w).unwrap_or_default();
+                }
                 if !text.is_empty() || icon.is_some() {
                     out.push(item("button", text, icon));
                 }
@@ -178,6 +184,21 @@ pub fn shown(roots: &[(&'static str, gtk::Widget)]) -> Vec<Shown> {
         }
     }
     out
+}
+
+/// The text of the first label under `w`, in tree order.
+fn first_label(w: &gtk::Widget) -> Option<String> {
+    if let Some(l) = w.downcast_ref::<gtk::Label>() {
+        return Some(l.text().to_string());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(text) = first_label(&c) {
+            return Some(text);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 /// The JSON `texts` writes.

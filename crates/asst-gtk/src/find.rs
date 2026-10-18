@@ -186,7 +186,7 @@ fn list_hits<'a>(
     lists
         .iter()
         .filter_map(|l| {
-            let gone = prefs.is_archived(&l.href);
+            let gone = prefs.is_archived(&l.href, lists);
             if q.is_empty() {
                 return (!gone && Some(l.href.as_str()) != on_tile).then_some((l, None));
             }

@@ -226,6 +226,8 @@ pub enum Msg {
     SetListOrder(Vec<String>, bool),
     /// Put a list away, or bring it back.
     Archive(String, bool),
+    /// New tasks go to this list from now on (`config.toml`'s `inbox`).
+    UseAsInbox(String),
     /// A list's open tasks to the clipboard, as Markdown.
     CopyList(String),
     /// A task's iCalendar object, to a file.
@@ -1906,9 +1908,12 @@ impl Component for Window {
                 else {
                     return;
                 };
-                self.prefs.archived.retain(|h| *h != href);
-                if on {
-                    self.prefs.archived.push(href.clone());
+                if !self.prefs.set_archived(&href, on, &self.lists) {
+                    toast(
+                        w,
+                        &format!("New tasks go to {}, so it can't be archived", quoted(&name)),
+                    );
+                    return;
                 }
                 self.prefs.save();
                 self.undo_toast(
@@ -1922,6 +1927,36 @@ impl Component for Window {
                     Msg::Archive(href, !on),
                     4,
                 );
+            }
+            Msg::UseAsInbox(href) => {
+                let Some(name) = self
+                    .lists
+                    .iter()
+                    .find(|l| l.href == href && l.writable && !l.inbox)
+                    .map(|l| l.name.clone())
+                else {
+                    return;
+                };
+                // What the Undo sends: the config's own value, so a default
+                // inbox goes back to being the default.
+                let before = match &self.settings {
+                    Some(s) => s.inbox.clone(),
+                    None => model::inbox(&self.lists).map(|l| l.name.clone()),
+                };
+                let change = |inbox: Option<String>| {
+                    Box::new(SettingsChange {
+                        inbox: Some(inbox),
+                        ..SettingsChange::default()
+                    })
+                };
+                self.undo_toast(
+                    w,
+                    &tx,
+                    &format!("{} is now the Inbox.", quoted(&name)),
+                    Msg::SetSettings(change(before)),
+                    6,
+                );
+                tx.emit(Msg::SetSettings(change(Some(name))));
             }
             Msg::CopyList(href) => {
                 if let Some(l) = self.lists.iter().find(|l| l.href == href) {
@@ -2249,10 +2284,25 @@ impl Component for Window {
             },
             Cmd::Settings(result) => match result {
                 Ok(s) => {
+                    // Another list is the inbox: the Inbox view, its tile's
+                    // list and the add card's chip are all of the old one
+                    // until the lists are read again.
+                    let moved = self
+                        .settings
+                        .as_ref()
+                        .is_some_and(|old| old.inbox != s.inbox);
                     self.settings = Some(s);
+                    if moved {
+                        self.reload(&sender);
+                    }
                 }
                 Err(e) => {
                     if self.settings.is_some() {
+                        // The change it answers may have a toast saying it
+                        // happened.
+                        if let Some(last) = self.edit_toast.take() {
+                            last.dismiss();
+                        }
                         toast(w, &e);
                     }
                 }
@@ -2505,12 +2555,13 @@ impl Window {
         lists.extend(
             self.lists
                 .iter()
-                .filter(|l| self.prefs.is_archived(&l.href))
+                .filter(|l| self.prefs.is_archived(&l.href, &self.lists))
                 .cloned(),
         );
         let kept = |t: &&TaskView| {
             !self.hidden.contains(&t.href)
-                && (!self.prefs.is_archived(&t.list) || self.nav == Nav::List(t.list.clone()))
+                && (!self.prefs.is_archived(&t.list, &self.lists)
+                    || self.nav == Nav::List(t.list.clone()))
         };
         let open = self.open.iter().filter(kept).cloned().collect();
         let completed = self
@@ -2990,7 +3041,7 @@ impl Window {
 
     /// The view is a list that was archived.
     fn nav_archived(&self) -> bool {
-        matches!(&self.nav, Nav::List(h) if self.prefs.is_archived(h))
+        matches!(&self.nav, Nav::List(h) if self.prefs.is_archived(h, &self.lists))
     }
 
     /// The list a view shows, for a list or the inbox.
@@ -3358,7 +3409,14 @@ impl Window {
         let opts = self.prefs.view_opts(&self.nav);
         CURRENT_VIEW.with(|c| *c.borrow_mut() = Some((self.nav.clone(), opts.clone())));
         CURRENT_LISTS.with(|c| *c.borrow_mut() = lists.clone());
-        CURRENT_ARCHIVED.with(|c| *c.borrow_mut() = self.prefs.archived.clone());
+        CURRENT_ARCHIVED.with(|c| {
+            *c.borrow_mut() = self
+                .lists
+                .iter()
+                .filter(|l| self.prefs.is_archived(&l.href, &self.lists))
+                .map(|l| l.href.clone())
+                .collect();
+        });
         let sections = model::plan(&self.nav, &data, &opts, now);
         let typing = self.editing.is_some() && w.editor.typing();
 
@@ -3406,7 +3464,7 @@ impl Window {
             comp.sort();
             comp.hash(&mut h);
             for l in &self.lists {
-                (&l.href, &l.name, &l.color).hash(&mut h);
+                (&l.href, &l.name, &l.color, l.inbox).hash(&mut h);
             }
             // Day's chips come from `blocks` and the window's slots, not
             // from task sections.
@@ -3656,6 +3714,7 @@ impl Window {
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
     /// `clear [list]` (asks), `clear! [list]`, `archive <list>`, `unarchive <list>`,
+    /// `inbox <list>` (Use as Inbox), `list-menu <list>` (its sidebar row's),
     /// `delete-list <list>` (asks), `delete-list! <list>`,
     /// `order <list>,<list>`, `opts sort=name|desc=true|due=week|hide=<list>|reset`,
     /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
@@ -3694,6 +3753,16 @@ impl Window {
                     sender.input(Msg::Archive(h, verb == "archive"));
                 }
             }
+            "inbox" => {
+                if let Some(h) = list(arg) {
+                    sender.input(Msg::UseAsInbox(h));
+                }
+            }
+            // A list row's menu, as its right-click opens it.
+            "list-menu" => match list(arg) {
+                Some(h) => w.sidebar.open_list_menu(&h),
+                None => eprintln!("drive: no list {arg:?}"),
+            },
             "delete-list" | "delete-list!" => {
                 if let Some(h) = list(arg) {
                     if verb == "delete-list" {

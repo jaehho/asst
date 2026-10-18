@@ -446,7 +446,7 @@ fn archived_group(lists: &[ListView], prefs: &Prefs, patch: &Patch) -> adw::Pref
         .build();
     let archived: Vec<&ListView> = lists
         .iter()
-        .filter(|l| prefs.is_archived(&l.href))
+        .filter(|l| prefs.is_archived(&l.href, lists))
         .collect();
     let left = Rc::new(Cell::new(archived.len()));
     let none = adw::ActionRow::builder()

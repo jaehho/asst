@@ -477,6 +477,7 @@ fn empty(o: &Opts, tx: &Tx) -> adw::StatusPage {
             "All clear",
             "Nothing is due today. Press a to add a task.",
         ),
+        Nav::Inbox => ("mailbox-symbolic", "Inbox zero", "Everything is sorted."),
         Nav::Completed => (
             "check-round-outline-symbolic",
             "Nothing completed yet",

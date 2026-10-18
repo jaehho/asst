@@ -31,6 +31,8 @@ struct Tile {
 
 struct ListRow {
     href: String,
+    /// The list as the row was built, for its menu.
+    list: ListView,
     row: gtk::ListBoxRow,
     count: gtk::Label,
     /// Shown while the list is tied to a GitHub repo.
@@ -69,14 +71,21 @@ pub fn list_menu(list: &ListView, archived: bool, tx: &Tx, select: bool) -> gtk:
                 .upcast(),
         );
     }
+    if list.writable && !list.inbox {
+        let (tx, h) = (tx.clone(), href.clone());
+        items.push(
+            Item::new(Some(Nav::Inbox.icon()), "Use as Inbox")
+                .build(move || tx.emit(Msg::UseAsInbox(h.clone())))
+                .upcast(),
+        );
+    }
     {
         let (tx, h) = (tx.clone(), href.clone());
         let title = if archived { "Unarchive" } else { "Archive" };
-        items.push(
-            Item::new(Some("shoe-box-symbolic"), title)
-                .build(move || tx.emit(Msg::Archive(h.clone(), !archived)))
-                .upcast(),
-        );
+        let archive = Item::new(Some("shoe-box-symbolic"), title)
+            .build(move || tx.emit(Msg::Archive(h.clone(), !archived)));
+        keep_inbox(&archive, list);
+        items.push(archive.upcast());
     }
     items.push(ui::separator());
     let clear = {
@@ -97,8 +106,18 @@ pub fn list_menu(list: &ListView, archived: bool, tx: &Tx, select: bool) -> gtk:
             .build(move || tx.emit(Msg::AskDeleteList(href.clone())))
     };
     delete.set_sensitive(list.writable);
+    keep_inbox(&delete, list);
     items.push(delete.upcast());
     ui::menu(&items)
+}
+
+/// The inbox list can be neither archived nor deleted from the window: it
+/// is where new tasks go. Another list takes over with "Use as Inbox".
+fn keep_inbox(item: &gtk::Button, list: &ListView) {
+    if list.inbox {
+        item.set_sensitive(false);
+        item.set_tooltip_text(Some("New tasks go here"));
+    }
 }
 
 /// One row for each hidden view: a click appends it to the sidebar.
@@ -446,7 +465,7 @@ impl Sidebar {
             "{:?}{:?}",
             st.lists
                 .iter()
-                .map(|l| (&l.href, &l.name, &l.color, l.writable))
+                .map(|l| (&l.href, &l.name, &l.color, l.writable, l.inbox))
                 .collect::<Vec<_>>(),
             st.prefs.list_icons
         );
@@ -534,6 +553,15 @@ impl Sidebar {
         let tiles = self.tiles.borrow();
         if let Some(t) = tiles.iter().find(|t| &t.nav == nav) {
             show_tile_menu(&t.child, &t.nav, &t.hidden, &self.tx, middle(&t.child));
+        }
+    }
+
+    /// The menu of the row for list `href`, as a right-click opens it.
+    pub fn open_list_menu(&self, href: &str) {
+        let rows = self.rows.borrow();
+        if let Some(r) = rows.iter().find(|r| r.href == href) {
+            let at = gdk::Rectangle::new(r.row.width() / 2, r.row.height() / 2, 1, 1);
+            crate::row::show_at(&list_menu(&r.list, false, &self.tx, false), &r.row, at);
         }
     }
 
@@ -722,6 +750,7 @@ impl Sidebar {
             self.lists_box.append(&row);
             rows.push(ListRow {
                 href: l.href.clone(),
+                list: l.clone(),
                 row,
                 count,
                 link,
