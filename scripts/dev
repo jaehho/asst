@@ -11,10 +11,11 @@
 #   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
-#   scripts/dev keys [MOD+]KEY...  real key presses to the window, unfocused (Hyprland send_shortcut):
-#                                  `keys Tab h i SHIFT+Return CTRL+Return`. Goes to the main
-#                                  surface, so not into an open popover (those don't take focus here),
-#                                  unless `drive searchfocus` put the keyboard in its search field
+#   scripts/dev keys [MOD+]KEY...  real key presses to this instance's window, unfocused (Hyprland
+#                                  send_shortcut, aimed by the window's pid): `keys Tab h i
+#                                  SHIFT+Return CTRL+Return`. Goes to the main surface, so not
+#                                  into an open popover (those don't take focus here), unless
+#                                  `drive searchfocus` put the keyboard in its search field
 #   scripts/dev snap FILE.png      the window as a PNG; snap-popover for the open popover
 #   scripts/dev dump [FILE]        JSON state dump (default $DEV/dump.json; no FILE also prints it)
 #   scripts/dev texts [FILE]       what the window, an open dialog and popover show, as JSON:
@@ -22,8 +23,9 @@
 #                                  (default $DEV/texts.json)
 #   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>)
 #   scripts/dev reset              wipe this instance's state, then up and seed
-#   scripts/dev down [--all]       stop the window, the tray, asstd and the bus;
-#                                  --all also Radicale and stray target/debug bins.
+#   scripts/dev down [--all]       stop this instance's window, tray, asstd and bus, found on its
+#                                  bus, so other instances keep running. --all is the broom for
+#                                  every instance: all debug asst-gtk and asstd, and Radicale.
 #                                  The devel hyprctl window rule cannot be
 #                                  dropped and stays until a config reload.
 #
@@ -153,6 +155,28 @@ action() {
   on_bus
   gdbus call --session --dest dev.jaeho.Asst.Devel --object-path /dev/jaeho/Asst/Devel \
     --method org.gtk.Actions.Activate "$1" "[<'${2//\'/\\\'}'>]" "{}" > /dev/null
+}
+
+# The pid behind a name on this instance's bus, or nothing. This is how the
+# instance's own window, asstd and stand-ins are told from the other
+# instances': a window class or a pattern on a command line matches them all.
+bus_pid() {
+  [ -f "$DEV/bus" ] || return 0
+  # The reply reads `(uint32 12345,)`.
+  DBUS_SESSION_BUS_ADDRESS="$(cat "$DEV/bus")" gdbus call --session \
+    --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.GetConnectionUnixProcessID "$1" 2> /dev/null \
+    | sed -n 's/^(uint32 \([0-9][0-9]*\),)$/\1/p' || true
+}
+
+# Ends the process owning NAME on this instance's bus, if it is a COMM, and
+# waits for it to go so the next `up` does not meet a bus still closing.
+stop_on_bus() {
+  local pid _
+  pid="$(bus_pid "$1")"
+  [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid")" = "$2" ] || return 0
+  kill "$pid" 2> /dev/null || return 0
+  for _ in $(seq 40); do kill -0 "$pid" 2> /dev/null || return 0; sleep 0.1; done
 }
 
 radicale_up() {
@@ -295,7 +319,8 @@ CONF
     shift
     build
     on_bus
-    pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
+    # Only this instance's old window: a pattern would take the others'.
+    stop_on_bus dev.jaeho.Asst.Devel asst-gtk
     hide_window
     # Popovers stay open without keyboard focus (ASST_NO_AUTOHIDE).
     (env ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals \
@@ -321,10 +346,14 @@ CONF
   keys)
     shift
     live_hyprland || exit 1
+    # Every instance's window has the devel class, so the class would send
+    # the keys to all of them: aim at this instance's window by its pid.
+    pid="$(bus_pid dev.jaeho.Asst.Devel)"
+    [ -n "$pid" ] || { echo "no window on this instance's bus; run scripts/dev window" >&2; exit 1; }
     for k in "$@"; do
       mods="" key="$k"
       case "$k" in *+*) mods="${k%+*}"; key="${k##*+}"; mods="${mods//+/ }" ;; esac
-      hyprctl eval "hl.dispatch(hl.dsp.send_shortcut({mods=\"${mods}\", key=\"${key}\", window=\"class:^dev.jaeho.Asst.Devel\$\"}))" > /dev/null
+      hyprctl eval "hl.dispatch(hl.dsp.send_shortcut({mods=\"${mods}\", key=\"${key}\", window=\"pid:${pid}\"}))" > /dev/null
       sleep 0.05
     done
     ;;
@@ -355,7 +384,8 @@ CONF
     seed_tasks
     ;;
   reset)
-    "$0" down --all
+    # Not `down --all`: Radicale and the other instances stay as they are.
+    "$0" down
     rm -f "$DEV/config/asst/window.toml" "$DEV"/state/asst/asst.db*
     rm -rf "$DEV/notes"
     mkdir -p "$DEV/notes"
@@ -366,28 +396,27 @@ CONF
     "$0" seed
     ;;
   down)
-    pkill -f "^$BIN/asst-gtk( |$)" 2>/dev/null || true
-    pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
+    # Only what this instance runs, found by the names it owns on its bus.
+    # A pattern on the command line matches every instance's, and every
+    # worktree's, copy of the same binary. Asstd goes last: it and the
+    # notification stand-in are what keep the bus up.
+    stop_on_bus dev.jaeho.Asst.Devel asst-gtk
+    stop_on_bus org.kde.StatusNotifierWatcher python3
+    stop_on_bus org.freedesktop.Notifications python3
+    stop_on_bus dev.jaeho.Asst.Daemon asstd
     if [ "${2:-}" = "--all" ]; then
-      # Stray debug binaries and this instance's Radicale. The window rule
-      # from hide_window cannot be dropped (see its comment); it only
-      # matches the devel app id and dies with a Hyprland config reload.
+      # Every instance's stray debug binaries, and Radicale, which they
+      # share. The window rule from hide_window cannot be dropped (see its
+      # comment); it only matches the devel app id and dies with a
+      # Hyprland config reload.
       pkill -f "$BIN/asst-gtk" 2>/dev/null || true
       pkill -f "$BIN/asstd" 2>/dev/null || true
       pkill -f "target/debug/asst-gtk" 2>/dev/null || true
       pkill -f "target/debug/asstd" 2>/dev/null || true
+      pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
       pkill -f "$RADICALE/config" 2>/dev/null || true
     fi
-    if [ -f "$DEV/bus" ]; then
-      # The reply reads `(uint32 12345,)`.
-      pid="$( (on_bus && gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
-        --method org.freedesktop.DBus.GetConnectionUnixProcessID dev.jaeho.Asst.Daemon) 2>/dev/null \
-        | sed -n 's/^(uint32 \([0-9][0-9]*\),)$/\1/p')" || true
-      if [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid")" = asstd ]; then
-        kill "$pid"
-      fi
-      rm -f "$DEV/bus"
-    fi
+    rm -f "$DEV/bus"
     ;;
-  *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
