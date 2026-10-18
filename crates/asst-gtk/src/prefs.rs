@@ -201,6 +201,27 @@ impl Prefs {
         self.archived.iter().any(|a| a == href)
     }
 
+    /// Forget what is kept for a list that was deleted: its place in the
+    /// dragged order, its icon, its archive entry. `prefs.save` on `true`,
+    /// since the window writes this file whole. Only for a delete that
+    /// happened: a list missing from one response may be back in the next.
+    pub fn forget_list(&mut self, href: &str) -> bool {
+        let before = (
+            self.list_order.len(),
+            self.list_icons.len(),
+            self.archived.len(),
+        );
+        self.list_order.retain(|h| h != href);
+        self.list_icons.remove(href);
+        self.archived.retain(|h| h != href);
+        before
+            != (
+                self.list_order.len(),
+                self.list_icons.len(),
+                self.archived.len(),
+            )
+    }
+
     /// Drop day-plan slots whose task is no longer open. `prefs.save` on
     /// `true`, since the window writes this file whole.
     pub fn prune_plan(&mut self, live: &std::collections::HashSet<&str>) -> bool {
@@ -303,6 +324,30 @@ mod tests {
         assert!(p.prune_plan(&live));
         assert_eq!(p.plan.len(), 1);
         assert!(!p.prune_plan(&live));
+    }
+
+    #[test]
+    fn a_deleted_list_is_forgotten_and_the_others_kept() {
+        let mut p = Prefs {
+            list_order: vec!["/a/".into(), "/gone/".into(), "/b/".into()],
+            list_icons: [("/gone/", "flask"), ("/b/", "home")]
+                .map(|(h, i)| (h.to_string(), i.to_string()))
+                .into(),
+            archived: vec!["/gone/".into(), "/a/".into()],
+            ..Prefs::default()
+        };
+        assert!(p.forget_list("/gone/"));
+        assert_eq!(p.list_order, ["/a/", "/b/"]);
+        assert_eq!(p.list_icons.len(), 1);
+        assert_eq!(p.list_icons.get("/b/").map(String::as_str), Some("home"));
+        assert_eq!(p.archived, ["/a/"]);
+        // Nothing left to forget, nothing to save; an unknown list too
+        assert!(!p.forget_list("/gone/"));
+        assert!(!p.forget_list("/never/"));
+        // An entry in only one of the three is still found
+        p.archived.push("/c/".into());
+        assert!(p.forget_list("/c/"));
+        assert_eq!(p.archived, ["/a/"]);
     }
 
     #[test]

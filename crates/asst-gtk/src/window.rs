@@ -334,6 +334,8 @@ pub enum Cmd {
     LoginUrl(client::Result<String>),
     Settings(client::Result<Settings>),
     Toast(client::Result<String>),
+    /// A list was deleted on the server: its href, and what to say.
+    ListDeleted(String, client::Result<String>),
     Completed(String, client::Result<TaskView>),
     /// Whether it was added by leaving the add card, which says so.
     Added(bool, client::Result<Added>),
@@ -1680,11 +1682,10 @@ impl Component for Window {
                     self.nav = Nav::Today;
                 }
                 sender.oneshot_command(async move {
-                    Cmd::Toast(
-                        client::delete_list(&href)
-                            .await
-                            .map(|()| format!("Deleted {}", quoted(&name))),
-                    )
+                    let said = client::delete_list(&href)
+                        .await
+                        .map(|()| format!("Deleted {}", quoted(&name)));
+                    Cmd::ListDeleted(href, said)
                 });
             }
             Msg::AskDeleteCompleted(list) => {
@@ -2056,6 +2057,20 @@ impl Component for Window {
             Cmd::Toast(result) => match result {
                 Ok(text) if !text.is_empty() => toast(w, &text),
                 Ok(_) => {}
+                Err(e) => {
+                    toast(w, &e);
+                    self.reload(&sender);
+                }
+            },
+            Cmd::ListDeleted(href, result) => match result {
+                // Only a delete that went through forgets the list's place,
+                // icon and archive entry: a refused one leaves them be.
+                Ok(text) => {
+                    if self.prefs.forget_list(&href) {
+                        self.prefs.save();
+                    }
+                    toast(w, &text);
+                }
                 Err(e) => {
                     toast(w, &e);
                     self.reload(&sender);
@@ -3332,6 +3347,7 @@ impl Window {
     /// `shortcuts`, `about`, `newlist`, `scheme dark|light`, `size W H`,
     /// `click X Y`, `focus`, `unfocus`, `switch N`, `scroll PX`, `close-dialog`, `close-window`, `state`,
     /// `clear [list]` (asks), `clear! [list]`, `archive <list>`, `unarchive <list>`,
+    /// `delete-list <list>` (asks), `delete-list! <list>`,
     /// `order <list>,<list>`, `opts sort=name|desc=true|due=week|hide=<list>|reset`,
     /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
     /// `plan <words> at HH:MM [minutes]`, `planoff <words>`,
@@ -3365,6 +3381,15 @@ impl Window {
             "archive" | "unarchive" => {
                 if let Some(h) = list(arg) {
                     sender.input(Msg::Archive(h, verb == "archive"));
+                }
+            }
+            "delete-list" | "delete-list!" => {
+                if let Some(h) = list(arg) {
+                    if verb == "delete-list" {
+                        sender.input(Msg::AskDeleteList(h));
+                    } else {
+                        sender.input(Msg::DeleteList(h));
+                    }
                 }
             }
             "order" => {
