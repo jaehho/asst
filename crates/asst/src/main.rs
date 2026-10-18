@@ -85,8 +85,9 @@ enum Cmd {
         literal: bool,
     },
     /// Tie a list to a GitHub repo: its issues are synced both ways.
-    /// `asst link owner/repo` uses the list named for the repo, making it
-    /// if there is none; without arguments, show the ties
+    /// `asst link owner/repo` uses the list the repo is linked to, else the
+    /// list named for it, making that if there is none; without arguments,
+    /// show the ties
     Link {
         /// The list, or with no repo, `owner/repo`
         list: Option<String>,
@@ -573,6 +574,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         "{repo:?} is not owner/repo; `asst link <list> <owner/repo>` names the list"
                     );
                 }
+                // A repo already linked keeps its list, whatever that is
+                // called now: the link follows the repo, not the name.
+                let links: Vec<LinkView> = serde_json::from_str(&proxy.links().await?)?;
+                if let Some(linked) = link_of_repo(&links, repo) {
+                    let raw = proxy.link(&linked.list, &linked.repo).await?;
+                    if json {
+                        return show_json(&raw);
+                    }
+                    let l: LinkView = serde_json::from_str(&raw)?;
+                    println!("{} {} ⇄ {}", style.dim("Linked:"), l.name, l.repo);
+                    return Ok(());
+                }
                 let name = repo.split_once('/').map_or(repo, |(_, n)| n);
                 let lists: Vec<ListView> = serde_json::from_str(&proxy.lists().await?)?;
                 let existing = lists
@@ -915,6 +928,11 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
     Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
+/// The link that already ties `repo` (GitHub names ignore case) to a list.
+fn link_of_repo<'a>(links: &'a [LinkView], repo: &str) -> Option<&'a LinkView> {
+    links.iter().find(|l| l.repo.eq_ignore_ascii_case(repo))
+}
+
 fn print_status(style: &Style, s: &StatusView) {
     match (&s.username, &s.server) {
         (Some(u), Some(server)) => println!("Signed in as {u} on {server}"),
@@ -1042,5 +1060,33 @@ fn track_run(cmd: TrackCmd, as_json: bool) -> anyhow::Result<()> {
             print!("{}", track::suggest_rules(&report.spans));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(repo: &str, name: &str) -> LinkView {
+        LinkView {
+            repo: repo.into(),
+            list: format!("/cal/{name}/"),
+            name: name.into(),
+            synced: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_linked_repo_keeps_its_list_whatever_it_is_called() {
+        // The repo was renamed, the list was not: the name would not find it
+        let links = [
+            link("jaehho/lab", "champalimaud"),
+            link("jaehho/dash", "dash"),
+        ];
+        assert_eq!(link_of_repo(&links, "jaehho/lab"), Some(&links[0]));
+        assert_eq!(link_of_repo(&links, "Jaehho/Dash"), Some(&links[1]));
+        assert_eq!(link_of_repo(&links, "jaehho/other"), None);
+        assert_eq!(link_of_repo(&[], "jaehho/lab"), None);
     }
 }

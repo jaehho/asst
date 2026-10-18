@@ -862,14 +862,24 @@ impl Daemon {
         if !l.writable {
             return Err(StoreError::ReadOnly(l.name).into());
         }
-        if let Some((other, _)) = store
-            .gh_links()?
-            .into_iter()
-            .find(|(r, href)| *href == l.href && r != repo)
-        {
+        let links = store.gh_links()?;
+        if let Some((other, _)) = links.iter().find(|(r, href)| *href == l.href && r != repo) {
             return Err(Error::Invalid(format!(
                 "{} is linked to {other}; unlink it first",
                 l.name
+            )));
+        }
+        // The store would move the link and drop its pairs, which name the
+        // other list's tasks. Moving is the owner's call: unlink first.
+        if let Some((other, href)) = links
+            .iter()
+            .find(|(r, href)| r.eq_ignore_ascii_case(repo) && *href != l.href)
+        {
+            let name = store
+                .find_list(href)
+                .map_or_else(|_| href.clone(), |o| o.name);
+            return Err(Error::Invalid(format!(
+                "{other} is linked to {name}; unlink it first"
             )));
         }
         store.gh_link(repo, &l.href)?;
@@ -1324,9 +1334,34 @@ mod tests {
         }
         let l = daemon.link("work", "jaehho/asst").unwrap();
         assert_eq!((l.repo.as_str(), l.name.as_str()), ("jaehho/asst", "Work"));
+        let pair = github::Pair {
+            number: 7,
+            uid: "uid-7".into(),
+            title: "One".into(),
+            open: true,
+            body: None,
+            priority: 0,
+        };
+        daemon.store().gh_pair("jaehho/asst", &pair).unwrap();
         // Again is nothing new; another repo for the same list is refused
         daemon.link("work", "jaehho/asst").unwrap();
         assert!(daemon.link("work", "jaehho/other").is_err());
+        // So is the same repo for another list, in any case: the store
+        // would move the link and drop its pairs, so unlink comes first
+        for typed in ["jaehho/asst", "Jaehho/ASST"] {
+            let err = daemon.link("home", typed).unwrap_err().to_string();
+            assert_eq!(err, "jaehho/asst is linked to Work; unlink it first");
+        }
+        assert_eq!(
+            daemon.links().unwrap().len(),
+            1,
+            "the refused call changed no link"
+        );
+        assert_eq!(
+            daemon.store().gh_pairs("jaehho/asst").unwrap(),
+            [pair],
+            "and dropped no pair"
+        );
         daemon.link("home", "jaehho/other").unwrap();
         let names: Vec<(String, String)> = daemon
             .links()
