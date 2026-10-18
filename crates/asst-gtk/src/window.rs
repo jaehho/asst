@@ -217,8 +217,13 @@ pub enum Msg {
     /// A list's completed tasks, or every list's: ask first.
     AskDeleteCompleted(Option<String>),
     DeleteCompleted(Option<String>),
-    /// Lists dragged into a new order (hrefs, top to bottom).
+    /// Lists dragged into a new order (hrefs, top to bottom): the ones on
+    /// show trade the places they held, the others keep theirs.
     ReorderLists(Vec<String>),
+    /// Sort A-Z, once; the Undo is `SetListOrder`.
+    SortLists,
+    /// Put back an order as it was saved, and whether it was by name.
+    SetListOrder(Vec<String>, bool),
     /// Put a list away, or bring it back.
     Archive(String, bool),
     /// A list's open tasks to the clipboard, as Markdown.
@@ -1869,7 +1874,26 @@ impl Component for Window {
                 });
             }
             Msg::ReorderLists(order) => {
+                let shown = self.shown_list_hrefs();
+                self.prefs.reorder_lists(&self.lists, &shown, &order);
+                self.prefs.save();
+            }
+            Msg::SortLists => {
+                let (order, by_name) = (self.prefs.list_order.clone(), self.prefs.lists_by_name);
+                let shown = self.prefs.arrange(&self.lists);
+                self.prefs.sort_lists_by_name(&self.lists, &shown);
+                self.prefs.save();
+                self.undo_toast(
+                    w,
+                    &tx,
+                    "Lists sorted A-Z.",
+                    Msg::SetListOrder(order, by_name),
+                    6,
+                );
+            }
+            Msg::SetListOrder(order, by_name) => {
                 self.prefs.list_order = order;
+                self.prefs.lists_by_name = by_name;
                 self.prefs.save();
             }
             Msg::Archive(href, on) => {
@@ -3029,6 +3053,15 @@ impl Window {
         self.edit_toast(w, toast);
     }
 
+    /// The lists on show in the sidebar, top to bottom.
+    fn shown_list_hrefs(&self) -> Vec<String> {
+        self.prefs
+            .arrange(&self.lists)
+            .into_iter()
+            .map(|l| l.href)
+            .collect()
+    }
+
     fn nav_order(&self) -> Vec<Nav> {
         let mut navs = self.prefs.sidebar_views();
         navs.extend(
@@ -3669,10 +3702,18 @@ impl Window {
                     }
                 }
             }
+            // The named lists first, the rest of those on show after them.
             "order" => {
-                let order: Vec<String> = arg.split(',').filter_map(list).collect();
+                let mut order: Vec<String> = arg.split(',').filter_map(list).collect();
+                let rest: Vec<String> = self
+                    .shown_list_hrefs()
+                    .into_iter()
+                    .filter(|h| !order.contains(h))
+                    .collect();
+                order.extend(rest);
                 sender.input(Msg::ReorderLists(order));
             }
+            "sort-lists" => sender.input(Msg::SortLists),
             "opts" => {
                 let mut opts = self.prefs.view_opts(&self.nav);
                 match arg.split_once('=') {

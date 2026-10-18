@@ -432,10 +432,79 @@ impl Prefs {
                     .position(|h| *h == l.href)
                     .unwrap_or(usize::MAX)
             };
-            // Stable: lists never dragged keep the server's order among them.
-            out.sort_by_key(place);
+            // Lists never dragged follow by name, not in the order the
+            // server happens to answer in.
+            out.sort_by(|a, b| {
+                place(a)
+                    .cmp(&place(b))
+                    .then_with(|| crate::model::natural_cmp(&a.name, &b.name))
+            });
         }
         out
+    }
+
+    /// Dragging made `shown_before` into `shown_after` (hrefs, top to
+    /// bottom). `list_order` also holds lists that are not on screen
+    /// (archived ones, a list that a response left out) and so must not be
+    /// replaced by what is: each of those keeps its place, and the lists
+    /// shown trade the places they held among themselves. Nothing is
+    /// pruned, since a list missing from one response may be back in the
+    /// next; `forget_list` is for a delete that happened.
+    ///
+    /// `list_order` becomes every list there is, so that the places exist to
+    /// be kept: the ones it held, then the rest in name order, which is the
+    /// order they were shown in. A drag writes the lists by order, so
+    /// `lists_by_name` is off.
+    pub fn reorder_lists(
+        &mut self,
+        all: &[ListView],
+        shown_before: &[String],
+        shown_after: &[String],
+    ) {
+        let mut rest: Vec<&ListView> = all.iter().collect();
+        rest.sort_by(|a, b| crate::model::natural_cmp(&a.name, &b.name));
+        let mut full: Vec<String> = Vec::new();
+        for href in self
+            .list_order
+            .iter()
+            .cloned()
+            .chain(rest.into_iter().map(|l| l.href.clone()))
+        {
+            if !full.contains(&href) {
+                full.push(href);
+            }
+        }
+        // A response that came in during the drag may have added a list or
+        // taken one away or archived it. What it did not know is not
+        // moved: the new order is cut down to lists that are on screen now
+        // and hold a place, and every other place stays.
+        let mut moved: Vec<String> = Vec::new();
+        for href in shown_after {
+            if shown_before.contains(href) && full.contains(href) && !moved.contains(href) {
+                moved.push(href.clone());
+            }
+        }
+        let mut next = moved.clone().into_iter();
+        for place in &mut full {
+            if moved.contains(place)
+                && let Some(href) = next.next()
+            {
+                *place = href;
+            }
+        }
+        self.list_order = full;
+        self.lists_by_name = false;
+    }
+
+    /// Sort A-Z: the lists in `shown` by name, as people read it (case
+    /// aside, "Work 9" before "Work 10"). The places of lists out of sight
+    /// stay, as in a drag, and the order is the sidebar's own from now on.
+    pub fn sort_lists_by_name(&mut self, all: &[ListView], shown: &[ListView]) {
+        let before: Vec<String> = shown.iter().map(|l| l.href.clone()).collect();
+        let mut sorted: Vec<&ListView> = shown.iter().collect();
+        sorted.sort_by(|a, b| crate::model::natural_cmp(&a.name, &b.name));
+        let after: Vec<String> = sorted.into_iter().map(|l| l.href.clone()).collect();
+        self.reorder_lists(all, &before, &after);
     }
 }
 
@@ -988,9 +1057,8 @@ day_zoom = 52.0
         assert_eq!(p.archived, ["/a/"]);
     }
 
-    #[test]
-    fn lists_in_dragged_order_or_by_name() {
-        let list = |href: &str, name: &str| ListView {
+    fn list(href: &str, name: &str) -> ListView {
+        ListView {
             href: href.into(),
             name: name.into(),
             color: None,
@@ -998,23 +1066,259 @@ day_zoom = 52.0
             inbox: false,
             open: 0,
             done: 0,
-        };
+        }
+    }
+
+    fn names(lists: Vec<ListView>) -> Vec<String> {
+        lists.into_iter().map(|l| l.name).collect()
+    }
+
+    fn hrefs(lists: &[ListView]) -> Vec<String> {
+        lists.iter().map(|l| l.href.clone()).collect()
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn lists_in_dragged_order_or_by_name() {
         let lists = [
             list("/a/", "Work 10"),
             list("/b/", "Home"),
             list("/c/", "Work 9"),
             list("/d/", "Old"),
         ];
-        let names = |v: Vec<ListView>| v.into_iter().map(|l| l.name).collect::<Vec<_>>();
         let mut p = Prefs {
             archived: vec!["/d/".into()],
             ..Prefs::default()
         };
-        assert_eq!(names(p.arrange(&lists)), ["Work 10", "Home", "Work 9"]);
+        // Never dragged: by name, "Work 9" before "Work 10".
+        assert_eq!(names(p.arrange(&lists)), ["Home", "Work 9", "Work 10"]);
         p.list_order = vec!["/c/".into(), "/a/".into()];
         assert_eq!(names(p.arrange(&lists)), ["Work 9", "Work 10", "Home"]);
         p.lists_by_name = true;
         assert_eq!(names(p.arrange(&lists)), ["Home", "Work 9", "Work 10"]);
+    }
+
+    #[test]
+    fn unsaved_lists_follow_in_name_order() {
+        // The order Radicale answers in: capitals first.
+        let lists = [
+            list("/errands/", "Errands"),
+            list("/groceries/", "Groceries"),
+            list("/inbox/", "Inbox"),
+            list("/lab/", "Lab"),
+            list("/work/", "Work"),
+            list("/asst/", "asst"),
+            list("/dotfiles/", "dotfiles"),
+        ];
+        let mut p = Prefs::default();
+        assert_eq!(
+            names(p.arrange(&lists)),
+            [
+                "asst",
+                "dotfiles",
+                "Errands",
+                "Groceries",
+                "Inbox",
+                "Lab",
+                "Work"
+            ]
+        );
+        // The ones with a place come first, in it; the rest follow by name.
+        p.list_order = strings(&["/work/", "/gone/", "/lab/"]);
+        assert_eq!(
+            names(p.arrange(&lists)),
+            [
+                "Work",
+                "Lab",
+                "asst",
+                "dotfiles",
+                "Errands",
+                "Groceries",
+                "Inbox"
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_by_name_true_still_orders_by_name() {
+        let lists = [list("/z/", "Zed"), list("/a/", "Ant"), list("/m/", "mid")];
+        let mut p = Prefs {
+            lists_by_name: true,
+            list_order: strings(&["/z/", "/m/", "/a/"]),
+            ..Prefs::default()
+        };
+        assert_eq!(names(p.arrange(&lists)), ["Ant", "mid", "Zed"]);
+        // The key is still read and written as it was.
+        let again = parse(&toml::to_string(&p).unwrap());
+        assert!(again.lists_by_name);
+        assert_eq!(again.list_order, p.list_order);
+        // A drag sets the order down and turns the flag off, whatever the
+        // order the lists were on show in.
+        let shown = p.arrange(&lists);
+        let after = strings(&["/z/", "/a/", "/m/"]);
+        p.reorder_lists(&lists, &hrefs(&shown), &after);
+        assert!(!p.lists_by_name);
+        assert_eq!(names(p.arrange(&lists)), ["Zed", "Ant", "mid"]);
+    }
+
+    #[test]
+    fn the_splice_trades_the_places_of_the_lists_shown() {
+        // `X` is not on show (archived); the others are dragged around it.
+        let lists = [
+            list("/a/", "a"),
+            list("/x/", "X"),
+            list("/b/", "b"),
+            list("/c/", "c"),
+        ];
+        let mut p = Prefs {
+            list_order: strings(&["/a/", "/x/", "/b/", "/c/"]),
+            archived: strings(&["/x/"]),
+            ..Prefs::default()
+        };
+        p.reorder_lists(
+            &lists,
+            &strings(&["/a/", "/b/", "/c/"]),
+            &strings(&["/c/", "/a/", "/b/"]),
+        );
+        assert_eq!(p.list_order, ["/c/", "/x/", "/a/", "/b/"]);
+        assert_eq!(names(p.arrange(&lists)), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn a_drag_keeps_the_places_of_lists_not_shown() {
+        // The shape of the real file: an order that names one list and a
+        // stale entry no list has, an archived list.
+        let lists = [
+            list("/inbox/", "Inbox"),
+            list("/mail/", "mail-digest"),
+            list("/work/", "Work"),
+            list("/asst/", "asst"),
+            list("/dot/", "dotfiles"),
+        ];
+        let mut p = Prefs {
+            list_order: strings(&["/inbox/", "/tasks/"]),
+            archived: strings(&["/mail/"]),
+            ..Prefs::default()
+        };
+        let shown = p.arrange(&lists);
+        assert_eq!(names(shown.clone()), ["Inbox", "asst", "dotfiles", "Work"]);
+
+        // Work to the top.
+        let after = strings(&["/work/", "/inbox/", "/asst/", "/dot/"]);
+        p.reorder_lists(&lists, &hrefs(&shown), &after);
+        assert_eq!(
+            p.list_order,
+            ["/work/", "/tasks/", "/inbox/", "/asst/", "/mail/", "/dot/"]
+        );
+        assert_eq!(
+            names(p.arrange(&lists)),
+            ["Work", "Inbox", "asst", "dotfiles"]
+        );
+
+        // The archived list is where it was left: bring it back and it is
+        // in its place, between asst and dotfiles.
+        p.archived.clear();
+        assert_eq!(
+            names(p.arrange(&lists)),
+            ["Work", "Inbox", "asst", "mail-digest", "dotfiles"]
+        );
+        // The stale entry stays too, never pruned.
+        assert!(p.list_order.contains(&"/tasks/".to_string()));
+    }
+
+    #[test]
+    fn a_drag_that_lost_a_race_moves_only_what_is_still_shown() {
+        let lists = [
+            list("/a/", "a"),
+            list("/b/", "b"),
+            list("/c/", "c"),
+            list("/n/", "new"),
+        ];
+        let mut p = Prefs {
+            list_order: strings(&["/a/", "/b/", "/c/", "/n/"]),
+            ..Prefs::default()
+        };
+        // Dragged from a sidebar that did not have `new` yet, and that had
+        // `gone`; `b` is named twice. The order stays a permutation: no list
+        // lost or doubled, and `new` keeps its place.
+        p.reorder_lists(
+            &lists,
+            &strings(&["/a/", "/b/", "/c/", "/n/"]),
+            &strings(&["/c/", "/gone/", "/b/", "/a/", "/b/"]),
+        );
+        assert_eq!(p.list_order, ["/c/", "/b/", "/a/", "/n/"]);
+
+        // A list archived since is not moved either.
+        let mut q = Prefs {
+            list_order: strings(&["/a/", "/b/", "/c/"]),
+            archived: strings(&["/b/"]),
+            ..Prefs::default()
+        };
+        q.reorder_lists(
+            &lists,
+            &strings(&["/a/", "/c/"]),
+            &strings(&["/c/", "/b/", "/a/"]),
+        );
+        assert_eq!(&q.list_order[..3], ["/c/", "/b/", "/a/"]);
+    }
+
+    #[test]
+    fn a_deleted_list_leaves_the_places_of_the_others() {
+        let lists = [list("/a/", "a"), list("/b/", "b"), list("/c/", "c")];
+        let mut p = Prefs::default();
+        p.reorder_lists(
+            &lists,
+            &strings(&["/a/", "/b/", "/c/"]),
+            &strings(&["/c/", "/a/", "/b/"]),
+        );
+        assert_eq!(p.list_order, ["/c/", "/a/", "/b/"]);
+        // A delete that happened takes the place with it, and the others
+        // stay as they were.
+        assert!(p.forget_list("/a/"));
+        assert_eq!(p.list_order, ["/c/", "/b/"]);
+        let rest = [list("/b/", "b"), list("/c/", "c")];
+        assert_eq!(names(p.arrange(&rest)), ["c", "b"]);
+    }
+
+    #[test]
+    fn sort_a_to_z_is_case_blind_natural_and_clears_the_by_name_flag() {
+        let lists = [
+            list("/w10/", "Work 10"),
+            list("/e/", "Errands"),
+            list("/w9/", "work 9"),
+            list("/a/", "asst"),
+            list("/x/", "Archived one"),
+        ];
+        for by_name in [false, true] {
+            let mut p = Prefs {
+                lists_by_name: by_name,
+                list_order: strings(&["/w10/", "/x/", "/e/", "/w9/", "/a/"]),
+                archived: strings(&["/x/"]),
+                ..Prefs::default()
+            };
+            let shown = p.arrange(&lists);
+            p.sort_lists_by_name(&lists, &shown);
+            assert!(!p.lists_by_name);
+            // "asst" before "Errands" though a capital sorts first as bytes,
+            // and "work 9" before "Work 10".
+            assert_eq!(
+                names(p.arrange(&lists)),
+                ["asst", "Errands", "work 9", "Work 10"]
+            );
+            // The archived list kept its place among the slots.
+            assert_eq!(p.list_order, ["/a/", "/x/", "/e/", "/w9/", "/w10/"]);
+        }
+        // Sorting what is sorted changes nothing.
+        let mut p = Prefs::default();
+        let shown = p.arrange(&lists);
+        p.sort_lists_by_name(&lists, &shown);
+        let sorted = p.list_order.clone();
+        let shown = p.arrange(&lists);
+        p.sort_lists_by_name(&lists, &shown);
+        assert_eq!(p.list_order, sorted);
     }
 
     #[test]

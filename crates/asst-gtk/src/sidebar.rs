@@ -438,17 +438,16 @@ impl Sidebar {
 
         let signed_in = st.status.is_some_and(|s| s.state != SyncState::NoAccount);
         let lists_key = format!(
-            "{:?}{}{:?}",
+            "{:?}{:?}",
             st.lists
                 .iter()
                 .map(|l| (&l.href, &l.name, &l.color, l.writable))
                 .collect::<Vec<_>>(),
-            st.prefs.lists_by_name,
             st.prefs.list_icons
         );
         if *self.lists_key.borrow() != lists_key {
             *self.lists_key.borrow_mut() = lists_key;
-            self.build_lists(st.lists, !st.prefs.lists_by_name);
+            self.build_lists(st.lists);
         }
         for r in self.rows.borrow().iter() {
             let n = st.counts.lists.get(&r.href).copied().unwrap_or(0);
@@ -655,8 +654,9 @@ impl Sidebar {
         *self.tiles.borrow_mut() = tiles;
     }
 
-    /// `movable`: lists can be dragged into a new order (not sorted by name).
-    fn build_lists(&self, lists: &[ListView], movable: bool) {
+    /// Dragging a row works whether the lists were last put in order by hand
+    /// or by name: a drop sets the order down and the by-name flag off.
+    fn build_lists(&self, lists: &[ListView]) {
         self.lists_box.remove_all();
         let mut rows = Vec::new();
         let order: Rc<Vec<String>> = Rc::new(lists.iter().map(|l| l.href.clone()).collect());
@@ -682,20 +682,18 @@ impl Sidebar {
             let row = gtk::ListBoxRow::new();
             row.add_css_class("list-row");
             row.set_child(Some(&line));
-            if movable {
-                let drag = gtk::DragSource::new();
-                drag.set_actions(gdk::DragAction::MOVE);
-                let payload = format!("{LIST_PREFIX}{}", l.href);
-                drag.connect_prepare(move |_, _, _| {
-                    Some(gdk::ContentProvider::for_value(&payload.to_value()))
-                });
-                drag.connect_drag_begin(|src, _| {
-                    if let Some(w) = src.widget() {
-                        src.set_icon(Some(&gtk::WidgetPaintable::new(Some(&w))), 12, 12);
-                    }
-                });
-                row.add_controller(drag);
-            }
+            let drag = gtk::DragSource::new();
+            drag.set_actions(gdk::DragAction::MOVE);
+            let payload = format!("{LIST_PREFIX}{}", l.href);
+            drag.connect_prepare(move |_, _, _| {
+                Some(gdk::ContentProvider::for_value(&payload.to_value()))
+            });
+            drag.connect_drag_begin(|src, _| {
+                if let Some(w) = src.widget() {
+                    src.set_icon(Some(&gtk::WidgetPaintable::new(Some(&w))), 12, 12);
+                }
+            });
+            row.add_controller(drag);
             self.list_drops(&row, l, order.clone());
             let menu_click = gtk::GestureClick::builder()
                 .button(gdk::BUTTON_SECONDARY)
