@@ -354,8 +354,17 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
         ),
     ];
     // What the keycaps cannot draw, said under their row: the wheel is
-    // no accelerator, and Adwaita warns and stops drawing at one.
-    let notes = [("Zoom the day grid", "Or hold Ctrl and scroll")];
+    // no accelerator, and Adwaita warns and stops drawing at one. And the
+    // focus rule, which the task keys on the sheet all follow.
+    let notes = [
+        ("Zoom the day grid", "Or hold Ctrl and scroll"),
+        (
+            "Complete or reopen",
+            "Task keys work in the task list. On a tile or button, Space presses it. \
+             While selecting, x and Space tick the task instead.",
+        ),
+        ("Complete the block", "The same rule as for tasks"),
+    ];
     for (title, items) in sections {
         let section = adw::ShortcutsSection::new(Some(title));
         for (what, keys) in items {
