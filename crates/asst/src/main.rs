@@ -665,21 +665,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     return show_json(&raw);
                 }
                 let links: Vec<LinkView> = serde_json::from_str(&raw)?;
-                if links.is_empty() {
-                    println!(
-                        "{}",
-                        style.dim("no list is linked; `asst link <list> <owner/repo>`")
-                    );
-                }
-                for l in &links {
-                    println!("{} ⇄ {}", l.name, l.repo);
-                    if let Some(note) = out::link_note(&style, l) {
-                        println!("{note}");
-                    }
-                }
-                if let Some(hint) = out::links_hint(&style, &links) {
-                    println!("{hint}");
-                }
+                println!("{}", out::links_text(&style, &links));
             }
         },
         Cmd::Unlink { repo } => {

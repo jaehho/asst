@@ -137,6 +137,21 @@ pub fn links_hint(s: &Style, links: &[LinkView]) -> Option<String> {
     needing_a_look(links).map(|hint| s.dim(&format!("{hint}: asst projects")))
 }
 
+/// `asst link` with no arguments: each link, the note of one that needs a
+/// look under it, and the hint at `asst projects` after the last.
+pub fn links_text(s: &Style, links: &[LinkView]) -> String {
+    if links.is_empty() {
+        return s.dim("no list is linked; `asst link <list> <owner/repo>`");
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for l in links {
+        lines.push(format!("{} ⇄ {}", l.name, l.repo));
+        lines.extend(link_note(s, l));
+    }
+    lines.extend(links_hint(s, links));
+    lines.join("\n")
+}
+
 /// The GitHub line of `asst status`, when any link needs a look: how many,
 /// and which (`archived: jaehho/mail-digest`).
 pub fn links_status(s: &Style, links: &[LinkView]) -> Option<String> {
@@ -438,6 +453,54 @@ mod tests {
             links_status(&color, &[archived, stuck])
                 .unwrap()
                 .starts_with("\x1b[33m")
+        );
+    }
+
+    #[test]
+    fn the_listing_of_links_as_the_terminal_shows_it() {
+        let mut links: Vec<LinkView> = [
+            ("asst", "jaehho/asst", None, ""),
+            (
+                "battery-log",
+                "jaehho/battery-log",
+                Some(LinkState::Archived),
+                "archived on GitHub, first seen 2026-10-18; no open tasks here",
+            ),
+            (
+                "wallhelper",
+                "jaehho/wallhelper",
+                Some(LinkState::Unreachable),
+                "GitHub cannot find it: deleted, or the token cannot see it",
+            ),
+            ("wombat", "jaehho/wombat", None, ""),
+        ]
+        .into_iter()
+        .map(|(name, repo, state, note)| LinkView {
+            name: name.into(),
+            ..link(repo, state, note)
+        })
+        .collect();
+        assert_eq!(
+            links_text(&plain(), &links),
+            "\
+asst ⇄ jaehho/asst
+battery-log ⇄ jaehho/battery-log
+  archived on GitHub, first seen 2026-10-18; no open tasks here
+wallhelper ⇄ jaehho/wallhelper
+  GitHub cannot find it: deleted, or the token cannot see it
+wombat ⇄ jaehho/wombat
+2 links need a look: asst projects"
+        );
+
+        // All well: the links and nothing else
+        links.retain(|l| l.state.is_none());
+        assert_eq!(
+            links_text(&plain(), &links),
+            "asst ⇄ jaehho/asst\nwombat ⇄ jaehho/wombat"
+        );
+        assert_eq!(
+            links_text(&plain(), &[]),
+            "no list is linked; `asst link <list> <owner/repo>`"
         );
     }
 
