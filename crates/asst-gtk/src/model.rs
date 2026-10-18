@@ -1584,19 +1584,23 @@ pub fn issue_repo(url: &str) -> Option<String> {
     (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
-/// Where a repo is checked out: its name under the projects folder
-/// (`~` in it is the home folder).
-pub fn checkout_dir(projects: &str, repo: &str, home: &str) -> std::path::PathBuf {
+/// The projects folder as a path: `~` in it is the home folder, and none
+/// typed is `~/projects`.
+pub fn projects_dir(projects: &str, home: &str) -> std::path::PathBuf {
     let projects = match projects.trim() {
         "" => "~/projects",
         p => p,
     };
-    let projects = match projects.strip_prefix('~') {
-        Some(rest) => format!("{home}{rest}"),
-        None => projects.to_string(),
-    };
+    match projects.strip_prefix('~') {
+        Some(rest) => format!("{home}{rest}").into(),
+        None => projects.into(),
+    }
+}
+
+/// Where a repo is checked out: its name under the projects folder.
+pub fn checkout_dir(projects: &str, repo: &str, home: &str) -> std::path::PathBuf {
     let name = repo.rsplit('/').next().unwrap_or(repo);
-    std::path::Path::new(&projects).join(name)
+    projects_dir(projects, home).join(name)
 }
 
 /// The command to run for "start work": `template` with `{dir}`, `{repo}`,
@@ -2578,6 +2582,12 @@ mod tests {
         assert_eq!(
             checkout_dir("/srv/src", "jaehho/asst", "/home/jaeho"),
             std::path::PathBuf::from("/srv/src/asst")
+        );
+        // Preferences checks the folder the same way Start work reads it,
+        // so an empty field is the default one.
+        assert_eq!(
+            projects_dir(" ", "/home/jaeho"),
+            std::path::PathBuf::from("/home/jaeho/projects")
         );
         assert_eq!(
             work_command(

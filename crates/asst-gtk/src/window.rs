@@ -390,6 +390,11 @@ pub enum Cmd {
     LoginDone(bool, String),
     LoginUrl(client::Result<String>),
     Settings(client::Result<Settings>),
+    /// The daemon's settings for Preferences, which opens with them.
+    Preferences(client::Result<Settings>),
+    /// The daemon refused a change to its settings: why, and the settings
+    /// it has.
+    Refused(String, Option<Settings>),
     Toast(client::Result<String>),
     /// A list was deleted on the server: its href, and what to say.
     ListDeleted(String, client::Result<String>),
@@ -544,6 +549,9 @@ pub struct Widgets {
     more_button: gtk::MenuButton,
     /// Up while running in the background.
     tray: Option<Rc<Tray>>,
+    /// The Preferences dialog last opened, to say in it what the daemon
+    /// refused.
+    preferences: Option<settings::Open>,
     /// Set once what was waiting has been sent, so the window can go.
     quitting: Rc<Cell<bool>>,
 }
@@ -1144,6 +1152,7 @@ impl Component for Window {
             view_button,
             more_button,
             tray,
+            preferences: None,
             quitting,
         };
         if let Some(old) = migrated {
@@ -1730,7 +1739,7 @@ impl Component for Window {
                     return;
                 };
                 if self.prefs.work_command.trim().is_empty() {
-                    toast(w, "Set what Start work runs in Preferences → GitHub");
+                    toast(w, "Set what Start work runs in Preferences → More options");
                     return;
                 }
                 let home = std::env::var("HOME").unwrap_or_default();
@@ -1739,7 +1748,7 @@ impl Component for Window {
                     toast(
                         w,
                         &format!(
-                            "No checkout of {repo} at {} (Preferences → GitHub)",
+                            "No checkout of {repo} at {} (Preferences → More options)",
                             dir.display()
                         ),
                     );
@@ -2062,16 +2071,17 @@ impl Component for Window {
                 }
             }
             Msg::Preferences => {
-                settings::open(
-                    &w.window,
-                    settings::Ctx {
-                        settings: self.settings.clone(),
-                        lists: self.lists.clone(),
-                        status: w.status.clone(),
-                        prefs: self.prefs.clone(),
-                    },
-                    tx.clone(),
-                );
+                if w.preferences.as_ref().is_some_and(settings::Open::is_up) {
+                    return;
+                }
+                // What the daemon has now, not what this window last heard;
+                // one that is slow to answer must not hold the dialog back.
+                sender.oneshot_command(async {
+                    let fresh = tokio::time::timeout(Duration::from_secs(2), client::settings())
+                        .await
+                        .unwrap_or_else(|_| Err("asstd isn't answering".into()));
+                    Cmd::Preferences(fresh)
+                });
             }
             Msg::Shortcuts => dialogs::shortcuts(&w.window),
             Msg::About => dialogs::about(&w.window),
@@ -2141,7 +2151,11 @@ impl Component for Window {
             }
             Msg::SetSettings(change) => {
                 sender.oneshot_command(async move {
-                    Cmd::Settings(client::set_settings(&change).await)
+                    match client::set_settings(&change).await {
+                        Ok(s) => Cmd::Settings(Ok(s)),
+                        // What it has now, for the controls to go back to.
+                        Err(e) => Cmd::Refused(e, client::settings().await.ok()),
+                    }
                 });
             }
             Msg::SignIn(server) => {
@@ -2303,30 +2317,50 @@ impl Component for Window {
                 }
             },
             Cmd::Settings(result) => match result {
-                Ok(s) => {
-                    // Another list is the inbox: the Inbox view, its tile's
-                    // list and the add card's chip are all of the old one
-                    // until the lists are read again.
-                    let moved = self
-                        .settings
-                        .as_ref()
-                        .is_some_and(|old| old.inbox != s.inbox);
-                    self.settings = Some(s);
-                    if moved {
-                        self.reload(&sender);
-                    }
-                }
+                Ok(s) => self.take_settings(s, &sender),
                 Err(e) => {
                     if self.settings.is_some() {
-                        // The change it answers may have a toast saying it
-                        // happened.
-                        if let Some(last) = self.edit_toast.take() {
-                            last.dismiss();
-                        }
                         toast(w, &e);
                     }
                 }
             },
+            Cmd::Preferences(result) => {
+                // Asked twice before the first answer: one dialog.
+                if w.preferences.as_ref().is_some_and(settings::Open::is_up) {
+                    return;
+                }
+                // Unanswered, the dialog opens on the last copy.
+                if let Ok(s) = result {
+                    self.take_settings(s, &sender);
+                }
+                w.preferences = Some(settings::open(
+                    &w.window,
+                    settings::Ctx {
+                        settings: self.settings.clone(),
+                        status: w.status.clone(),
+                        prefs: self.prefs.clone(),
+                        linked: !self.links.is_empty(),
+                    },
+                    tx.clone(),
+                ));
+            }
+            Cmd::Refused(why, daemon) => {
+                if let Some(s) = daemon {
+                    self.take_settings(s, &sender);
+                }
+                let said = w
+                    .preferences
+                    .as_ref()
+                    .is_some_and(|p| p.refused(&why, self.settings.as_ref()));
+                if !said {
+                    // The change it answers may have a toast saying it
+                    // happened.
+                    if let Some(last) = self.edit_toast.take() {
+                        last.dismiss();
+                    }
+                    toast(w, &why);
+                }
+            }
             Cmd::Toast(result) => match result {
                 Ok(text) if !text.is_empty() => toast(w, &text),
                 Ok(_) => {}
@@ -2643,6 +2677,21 @@ impl Window {
 
     fn needs_completed(&self) -> bool {
         self.nav == Nav::Completed || self.prefs.view_opts(&self.nav).show_completed
+    }
+
+    /// The daemon's settings as it has them now.
+    fn take_settings(&mut self, s: Settings, sender: &ComponentSender<Self>) {
+        // Another list is the inbox: the Inbox view, its tile's list and
+        // the add card's chip are all of the old one until the lists are
+        // read again.
+        let moved = self
+            .settings
+            .as_ref()
+            .is_some_and(|old| old.inbox != s.inbox);
+        self.settings = Some(s);
+        if moved {
+            self.reload(sender);
+        }
     }
 
     fn reload(&mut self, sender: &ComponentSender<Self>) {
@@ -4235,6 +4284,16 @@ impl Window {
                 }
                 if let Some(s) = arg.parse::<usize>().ok().and_then(|n| switches.get(n)) {
                     s.set_active(!s.is_active());
+                }
+            }
+            // Unfold the dialog's More options (its rows are not mapped
+            // until then, so `texts` does not list them).
+            "expand" => {
+                match dialog_widget(w, |x| x.is::<adw::ExpanderRow>())
+                    .and_downcast::<adw::ExpanderRow>()
+                {
+                    Some(row) => row.set_expanded(true),
+                    None => eprintln!("drive: no expander in the dialog"),
                 }
             }
             // What the compositor's close does.
