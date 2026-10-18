@@ -1981,6 +1981,43 @@ pub fn priority_name(level: u8) -> &'static str {
     }
 }
 
+/// The sets of Snooze buttons Preferences offers, as minutes.
+const SNOOZE_PRESETS: [&[u64]; 4] = [
+    &asst_core::config::DEFAULT_SNOOZE,
+    &[15, 60],
+    &[10, 60, 1440],
+    &[10],
+];
+
+/// The sets of Snooze buttons to choose from: the presets, then `current`
+/// as it is written when it is none of them (set by `asst settings`).
+pub fn snooze_presets(current: &[u64]) -> Vec<Vec<u64>> {
+    let mut all: Vec<Vec<u64>> = SNOOZE_PRESETS.iter().map(|p| p.to_vec()).collect();
+    if !all.iter().any(|p| p == current) {
+        all.push(current.to_vec());
+    }
+    all
+}
+
+/// `10 min, 30 min, 1 h`: a set of Snooze buttons, as its entry names it.
+pub fn snooze_label(lengths: &[u64]) -> String {
+    if lengths.is_empty() {
+        return "None".into();
+    }
+    let words: Vec<String> = lengths.iter().map(|m| fmt::minutes(*m)).collect();
+    words.join(", ")
+}
+
+/// The buttons a reminder gets from this set, worded as the notification
+/// words them, and what Snooze… is for.
+pub fn snooze_hint(lengths: &[u64]) -> String {
+    if lengths.is_empty() {
+        return "Snooze… picks any time.".into();
+    }
+    let buttons: Vec<String> = lengths.iter().map(|m| fmt::snooze_button(*m)).collect();
+    format!("{}. Snooze… picks any other time.", buttons.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use asst_core::task::Status;
@@ -3495,5 +3532,49 @@ mod tests {
         // Durations clamp the same way a real drop would.
         let g = ghost_block(&p.blocks, &t, 23 * 60 + 50, 30);
         assert_eq!((g.start, g.duration), (23 * 60 + 50, 10));
+    }
+
+    #[test]
+    fn snooze_presets_keep_the_current_value() {
+        use asst_core::config::DEFAULT_SNOOZE;
+        let presets = snooze_presets(&DEFAULT_SNOOZE);
+        assert_eq!(presets.len(), 4, "the default is a preset, not a fifth");
+        assert_eq!(presets[0], DEFAULT_SNOOZE);
+        let labels: Vec<String> = presets.iter().map(|p| snooze_label(p)).collect();
+        assert_eq!(
+            labels,
+            [
+                "10 min, 30 min, 1 h",
+                "15 min, 1 h",
+                "10 min, 1 h, 1 day",
+                "10 min"
+            ]
+        );
+        // Any preset, not just the first, is found as it is.
+        assert_eq!(snooze_presets(&[15, 60]), presets);
+        // A value set by `asst settings --snooze 20,45` follows the four,
+        // as written, and is what the row opens on.
+        let other = snooze_presets(&[20, 45]);
+        assert_eq!(other[..4], presets[..]);
+        assert_eq!(other.len(), 5);
+        assert_eq!(snooze_label(&other[4]), "20 min, 45 min");
+        // Same minutes in another order are not the same buttons.
+        assert_eq!(snooze_presets(&[60, 10, 30]).len(), 5);
+        // No buttons at all (a hand-edited config) is still shown.
+        assert_eq!(snooze_presets(&[])[4], Vec::<u64>::new());
+        assert_eq!(snooze_label(&[]), "None");
+    }
+
+    #[test]
+    fn the_snooze_hint_words_the_buttons_as_the_notification_does() {
+        assert_eq!(
+            snooze_hint(&[10, 30, 60]),
+            "Snooze 10 min, Snooze 30 min, Snooze 1 h. Snooze… picks any other time."
+        );
+        assert_eq!(
+            snooze_hint(&[10, 1440]),
+            "Snooze 10 min, Snooze 1 day. Snooze… picks any other time."
+        );
+        assert_eq!(snooze_hint(&[]), "Snooze… picks any time.");
     }
 }

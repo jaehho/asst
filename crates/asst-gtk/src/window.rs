@@ -403,8 +403,9 @@ pub enum Cmd {
     Added(bool, client::Result<Added>),
     Opened(client::Result<TaskView>),
     /// The icon a list just made is to have, and the list.
-    /// A task the snooze chooser is for, as the daemon has it.
-    SnoozeAsk(String, client::Result<TaskView>),
+    /// A task the snooze chooser is for, as the daemon has it, and the
+    /// lengths of the Snooze buttons it has now.
+    SnoozeAsk(String, client::Result<TaskView>, Option<Vec<u64>>),
     /// The new list's icon, the list, and what became of its GitHub tie
     /// (a sentence to toast, or why not).
     ListSaved(
@@ -2028,7 +2029,8 @@ impl Component for Window {
             Msg::SnoozePrompt(href) => {
                 sender.oneshot_command(async move {
                     let task = client::get(&href).await;
-                    Cmd::SnoozeAsk(href, task)
+                    let buttons = client::settings().await.ok().map(|s| s.snooze);
+                    Cmd::SnoozeAsk(href, task, buttons)
                 });
             }
             Msg::ThemeChanged => {
@@ -2516,10 +2518,14 @@ impl Component for Window {
                     Err(e) => toast(w, &e),
                 }
             }
-            Cmd::SnoozeAsk(href, result) => match result {
+            Cmd::SnoozeAsk(href, result, buttons) => match result {
                 Ok(t) if t.task.is_open() => {
+                    let buttons = buttons
+                        .or_else(|| self.settings.as_ref().map(|s| s.snooze.clone()))
+                        .unwrap_or_else(|| asst_core::config::DEFAULT_SNOOZE.to_vec());
                     crate::snooze::present(
                         &t.task.summary,
+                        &buttons,
                         Box::new(move |at, done| {
                             let href = href.clone();
                             client::call(async move { client::snooze(&href, at).await }, done);

@@ -328,110 +328,52 @@ fn reminder_row(settings: &Settings, set: &Set, syncing: &Rc<Cell<bool>>) -> (ad
     (row, Box::new(show))
 }
 
-/// A reminder's Snooze buttons: lengths to pick, up to three.
-fn snooze_row(
-    settings: &Settings,
-    set: &Set,
-    syncing: &Rc<Cell<bool>>,
-) -> (adw::PreferencesRow, Show) {
-    let mut lengths: Vec<u64> = vec![5, 10, 15, 30, 60, 120, 1440];
-    lengths.extend(settings.snooze.iter().copied());
-    lengths.sort_unstable();
-    lengths.dedup();
-    let chosen = Rc::new(RefCell::new(settings.snooze.clone()));
-    let chips = adw::WrapBox::builder()
-        .child_spacing(6)
-        .line_spacing(6)
+/// A reminder's Snooze buttons: one of a few sets, else the set `asst
+/// settings` gave, as written. The subtitle shows the buttons it makes.
+fn snooze_row(settings: &Settings, set: &Set, syncing: &Rc<Cell<bool>>) -> (adw::ComboRow, Show) {
+    let sets = Rc::new(RefCell::new(model::snooze_presets(&settings.snooze)));
+    let labels = gtk::StringList::new(&[]);
+    for lengths in sets.borrow().iter() {
+        labels.append(&model::snooze_label(lengths));
+    }
+    let at = |sets: &[Vec<u64>], current: &[u64]| sets.iter().position(|l| l == current);
+    let row = adw::ComboRow::builder()
+        .title("Snooze buttons")
+        .subtitle(model::snooze_hint(&settings.snooze))
+        .model(&labels)
+        .selected(at(&sets.borrow(), &settings.snooze).unwrap_or(0) as u32)
         .build();
-    chips.add_css_class("snooze-lengths");
-    let buttons: Rc<RefCell<Vec<(u64, gtk::ToggleButton)>>> = Rc::default();
-    // Past the limit, the rest wait until one is let go.
-    let limit = {
-        let (buttons, chosen) = (buttons.clone(), chosen.clone());
-        move || {
-            let full = chosen.borrow().len() >= asst_core::config::MAX_SNOOZE;
-            for (m, b) in buttons.borrow().iter() {
-                b.set_sensitive(!full || chosen.borrow().contains(m));
-            }
-        }
-    };
-    for m in lengths {
-        let b = gtk::ToggleButton::with_label(&asst_core::fmt::minutes(m));
-        b.add_css_class("pill");
-        b.set_active(settings.snooze.contains(&m));
-        let (chosen, set, limit, syncing) =
-            (chosen.clone(), set.clone(), limit.clone(), syncing.clone());
-        b.connect_toggled(move |b| {
+    {
+        let (sets, set, syncing) = (sets.clone(), set.clone(), syncing.clone());
+        row.connect_selected_notify(move |c| {
+            let Some(lengths) = sets.borrow().get(c.selected() as usize).cloned() else {
+                return;
+            };
+            c.set_subtitle(&model::snooze_hint(&lengths));
             if syncing.get() {
                 return;
             }
-            let mut v = chosen.borrow().clone();
-            if b.is_active() {
-                if !v.contains(&m) {
-                    v.push(m);
-                }
-            } else {
-                v.retain(|x| *x != m);
-            }
-            if v.is_empty() {
-                // One is the least a reminder has.
-                b.set_active(true);
-                return;
-            }
-            v.sort_unstable();
-            *chosen.borrow_mut() = v.clone();
-            limit();
             set(SettingsChange {
-                snooze: Some(v),
+                snooze: Some(lengths),
                 ..SettingsChange::default()
             });
         });
-        chips.append(&b);
-        buttons.borrow_mut().push((m, b));
     }
-    limit();
-
-    let body = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(3)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-    body.append(
-        &gtk::Label::builder()
-            .label("Snooze buttons")
-            .xalign(0.0)
-            .build(),
-    );
-    body.append(
-        &gtk::Label::builder()
-            .label(format!(
-                "The buttons on a reminder, up to {}. Snooze… beside them asks for any other time.",
-                asst_core::config::MAX_SNOOZE
-            ))
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["caption", "dim-label"])
-            .build(),
-    );
-    body.append(&chips);
-    let row = adw::PreferencesRow::builder()
-        .title("Snooze buttons")
-        .activatable(false)
-        .child(&body)
-        .build();
-
     let show = {
-        let syncing = syncing.clone();
+        let (row, syncing) = (row.downgrade(), syncing.clone());
         move |s: &Settings| {
+            let Some(row) = row.upgrade() else {
+                return;
+            };
+            // The entry is in `sets` before the model can tell the row.
+            let found = at(&sets.borrow(), &s.snooze);
+            let selected = found.unwrap_or_else(|| {
+                sets.borrow_mut().push(s.snooze.clone());
+                labels.append(&model::snooze_label(&s.snooze));
+                sets.borrow().len() - 1
+            });
             syncing.set(true);
-            for (m, b) in buttons.borrow().iter() {
-                b.set_active(s.snooze.contains(m));
-            }
-            *chosen.borrow_mut() = s.snooze.clone();
-            limit();
+            row.set_selected(selected as u32);
             syncing.set(false);
         }
     };

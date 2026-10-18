@@ -331,10 +331,7 @@ fn actions_for(uid: &str, snooze: &[u64]) -> Vec<(String, String)> {
         (format!("done:{uid}"), "Complete".to_string()),
     ];
     for m in snooze {
-        actions.push((
-            format!("snooze:{m}:{uid}"),
-            format!("Snooze {}", fmt::minutes(*m)),
-        ));
+        actions.push((format!("snooze:{m}:{uid}"), fmt::snooze_button(*m)));
     }
     actions.push((format!("snooze-more:{uid}"), "Snooze…".to_string()));
     actions
