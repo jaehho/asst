@@ -262,6 +262,11 @@ async fn try_follow(
             return keep(daemon, &link, old, pending_id, &changed, now);
         }
     }
+    // A rename that has been tried for a month is not tried again. It is
+    // read for being done first, above: only one that is not done lapses.
+    if pending.is_some() && now - started > MARKER_EXPIRES {
+        return keep(daemon, &link, old, pending_id, &Keep::Expired, now);
+    }
     let others: Vec<&str> = rows
         .iter()
         .filter(|l| l.href != href)

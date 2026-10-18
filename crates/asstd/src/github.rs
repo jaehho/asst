@@ -3337,4 +3337,77 @@ mod tests {
         );
         assert_eq!(rig.row("jaehho/lab2").follow_from, None);
     }
+
+    #[tokio::test]
+    async fn the_upgrade_in_a_bad_hour_learns_what_it_can_and_says_nothing() {
+        let names: Vec<String> = (0..6).map(|i| format!("jaehho/p{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        for (label, trouble, ends) in [
+            ("a 500", Reply::status(500), Round::Done),
+            ("a hang", Reply::hang(), Round::Offline),
+        ] {
+            let mut rig = Rig::new(&refs).await;
+            for (i, name) in refs.iter().enumerate() {
+                rig.publish(10 + i as u64, name, i == 4);
+            }
+            rig.fake.reply("GET", "/repos/jaehho/p2", trouble);
+            let lists = rig.daemon.lists().unwrap();
+
+            assert_eq!(rig.go().await, ends, "{label}");
+
+            let known = rig.rows().iter().filter(|r| r.repo_id.is_some()).count();
+            assert!((2..6).contains(&known), "{label}: {known} learned");
+            assert!(rig.row("jaehho/p2").repo_id.is_none(), "{label}");
+            assert!(rig.log().is_empty(), "{label}");
+            assert_eq!(rig.daemon.lists().unwrap(), lists, "{label}");
+            assert!(rig.lists.calls().is_empty(), "{label}");
+
+            // The hour passes
+            rig.publish(12, "jaehho/p2", false);
+            rig.later(20);
+            assert_eq!(rig.go().await, Round::Done, "{label}");
+            assert!(rig.rows().iter().all(|r| r.repo_id.is_some()), "{label}");
+            assert!(rig.log().is_empty(), "{label}: learning is no event");
+            assert_eq!(rig.row("jaehho/p4").archived.map(|t| t > 0), Some(true));
+            let before = rig.snap();
+            rig.go().await;
+            assert_eq!(rig.snap(), before, "{label}: and then it rests");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rename_the_server_refuses_to_take_for_a_month_lapses_with_its_intent() {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        rig.lists.with(|s| s.rename_fails = Some(Fail::Status(500)));
+        rig.go().await;
+        assert_eq!(kinds(&rig.log()), ["list-renaming", "repo-renamed"]);
+
+        // Tried every time it is looked at, not for ever
+        rig.later(60 * 24 * 29);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 2);
+        rig.later(60 * 24 * 2);
+        rig.go().await;
+        assert_eq!(rig.lists.renames(), 2, "not tried again");
+        let log = rig.log();
+        assert_eq!(kinds(&log), ["list-kept", "repo-renamed"]);
+        assert!(log[0].text.contains("gave up"), "{}", log[0].text);
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "champalimaud");
+
+        // One that was done meanwhile is told as done, however late
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", "[]");
+        rig.lists.with(|s| s.rename_fails = Some(Fail::Status(500)));
+        rig.go().await;
+        rig.lists.set_name(CHAMPALIMAUD, "lab");
+        rig.later(60 * 24 * 40);
+        rig.go().await;
+        assert_eq!(kinds(&rig.log()), ["list-renamed", "repo-renamed"]);
+    }
 }
