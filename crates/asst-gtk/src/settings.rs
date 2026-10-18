@@ -68,6 +68,18 @@ impl Open {
     }
 }
 
+/// A refused change as a sentence for a toast. The daemon's own words about
+/// a value ("the sync interval must be at least 15 seconds") are plain
+/// already. A config file it could not write comes as a path and an errno,
+/// which says nothing a person can act on; the caller logs that text.
+pub fn plain_refusal(raw: &str) -> String {
+    if raw.starts_with('/') || raw.contains("(os error ") {
+        "Couldn't save that setting. asst can't write its config file.".into()
+    } else {
+        raw.into()
+    }
+}
+
 fn say(dialog: &adw::PreferencesDialog, text: &str) {
     dialog.add_toast(adw::Toast::new(&glib::markup_escape_text(text)));
 }
@@ -635,4 +647,28 @@ fn github_rows(more: &adw::ExpanderRow, p: &Prefs, patch: &Patch) {
     }
     more.add_row(&command);
     more.add_row(&note_row("Placeholders: {dir} {number} {repo} {url}").0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_error_is_a_sentence_and_the_daemons_own_words_stay() {
+        for raw in [
+            "/home/jaeho/.config/asst/config.toml.tmp: Permission denied (os error 13)",
+            "/home/jaeho/.config/asst: No space left on device (os error 28)",
+            "Read-only file system (os error 30)",
+        ] {
+            let said = plain_refusal(raw);
+            assert!(!said.contains('/') && !said.contains("os error"), "{said}");
+        }
+        for raw in [
+            "the sync interval must be at least 15 seconds",
+            "a reminder has 1 to 3 Snooze buttons",
+            "asstd is not running (systemctl --user start asstd)",
+        ] {
+            assert_eq!(plain_refusal(raw), raw);
+        }
+    }
 }

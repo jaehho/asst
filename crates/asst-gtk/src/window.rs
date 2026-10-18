@@ -2354,7 +2354,9 @@ impl Component for Window {
                     tx.clone(),
                 ));
             }
-            Cmd::Refused(why, daemon) => {
+            Cmd::Refused(raw, daemon) => {
+                eprintln!("asst-gtk: asstd refused a setting: {raw}");
+                let why = settings::plain_refusal(&raw);
                 if let Some(s) = daemon {
                     self.take_settings(s, &sender);
                 }
