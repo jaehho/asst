@@ -378,7 +378,7 @@ impl Ghost {
         for b in &p.blocks {
             tasks.insert(b.task.href.clone(), b.task.clone());
         }
-        for t in &p.tray {
+        for t in p.tray.iter().chain(&p.no_date) {
             tasks.insert(t.href.clone(), t.clone());
         }
         let g = Ghost {
@@ -509,8 +509,9 @@ pub fn fill_lane(
     overlay.add_controller(target);
 }
 
-/// The tray of tasks to place beside the day grid. On a non-today day it is
-/// the open/overdue backlog minus what sits on that day; today unchanged.
+/// The tray of tasks to place beside the day grid: what is due on or before
+/// the day on view and not yet on its plan, then a collapsed No date
+/// section for the tasks nobody dated, which can be planned all the same.
 pub fn tray(
     p: &DayPlan,
     o: &content::Opts<'_>,
@@ -537,15 +538,75 @@ pub fn tray(
     let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
     rule.add_css_class("section-rule");
     b.append(&rule);
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if p.tray.is_empty() {
         let empty = if p.day == o.now.date_naive() {
             "Every task due today is on the timeline."
         } else {
             "Nothing left to place on this day."
         };
-        b.append(&ui::label(empty, &["dim-label", "caption"]));
-        return b;
+        body.append(&ui::label(empty, &["dim-label", "caption"]));
+    } else {
+        body.append(&task_list(&p.tray, o, tx, rows));
     }
+    if !p.no_date.is_empty() {
+        body.append(&no_date_head(p.no_date.len(), o.no_date_open, tx));
+        if o.no_date_open {
+            body.append(&task_list(&p.no_date, o, tx, rows));
+        }
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&body)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .propagate_natural_height(true)
+        .max_content_height(360)
+        .build();
+    scroll.add_css_class("plan-tray-scroll");
+    b.append(&scroll);
+    b
+}
+
+/// The No date row's widget name, so a rebuild can hand the keyboard back to it.
+pub const NO_DATE_TOGGLE: &str = "no-date-toggle";
+
+/// The row that folds the No date section open and shut.
+fn no_date_head(n: usize, open: bool, tx: &Tx) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.set_halign(gtk::Align::Start);
+    content.append(&ui::icon(
+        if open {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        },
+        12,
+    ));
+    content.append(&ui::label("No date", &["section-title"]));
+    content.append(&ui::label(&n.to_string(), &["dim-label", "section-note"]));
+    let head = gtk::Button::builder().child(&content).build();
+    head.set_widget_name(NO_DATE_TOGGLE);
+    head.add_css_class("flat");
+    head.add_css_class("plan-no-date");
+    head.set_tooltip_text(Some(if open {
+        "Hide the tasks with no date"
+    } else {
+        "Show the tasks with no date, to place on this day"
+    }));
+    let tx = tx.clone();
+    head.connect_clicked(move |_| tx.emit(Msg::ToggleNoDate));
+    head
+}
+
+/// The tray's rows: compact task rows that drag onto the grid.
+fn task_list(
+    tasks: &[TaskView],
+    o: &content::Opts<'_>,
+    tx: &Tx,
+    rows: &mut Vec<(String, gtk::Widget)>,
+) -> gtk::ListBox {
     let list = gtk::ListBox::new();
     list.add_css_class("task-list");
     list.set_selection_mode(gtk::SelectionMode::None);
@@ -555,7 +616,7 @@ pub fn tray(
             tx.emit(Msg::Activate(row.widget_name().to_string()));
         });
     }
-    for t in &p.tray {
+    for t in tasks {
         if o.editing == Some(t.href.as_str()) {
             let r = row::editor_row(&t.href, o.editor);
             list.append(&r);
@@ -583,17 +644,7 @@ pub fn tray(
         list.append(&r);
         rows.push((t.href.clone(), r.into()));
     }
-    let scroll = gtk::ScrolledWindow::builder()
-        .child(&list)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .propagate_natural_height(true)
-        .max_content_height(360)
-        .build();
-    scroll.add_css_class("plan-tray-scroll");
-    b.append(&scroll);
-    b
+    list
 }
 
 /// Place or move `href`'s slot for `date` in the window's prefs.

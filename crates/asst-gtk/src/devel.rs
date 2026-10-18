@@ -219,8 +219,12 @@ pub struct Dump {
     pub sidebar: String,
     pub rows: Vec<DumpRow>,
     pub blocks: Vec<DumpBlock>,
-    /// Open and overdue backlog not placed on `day`.
+    /// Open tasks due on or before `day`, not placed on it.
     pub tray: Vec<DumpRow>,
+    /// Open tasks with no date, not placed on `day`; their rows are among
+    /// `rows` only while the No date section is unfolded.
+    pub no_date: Vec<DumpRow>,
+    pub no_date_open: bool,
     /// The open editor card's task.
     pub editor: Option<String>,
     /// A visible toast's text.
@@ -256,7 +260,15 @@ pub fn build_dump(
     editor: Option<&str>,
     toast: Option<&str>,
     cursor: Option<&str>,
+    no_date_open: bool,
 ) -> Dump {
+    let tray_row = |kind: &'static str| {
+        move |t: &asst_core::api::TaskView| DumpRow {
+            id: t.id.clone(),
+            summary: t.task.summary.clone(),
+            kind: kind.into(),
+        }
+    };
     let rows = if *nav == Nav::Day {
         plan.blocks
             .iter()
@@ -265,11 +277,13 @@ pub fn build_dump(
                 summary: b.task.task.summary.clone(),
                 kind: "plan".into(),
             })
-            .chain(plan.tray.iter().map(|t| DumpRow {
-                id: t.id.clone(),
-                summary: t.task.summary.clone(),
-                kind: "tray".into(),
-            }))
+            .chain(plan.tray.iter().map(tray_row("tray")))
+            .chain(
+                plan.no_date
+                    .iter()
+                    .filter(|_| no_date_open)
+                    .map(tray_row("no-date")),
+            )
             .collect()
     } else {
         sections
@@ -302,15 +316,9 @@ pub fn build_dump(
                 cols: b.cols,
             })
             .collect(),
-        tray: plan
-            .tray
-            .iter()
-            .map(|t| DumpRow {
-                id: t.id.clone(),
-                summary: t.task.summary.clone(),
-                kind: "tray".into(),
-            })
-            .collect(),
+        tray: plan.tray.iter().map(tray_row("tray")).collect(),
+        no_date: plan.no_date.iter().map(tray_row("no-date")).collect(),
+        no_date_open,
         editor: editor.map(str::to_string),
         toast: toast.map(str::to_string),
         cursor: cursor.map(str::to_string),
@@ -489,6 +497,7 @@ mod tests {
                 cols: 1,
             }],
             tray: vec![task("cc33", "Call bank")],
+            no_date: vec![task("dd44", "Gym")],
             now_min: Some(10 * 60),
         };
         let d = build_dump(
@@ -501,6 +510,7 @@ mod tests {
             Some("/l/bb22.ics"),
             Some("Copied to the clipboard"),
             Some("/l/aa11.ics"),
+            false,
         );
         let v: serde_json::Value = serde_json::from_str(&dump_json(&d)).unwrap();
         assert_eq!(v["nav"], "today");
@@ -537,13 +547,42 @@ mod tests {
                 cols: 1,
             }],
             tray: vec![task("cc33", "Call bank")],
+            no_date: vec![task("dd44", "Gym")],
             now_min: None,
         };
-        let d = build_dump(&Nav::Day, day, 52.0, None, &[], &plan, None, None, None);
+        let d = build_dump(
+            &Nav::Day,
+            day,
+            52.0,
+            None,
+            &[],
+            &plan,
+            None,
+            None,
+            None,
+            false,
+        );
         let kinds: Vec<&str> = d.rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["plan", "tray"]);
         assert_eq!(d.rows[0].id, "bb22");
         assert_eq!(d.rows[1].summary, "Call bank");
+        // Folded, No date is listed apart; unfolded, its rows join the walk.
+        assert_eq!((d.no_date.len(), d.no_date_open), (1, false));
+        let d = build_dump(
+            &Nav::Day,
+            day,
+            52.0,
+            None,
+            &[],
+            &plan,
+            None,
+            None,
+            None,
+            true,
+        );
+        let kinds: Vec<&str> = d.rows.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, ["plan", "tray", "no-date"]);
+        assert_eq!(d.rows[2].summary, "Gym");
     }
 
     #[test]
@@ -555,9 +594,21 @@ mod tests {
             hour_end: 24,
             blocks: Vec::new(),
             tray: Vec::new(),
+            no_date: Vec::new(),
             now_min: None,
         };
-        let d = build_dump(&Nav::Today, day, 52.0, None, &[], &plan, None, None, None);
+        let d = build_dump(
+            &Nav::Today,
+            day,
+            52.0,
+            None,
+            &[],
+            &plan,
+            None,
+            None,
+            None,
+            false,
+        );
         let v: serde_json::Value = serde_json::from_str(&dump_json(&d)).unwrap();
         assert!(v["editor"].is_null());
         assert!(v["toast"].is_null());

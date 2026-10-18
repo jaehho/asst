@@ -32,7 +32,7 @@ use crate::prefs::{PrefPatch, Prefs};
 use crate::sidebar::{self, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
-use crate::{client, dialogs, find, settings};
+use crate::{client, dialogs, find, plan, settings};
 
 pub type Tx = relm4::Sender<Msg>;
 
@@ -176,6 +176,8 @@ pub enum Msg {
     PlanUndo(String, chrono::NaiveDate, Option<(u32, u32)>),
     /// The Day view's button: this day's unfinished blocks to the next day.
     PlanCarry,
+    /// Fold the tray's No date section open or shut.
+    ToggleNoDate,
     /// Take a carry back.
     PlanUncarry(model::Carried),
     /// A new task, and whether the add card was left with it typed.
@@ -411,6 +413,8 @@ pub struct Window {
     /// both follow this cursor; slots are keyed by date, so this is just
     /// the day the grid is looking at.
     day_day: chrono::NaiveDate,
+    /// The Day tray's No date section is unfolded. Not kept: it starts shut.
+    no_date_open: bool,
     /// Minute pinned at a viewport y across the next zoom rebuild.
     zoom_hold: Option<(f64, f64)>,
     lists: Vec<ListView>,
@@ -568,6 +572,23 @@ fn dialog_widget(w: &Widgets, want: impl Fn(&gtk::Widget) -> bool) -> Option<gtk
         while let Some(c) = child {
             child = c.next_sibling();
             queue.push_back(c);
+        }
+    }
+    None
+}
+
+/// The widget under `root` with this name, to give the keyboard back to a
+/// button that a rebuild replaced.
+fn named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    let mut stack = vec![root.clone()];
+    while let Some(widget) = stack.pop() {
+        if widget.widget_name() == name {
+            return Some(widget);
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            stack.push(c);
         }
     }
     None
@@ -988,6 +1009,7 @@ impl Component for Window {
             completed: None,
             blocks: Vec::new(),
             day_day: chrono::Local::now().date_naive(),
+            no_date_open: false,
             zoom_hold: None,
             status: None,
             links: Vec::new(),
@@ -1069,6 +1091,10 @@ impl Component for Window {
                     w.add_card.set_target(Target::Day(day));
                 }
                 self.reload_blocks(&sender, day);
+                self.shown = 0;
+            }
+            Msg::ToggleNoDate => {
+                self.no_date_open = !self.no_date_open;
                 self.shown = 0;
             }
             Msg::Zoom(px, hold) => {
@@ -2172,12 +2198,16 @@ impl Component for Window {
                     let here = match &self.nav {
                         Nav::List(h) => &t.list == h,
                         Nav::Inbox => model::inbox(&self.lists).is_some_and(|l| l.href == t.list),
-                        // Day's tray holds what is due by today, whatever day is on view.
-                        Nav::Today | Nav::Day => t
+                        Nav::Today => t
                             .task
                             .due
                             .as_ref()
                             .is_some_and(|d| d.local_date(self.zone) <= self.now().date_naive()),
+                        // Day's tray holds what is due by the day on view, and
+                        // the undated only while their section is unfolded.
+                        Nav::Day => t.task.due.as_ref().map_or(self.no_date_open, |d| {
+                            d.local_date(self.zone) <= self.day_day
+                        }),
                         _ => true,
                     };
                     if !here {
@@ -3166,7 +3196,7 @@ impl Window {
                 .iter()
                 .any(|s| s.tasks.iter().any(|t| t.href == href))
                 || day.blocks.iter().any(|b| b.task.href == href)
-                || day.tray.iter().any(|t| t.href == href);
+                || day.tray.iter().chain(&day.no_date).any(|t| t.href == href);
             if !here && !typing {
                 self.close_editor(w, sender);
             }
@@ -3214,7 +3244,8 @@ impl Window {
                 for b in &day.blocks {
                     (&b.task.href, b.start, b.duration, b.col, b.cols).hash(&mut h);
                 }
-                for t in &day.tray {
+                self.no_date_open.hash(&mut h);
+                for t in day.tray.iter().chain(&day.no_date) {
                     if self.editing.as_deref() == Some(t.href.as_str()) {
                         t.href.hash(&mut h);
                     } else {
@@ -3249,6 +3280,9 @@ impl Window {
             let had_focus = focus.as_ref().is_some_and(|f| f.is_ancestor(&w.clamp));
             // The editor and the add card outlive rebuilds; so does the
             // keyboard in them.
+            let on_no_date = focus
+                .as_ref()
+                .is_some_and(|f| f.widget_name() == plan::NO_DATE_TOGGLE);
             let kept =
                 focus.filter(|f| f.is_ancestor(&w.editor.root) || f.is_ancestor(&w.add_card.root));
 
@@ -3297,6 +3331,7 @@ impl Window {
                     lists: &self.lists,
                     blocks: &self.blocks,
                     plan: &day,
+                    no_date_open: self.no_date_open,
                     px_per_hour: self.prefs.day_zoom,
                     hold: self.zoom_hold,
                     archived: self.nav_archived(),
@@ -3365,6 +3400,9 @@ impl Window {
                     None => self.cursor = None,
                 }
             }
+            if on_no_date && let Some(toggle) = named(w.clamp.upcast_ref(), plan::NO_DATE_TOGGLE) {
+                toggle.grab_focus();
+            }
             if refocus == Refocus::Editor && self.editing.is_some() {
                 w.editor.focus();
             } else if let Some(f) = kept.filter(|f| f.root().is_some()) {
@@ -3415,6 +3453,7 @@ impl Window {
             self.editing.as_deref(),
             crate::devel::visible_toast(w.toasts.upcast_ref()).as_deref(),
             self.cursor.as_deref(),
+            self.no_date_open,
         );
         let json = crate::devel::dump_json(&state);
         if path.is_empty() {
@@ -3437,7 +3476,8 @@ impl Window {
     /// `addtext <text, \n for a new line>`, `newline` (typed in the notes), `open-task <words>`,
     /// `plan <words> at HH:MM [minutes]`, `planoff <words>`,
     /// `planghost <words> at HH:MM [minutes]`, `planghostoff`,
-    /// `daystep ±N` (the view's day cursor), `daytoday`.
+    /// `daystep ±N` (the view's day cursor), `daytoday`, `nodate` (the tray's
+    /// No date section, open or shut).
     fn drive(&mut self, w: &mut Widgets, sender: &ComponentSender<Self>, command: &str) {
         let (verb, arg) = command.split_once(' ').unwrap_or((command, ""));
         let task = |text: &str| {
@@ -3610,6 +3650,8 @@ impl Window {
                 crate::plan::ghost_at(&h, start, duration);
             }
             "planghostoff" => crate::plan::ghost_off(),
+            // The tray's No date section, folded open or shut.
+            "nodate" => sender.input(Msg::ToggleNoDate),
             // Step the Day view's cursor.
             "daystep" => {
                 if let Ok(delta) = arg.trim().parse::<i32>() {

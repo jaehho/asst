@@ -1031,6 +1031,14 @@ button.pill {
   margin-top: 4px;
 }
 
+/* The fold for the tray's undated tasks: its chevron lines up with the
+   header's title above. */
+.plan-no-date {
+  margin: 8px 3px 0 3px;
+  padding: 2px 3px;
+  min-height: 28px;
+}
+
 .plan-block-row {
   margin-left: 2px;
   margin-right: 2px;

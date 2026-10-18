@@ -925,8 +925,12 @@ pub struct DayPlan {
     pub hour_start: u32,
     pub hour_end: u32,
     pub blocks: Vec<PlanBlock>,
-    /// Open and overdue backlog not placed on `day`.
+    /// Open tasks due on or before `day` and not placed on it: the ones
+    /// that want a slot.
     pub tray: Vec<TaskView>,
+    /// Open tasks with no date, not placed on `day`: the tray's collapsed
+    /// No date section, so a task nobody dated can still be planned.
+    pub no_date: Vec<TaskView>,
     /// Minutes from midnight, only when `day` is the wall-clock today.
     pub now_min: Option<u32>,
 }
@@ -1208,11 +1212,11 @@ pub fn uncarry(slots: &mut Vec<PlanSlot>, carried: &Carried) {
 }
 
 /// The day plan for `viewed`. Blocks are the open tasks with a slot on that
-/// day; the tray is the open/overdue backlog (due on or before the
-/// wall-clock today) minus the tasks placed on `viewed`. The same task may
-/// sit on several days' plans at once, so a slot on another day does not
-/// empty it from the tray here. Today's tray is that rule with `viewed ==
-/// today`, which is the original behavior.
+/// day; the tray is the open tasks due on or before `viewed` (what is
+/// overdue, and what falls due by then) minus the tasks placed on it, and
+/// `no_date` the open tasks with no date, likewise. Tasks due after `viewed`
+/// wait for their own day. The same task may sit on several days' plans at
+/// once, so a slot on another day does not empty it from the tray here.
 ///
 /// Overlaps sit side by side: each block takes the leftmost column that no
 /// overlapping block already holds, and a group of blocks linked by overlap
@@ -1244,20 +1248,20 @@ pub fn day_plan(
     layout(&mut blocks);
 
     let due = |t: &TaskView| t.task.due.as_ref().map(|d| d.local_date(zone));
-    let mut tray: Vec<TaskView> = open
+    let unplaced = open
         .iter()
-        .filter(|t| !placed.contains(t.task.uid.as_str()) && due(t).is_some_and(|d| d <= today))
+        .filter(|t| !placed.contains(t.task.uid.as_str()));
+    let mut tray: Vec<TaskView> = unplaced
+        .clone()
+        .filter(|t| due(t).is_some_and(|d| d <= viewed))
         .cloned()
         .collect();
-    tray.sort_by_key(|t| {
-        let d = due(t);
-        (
-            d.is_none(),
-            d,
-            priority_level(t.task.priority),
-            t.task.uid.clone(),
-        )
-    });
+    tray.sort_by_key(|t| (due(t), priority_level(t.task.priority), t.task.uid.clone()));
+    let no_date = sorted(
+        unplaced.filter(|t| due(t).is_none()).cloned().collect(),
+        Sort::Priority,
+        zone,
+    );
 
     DayPlan {
         day: viewed,
@@ -1265,6 +1269,7 @@ pub fn day_plan(
         hour_end: PLAN_HOUR_END,
         blocks,
         tray,
+        no_date,
         now_min: (viewed == today)
             .then(|| now_on_grid(now, PLAN_HOUR_START, PLAN_HOUR_END))
             .flatten(),
@@ -2606,9 +2611,12 @@ mod tests {
         // `now` sits on the grid; `gone` is not open and is dropped.
         assert_eq!(placed(&p, "now"), Some((9 * 60, 60, 0, 1)));
         assert_eq!(placed(&p, "gone"), None);
-        // Tray: overdue and due today, unplaced; future and undated stay out.
+        // Tray: overdue and due today, unplaced; a later date stays out and
+        // the undated wait in their own section.
         let tray: Vec<&str> = p.tray.iter().map(|t| t.task.uid.as_str()).collect();
         assert_eq!(tray, ["late", "other"]);
+        let undated: Vec<&str> = p.no_date.iter().map(|t| t.task.uid.as_str()).collect();
+        assert_eq!(undated, ["someday"]);
         // 10:00 on Sep 14 2026.
         assert_eq!(p.now_min, Some(10 * 60));
         // A slot for a task the open set no longer holds does not count.
@@ -2845,7 +2853,7 @@ mod tests {
         let tray: Vec<&str> = p.tray.iter().map(|t| t.task.uid.as_str()).collect();
         assert_eq!(tray, ["late"]);
         assert_eq!(p.now_min, Some(10 * 60));
-        // Tomorrow: that day's slots only. The tray is the same backlog
+        // Tomorrow: that day's slots only. The tray is what is due by then
         // minus what sits on the viewed day, so `now` (placed tomorrow too)
         // leaves it and `late` stays. A slot on today does not empty the
         // tray for another day.
@@ -2856,6 +2864,56 @@ mod tests {
         let tray: Vec<&str> = p.tray.iter().map(|t| t.task.uid.as_str()).collect();
         assert_eq!(tray, ["late"]);
         assert_eq!(p.now_min, None);
+    }
+
+    #[test]
+    fn the_tray_offers_what_is_due_by_the_viewed_day_and_what_has_no_date() {
+        let urgent = |mut t: TaskView| {
+            t.task.priority = 1;
+            t
+        };
+        let open = vec![
+            task("late", "/a/", on(date(9, 10))),
+            task("today", "/a/", on(date(9, 14))),
+            task("tomorrow", "/a/", on(date(9, 15))),
+            task("friday", "/a/", on(date(9, 18))),
+            task("plain", "/a/", None),
+            urgent(task("urgent", "/b/", None)),
+            task("planned", "/b/", None),
+        ];
+        let uids = |tasks: &[TaskView]| -> Vec<String> {
+            tasks.iter().map(|t| t.task.uid.clone()).collect()
+        };
+        let slots = vec![
+            slot("planned", 9 * 60, 30),
+            PlanSlot {
+                uid: "plain".into(),
+                date: date(9, 20),
+                start: 9 * 60,
+                duration: 30,
+            },
+        ];
+        // Today: what is due by today, nothing dated later, and the undated
+        // in priority order. A task placed today is in neither.
+        let p = day_plan(&open, &slots, now(), date(9, 14));
+        assert_eq!(uids(&p.tray), ["late", "today"]);
+        assert_eq!(uids(&p.no_date), ["urgent", "plain"]);
+        // A later day takes in what falls due by it, so a task due Friday
+        // can be planned on Friday; a slot on another day (plain, on the
+        // 20th) does not take the task out of today's list.
+        let p = day_plan(&open, &slots, now(), date(9, 15));
+        assert_eq!(uids(&p.tray), ["late", "today", "tomorrow"]);
+        let p = day_plan(&open, &slots, now(), date(9, 18));
+        assert_eq!(uids(&p.tray), ["late", "today", "tomorrow", "friday"]);
+        // A day gone by offers what was due by then, not what came after.
+        let p = day_plan(&open, &slots, now(), date(9, 12));
+        assert_eq!(uids(&p.tray), ["late"]);
+        // The day a task is placed on, it leaves No date.
+        let p = day_plan(&open, &slots, now(), date(9, 20));
+        assert_eq!(uids(&p.no_date), ["urgent", "planned"]);
+        // Nothing open, nothing to place.
+        let p = day_plan(&[], &[], now(), date(9, 14));
+        assert!(p.tray.is_empty() && p.no_date.is_empty());
     }
 
     #[test]

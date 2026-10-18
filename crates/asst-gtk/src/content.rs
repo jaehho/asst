@@ -24,6 +24,8 @@ pub struct Opts<'a> {
     pub blocks: &'a [asst_core::api::BlockView],
     /// Placed slots, the tray and the now-line, for the Day view.
     pub plan: &'a DayPlan,
+    /// The tray's No date section is unfolded.
+    pub no_date_open: bool,
     /// Day-grid zoom in pixels per hour.
     pub px_per_hour: f64,
     /// Minute to pin across a zoom, with its y from the top of the viewport.
