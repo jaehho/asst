@@ -54,9 +54,6 @@ trait Notifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
-/// The action that opens the window's snooze chooser.
-const SNOOZE_MORE: &str = "snooze-more";
-
 type Shown = Arc<Mutex<HashMap<u32, String>>>;
 
 /// Alarms due now, each with the instant it was due.
@@ -175,24 +172,11 @@ async fn show(
     if priority_level(row.task.priority) == 1 {
         hints.insert("urgency", Value::U8(2));
     }
-    // "default" is the click on the notification itself, not a button.
-    let snoozes: Vec<(String, String)> = daemon
-        .config()
-        .snooze
+    let buttons = actions_for(&row.task.uid, &daemon.config().snooze);
+    let actions: Vec<&str> = buttons
         .iter()
-        .map(|m| {
-            (
-                format!("snooze:{m}"),
-                format!("Snooze {}", fmt::minutes(*m)),
-            )
-        })
+        .flat_map(|(key, label)| [key.as_str(), label.as_str()])
         .collect();
-    let mut actions = vec!["default", "Open", "done", "Complete"];
-    for (key, label) in &snoozes {
-        actions.extend([key.as_str(), label.as_str()]);
-    }
-    // Any other time: the window's chooser (#20).
-    actions.extend([SNOOZE_MORE, "Snooze…"]);
     proxy
         .notify(
             "asst",
@@ -205,6 +189,86 @@ async fn show(
             -1,
         )
         .await
+}
+
+/// A notification's actions as (key, label), in the order they show:
+/// "default" (Open), Complete, a Snooze for each length, then the
+/// chooser for any other time (#20).
+///
+/// Every key but "default" names its task, so a button still works after
+/// asstd restarts and no longer knows which notification is which.
+/// "default" cannot: a notification server fires it for a click on the
+/// notification itself and knows no other name for it (swaync turns
+/// anything else into a button, so `default:<uid>` would leave the click
+/// doing nothing).
+fn actions_for(uid: &str, snooze: &[u64]) -> Vec<(String, String)> {
+    let mut actions = vec![
+        ("default".to_string(), "Open".to_string()),
+        (format!("done:{uid}"), "Complete".to_string()),
+    ];
+    for m in snooze {
+        actions.push((
+            format!("snooze:{m}:{uid}"),
+            format!("Snooze {}", fmt::minutes(*m)),
+        ));
+    }
+    actions.push((format!("snooze-more:{uid}"), "Snooze…".to_string()));
+    actions
+}
+
+/// One thing a button does to its task.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// Show it in the window.
+    Open,
+    Complete,
+    Snooze(u64),
+    /// The window's chooser for when to ring it again.
+    Chooser,
+}
+
+/// What an action key asks for.
+#[derive(Debug, PartialEq)]
+struct Plan<'a> {
+    /// The task the key names; none for "default", a click on the
+    /// notification itself.
+    uid: Option<&'a str>,
+    steps: Vec<Step>,
+}
+
+/// The plan for an action key, or `None` for a key that is not ours:
+/// another app's, or one made without a UID by an asstd from before this,
+/// which no running asstd could map to a task anyway.
+fn plan_action(key: &str) -> Option<Plan<'_>> {
+    if key == "default" {
+        return Some(Plan {
+            uid: None,
+            steps: vec![Step::Open],
+        });
+    }
+    // The UID is the rest of the key, colons and all.
+    let (verb, rest) = key.split_once(':')?;
+    let (step, uid) = match verb {
+        "done" => (Step::Complete, rest),
+        "snooze-more" => (Step::Chooser, rest),
+        "snooze" => {
+            let (minutes, uid) = rest.split_once(':')?;
+            (Step::Snooze(minutes.parse().ok()?), uid)
+        }
+        _ => return None,
+    };
+    (!uid.is_empty()).then(|| Plan {
+        uid: Some(uid),
+        steps: vec![step],
+    })
+}
+
+/// The href of the task with exactly this UID. `Store::find` also takes
+/// a prefix, so a deleted task's button could reach another task whose
+/// UID starts the same.
+fn href_of(daemon: &Daemon, uid: &str) -> Option<String> {
+    let row = daemon.store().find(uid).ok()?;
+    row.task.uid.eq_ignore_ascii_case(uid).then_some(row.href)
 }
 
 async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown: Shown) {
@@ -226,35 +290,47 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
             }
             Some(signal) = actions.next() => {
                 let Ok(args) = signal.args() else { continue };
-                let href = shown.lock().unwrap_or_else(|p| p.into_inner()).get(&args.id).cloned();
-                let Some(href) = href else { continue };
-                let token = token.take().filter(|(id, _)| *id == args.id).map(|(_, t)| t);
-                let snooze = |minutes: u64| daemon.snooze(&href, minutes);
-                let result = match args.action_key {
-                    "default" => {
-                        let conn = proxy.inner().connection();
-                        if let Err(e) = asst_core::api::open_in_window(conn, &href, token).await {
-                            log::info!("opening a task from its notification: {e}");
-                        }
-                        Ok(())
-                    }
-                    SNOOZE_MORE => {
-                        let conn = proxy.inner().connection();
-                        if let Err(e) = asst_core::api::snooze_in_window(conn, &href, token).await {
-                            log::info!("opening the snooze chooser from a notification: {e}");
-                        }
-                        Ok(())
-                    }
-                    "done" => daemon.complete(&href).map(|_| ()),
-                    // A notification from before there were several.
-                    "snooze" => snooze(daemon.config().snooze.first().copied().unwrap_or(10)),
-                    key => match key.strip_prefix("snooze:").and_then(|m| m.parse().ok()) {
-                        Some(minutes) => snooze(minutes),
-                        None => Ok(()),
-                    },
+                let Some(plan) = plan_action(args.action_key) else { continue };
+                let href = match plan.uid {
+                    Some(uid) => href_of(&daemon, uid),
+                    None => shown.lock().unwrap_or_else(|p| p.into_inner()).get(&args.id).cloned(),
                 };
-                if let Err(e) = result {
-                    log::warn!("{} from a notification: {e}", args.action_key);
+                let Some(href) = href else {
+                    // A click on a notification we cannot match to a task:
+                    // another app's, or ours from before a restart. A
+                    // button for a task that is gone closes its
+                    // notification rather than sit there doing nothing.
+                    if plan.uid.is_some() {
+                        log::info!("{} from a notification: no such task", args.action_key);
+                        let _ = proxy.close_notification(args.id).await;
+                    }
+                    continue;
+                };
+                let mut token = token.take().filter(|(id, _)| *id == args.id).map(|(_, t)| t);
+                for step in plan.steps {
+                    let conn = proxy.inner().connection();
+                    match step {
+                        Step::Open => {
+                            if let Err(e) = asst_core::api::open_in_window(conn, &href, token.take()).await {
+                                log::info!("opening a task from its notification: {e}");
+                            }
+                        }
+                        Step::Chooser => {
+                            if let Err(e) = asst_core::api::snooze_in_window(conn, &href, token.take()).await {
+                                log::info!("opening the snooze chooser from a notification: {e}");
+                            }
+                        }
+                        Step::Complete => {
+                            if let Err(e) = daemon.complete(&href) {
+                                log::warn!("{} from a notification: {e}", args.action_key);
+                            }
+                        }
+                        Step::Snooze(minutes) => {
+                            if let Err(e) = daemon.snooze(&href, minutes) {
+                                log::warn!("{} from a notification: {e}", args.action_key);
+                            }
+                        }
+                    }
                 }
                 let _ = proxy.close_notification(args.id).await;
             }
@@ -265,5 +341,88 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
             }
             else => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(uid: Option<&str>, step: Step) -> Plan<'_> {
+        Plan {
+            uid,
+            steps: vec![step],
+        }
+    }
+
+    #[test]
+    fn a_key_names_its_task_and_what_to_do() {
+        let uid = "5E9C0D4A-7B2F-4F6E-9C1A-0A3B4C5D6E7F";
+        let done = format!("done:{uid}");
+        let snooze = format!("snooze:10:{uid}");
+        let day = format!("snooze:1440:{uid}");
+        let more = format!("snooze-more:{uid}");
+        for (key, want) in [
+            ("default", Some(plan(None, Step::Open))),
+            (&done, Some(plan(Some(uid), Step::Complete))),
+            (&snooze, Some(plan(Some(uid), Step::Snooze(10)))),
+            (&day, Some(plan(Some(uid), Step::Snooze(1440)))),
+            (&more, Some(plan(Some(uid), Step::Chooser))),
+            // A UID from another client can hold colons.
+            ("done:a:b:c", Some(plan(Some("a:b:c"), Step::Complete))),
+            ("snooze:5:a:b", Some(plan(Some("a:b"), Step::Snooze(5)))),
+            // Keys made before they named a task, and keys not ours.
+            ("done", None),
+            ("snooze", None),
+            ("snooze:10", None),
+            ("snooze-more", None),
+            ("default:abc", None),
+            ("done:", None),
+            ("snooze-more:", None),
+            ("snooze:10:", None),
+            ("snooze:ten:abc", None),
+            ("snooze:-5:abc", None),
+            ("snooze::abc", None),
+            ("reply:abc", None),
+            ("", None),
+        ] {
+            assert_eq!(plan_action(key), want, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_buttons_keep_their_order_and_every_key_reads_back() {
+        let uid = "task-1";
+        let actions = actions_for(uid, &[10, 30, 60]);
+        let labels: Vec<_> = actions.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Open",
+                "Complete",
+                "Snooze 10 min",
+                "Snooze 30 min",
+                "Snooze 1 h",
+                "Snooze…"
+            ]
+        );
+        let plans: Vec<_> = actions
+            .iter()
+            .map(|(key, _)| plan_action(key).expect(key))
+            .collect();
+        assert_eq!(
+            plans,
+            [
+                plan(None, Step::Open),
+                plan(Some(uid), Step::Complete),
+                plan(Some(uid), Step::Snooze(10)),
+                plan(Some(uid), Step::Snooze(30)),
+                plan(Some(uid), Step::Snooze(60)),
+                plan(Some(uid), Step::Chooser),
+            ]
+        );
+        // A server fires "default" for the click on the notification and
+        // for nothing else, so that key stays bare.
+        assert_eq!(actions[0].0, "default");
     }
 }
