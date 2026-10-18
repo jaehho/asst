@@ -270,11 +270,17 @@ pub enum Key {
     Toggle,
     Add,
     Find,
+    /// `d`, pressed twice as vim has it.
     Delete,
+    /// The Delete key: deliberate on its own, with Undo a toast away.
+    Remove,
     /// Place the focused tray task on the plan at now.
     PlanPlace,
     /// Nudge the focused block's start by ±15 minutes.
     PlanNudge(i32),
+    /// The Up (-1) or Down (1) arrow: steps the cursor like `k` and `j`,
+    /// except in Day on a task with a slot, which it nudges.
+    Arrow(i32),
     /// Zoom the day grid in or out (Ctrl+= / Ctrl+-).
     ZoomIn,
     ZoomOut,
@@ -2908,6 +2914,7 @@ impl Window {
             Key::Open
             | Key::Toggle
             | Key::Delete
+            | Key::Remove
             | Key::Priority(_)
             | Key::Today
             | Key::Tomorrow
@@ -2927,10 +2934,11 @@ impl Window {
                         t.href.clone(),
                         t.task.is_open() && !self.completing.contains_key(&t.href),
                     )),
-                    Key::Delete => {
-                        if self
-                            .pending_d
-                            .is_some_and(|p| p.elapsed() < Duration::from_millis(800))
+                    Key::Delete | Key::Remove => {
+                        if matches!(key, Key::Remove)
+                            || self
+                                .pending_d
+                                .is_some_and(|p| p.elapsed() < Duration::from_millis(800))
                         {
                             self.pending_d = None;
                             if let Some(i) = index {
@@ -2987,6 +2995,22 @@ impl Window {
                 };
                 let hold = self.top_visible_hold();
                 sender.input(Msg::ZoomBy(factor, hold));
+            }
+            Key::Arrow(step) => {
+                // A block with a slot is moved in time; any other task is
+                // stepped to, as `j` and `k` do.
+                let slotted = self.nav == Nav::Day
+                    && self
+                        .cursor_task()
+                        .is_some_and(|t| self.plan_slot(&t.href, self.day_day).is_some());
+                let next = if slotted {
+                    Key::PlanNudge(step * model::PLAN_SNAP as i32)
+                } else if step < 0 {
+                    Key::Up
+                } else {
+                    Key::Down
+                };
+                self.key(w, next, sender);
             }
             Key::PlanNudge(delta) => {
                 let Some(t) = self.cursor_task() else { return };
@@ -4290,10 +4314,13 @@ fn vim_key(key: gdk::Key) -> Option<Key> {
         gdk::Key::x | gdk::Key::space => Key::Toggle,
         gdk::Key::a | gdk::Key::o => Key::Add,
         gdk::Key::slash => Key::Find,
-        gdk::Key::d | gdk::Key::Delete => Key::Delete,
+        gdk::Key::d => Key::Delete,
+        gdk::Key::Delete => Key::Remove,
         gdk::Key::n => Key::PlanPlace,
-        gdk::Key::Left | gdk::Key::Up => Key::PlanNudge(-(model::PLAN_SNAP as i32)),
-        gdk::Key::Right | gdk::Key::Down => Key::PlanNudge(model::PLAN_SNAP as i32),
+        gdk::Key::Left => Key::PlanNudge(-(model::PLAN_SNAP as i32)),
+        gdk::Key::Right => Key::PlanNudge(model::PLAN_SNAP as i32),
+        gdk::Key::Up => Key::Arrow(-1),
+        gdk::Key::Down => Key::Arrow(1),
         gdk::Key::_1 => Key::Priority(1),
         gdk::Key::_2 => Key::Priority(2),
         gdk::Key::_3 => Key::Priority(3),
@@ -4319,8 +4346,12 @@ fn acts_on_task(key: Key) -> bool {
         Key::Open
         | Key::Toggle
         | Key::Delete
+        | Key::Remove
         | Key::PlanPlace
         | Key::PlanNudge(_)
+        // The arrows are the focused widget's in the sidebar and on a
+        // button, unlike `j` and `k`.
+        | Key::Arrow(_)
         | Key::Priority(_)
         | Key::Today
         | Key::Tomorrow
@@ -4486,5 +4517,18 @@ mod tests {
             assert!(routes_to_tasks(Scope::Content, key), "{key:?}");
             assert!(!routes_to_tasks(Scope::Typing, key), "{key:?}");
         }
+    }
+
+    #[test]
+    fn arrows_step_the_cursor_and_the_delete_key_needs_no_second_press() {
+        use gdk::Key as K;
+        assert!(matches!(vim_key(K::Up), Some(Key::Arrow(-1))));
+        assert!(matches!(vim_key(K::Down), Some(Key::Arrow(1))));
+        // Left and Right only ever nudge a block.
+        assert!(matches!(vim_key(K::Left), Some(Key::PlanNudge(n)) if n < 0));
+        assert!(matches!(vim_key(K::Right), Some(Key::PlanNudge(n)) if n > 0));
+        // `d` waits for a second `d`, as vim's does; the Delete key acts.
+        assert!(matches!(vim_key(K::d), Some(Key::Delete)));
+        assert!(matches!(vim_key(K::Delete), Some(Key::Remove)));
     }
 }

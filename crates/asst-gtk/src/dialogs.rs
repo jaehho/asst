@@ -288,7 +288,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
         (
             "Moving around",
             &[
-                ("Next / previous task", "j k"),
+                ("Next / previous task", "j k Down Up"),
                 ("First / last task", "g <Shift>g"),
                 ("Previous / next view", "bracketleft bracketright"),
                 ("Inbox", "<Control>i"),
@@ -305,7 +305,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                 ("Add a task", "a"),
                 ("Open the selected task", "e Return"),
                 ("Complete or reopen", "x space"),
-                ("Delete", "d+d"),
+                ("Delete", "d+d Delete"),
                 ("Priority 1–4", "1...4"),
                 ("Due today / tomorrow", "t m"),
                 ("Next week", "w"),
@@ -323,7 +323,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
             "Day",
             &[
                 ("Place the task on the plan at now", "n"),
-                ("Move the block start", "Left Right"),
+                ("Move the block start", "Left Right Up Down"),
                 ("Complete the block", "x space"),
                 ("Zoom the day grid", "<Control>plus <Control>minus"),
             ],
