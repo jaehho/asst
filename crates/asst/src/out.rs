@@ -303,28 +303,30 @@ fn pending_line(l: &ProjectLink, p: &Pending, r: &Report, zone: Tz) -> String {
 }
 
 /// `asst projects log`: newest first, one row per line. What a row did, and
-/// why, is its text; the undo is in it where there is one.
-pub fn log_text(s: &Style, rows: &[LogRow], zone: Tz) -> String {
+/// why, is its text; the undo is in it where there is one. `repo` is the
+/// filter it was asked for, to say what an empty answer is the answer to.
+/// Who made a row is a column only when it was not asstd: `asst projects
+/// log` is what asstd did, and a column of the same word is no news.
+pub fn log_text(s: &Style, rows: &[LogRow], zone: Tz, repo: Option<&str>) -> String {
     if rows.is_empty() {
-        return s.dim("nothing logged");
+        return s.dim(&match repo {
+            Some(repo) => format!("nothing logged for {repo}"),
+            None => "asstd has not changed or decided anything by itself yet".into(),
+        });
     }
     let width = |cell: fn(&LogRow) -> &str| rows.iter().map(|r| cell(r).chars().count()).max();
-    let (kind_w, by_w) = (
-        width(|r| &r.kind).unwrap_or(0),
-        width(|r| &r.by).unwrap_or(0),
-    );
+    let kind_w = width(|r| &r.kind).unwrap_or(0);
+    let by_w = rows
+        .iter()
+        .any(|r| r.by != "auto")
+        .then(|| width(|r| &r.by).unwrap_or(0));
     rows.iter()
         .map(|r| {
             let when = DateTime::from_timestamp(r.at, 0)
                 .map(|t| t.with_timezone(&zone).format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| "?".into());
-            format!(
-                "{}  {:<kind_w$}  {}  {}",
-                s.dim(&when),
-                r.kind,
-                s.dim(&format!("{:<by_w$}", r.by)),
-                r.text
-            )
+            let by = by_w.map_or(String::new(), |w| s.dim(&format!("{:<w$}  ", r.by)));
+            format!("{}  {:<kind_w$}  {by}{}", s.dim(&when), r.kind, r.text)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -806,13 +808,57 @@ Labels
         ];
         // 01:04 UTC is the evening before in New York
         assert_eq!(
-            log_text(&plain(), &rows, ny()),
+            log_text(&plain(), &rows, ny(), None),
             "\
 2026-10-17 21:04  list-renamed   auto  renamed list \"champalimaud\" to \"lab\": jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005). Undo: asst list rename lab champalimaud
 2026-10-17 12:00  repo-archived  cli   jaehho/mail-digest is archived on GitHub"
         );
-        assert_eq!(log_text(&plain(), &[], ny()), "nothing logged");
         let color = Style { color: true };
-        assert!(log_text(&color, &rows, ny()).starts_with("\x1b[2m2026-10-17 21:04\x1b[0m"));
+        assert!(log_text(&color, &rows, ny(), None).starts_with("\x1b[2m2026-10-17 21:04\x1b[0m"));
+    }
+
+    #[test]
+    fn what_asstd_did_is_not_labelled_as_asstds_on_every_line() {
+        // The rows of a run on a private bus: what it did, and what it kept
+        let rows = [
+            log_row(
+                at(10, 18),
+                "list-kept",
+                "auto",
+                "jaehho/work is now jaehho/job; its list was not renamed: the list is called \
+                 \"Work stuff\", not \"work\"",
+            ),
+            log_row(
+                at(10, 18),
+                "repo-renamed",
+                "auto",
+                "jaehho/work is now jaehho/job (GitHub id 2001); the link moved with it",
+            ),
+            log_row(
+                at(10, 18),
+                "list-renamed",
+                "auto",
+                "renamed list \"champalimaud\" to \"lab\": jaehho/champalimaud is now jaehho/lab \
+                 (GitHub id 1379104005). Undo: asst list rename lab champalimaud",
+            ),
+        ];
+        assert_eq!(
+            log_text(&plain(), &rows, ny(), None),
+            r#"2026-10-18 12:00  list-kept     jaehho/work is now jaehho/job; its list was not renamed: the list is called "Work stuff", not "work"
+2026-10-18 12:00  repo-renamed  jaehho/work is now jaehho/job (GitHub id 2001); the link moved with it
+2026-10-18 12:00  list-renamed  renamed list "champalimaud" to "lab": jaehho/champalimaud is now jaehho/lab (GitHub id 1379104005). Undo: asst list rename lab champalimaud"#
+        );
+    }
+
+    #[test]
+    fn an_empty_log_says_which_question_it_answers() {
+        assert_eq!(
+            log_text(&plain(), &[], ny(), None),
+            "asstd has not changed or decided anything by itself yet"
+        );
+        assert_eq!(
+            log_text(&plain(), &[], ny(), Some("jaehho/lab")),
+            "nothing logged for jaehho/lab"
+        );
     }
 }

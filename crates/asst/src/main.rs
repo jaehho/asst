@@ -712,7 +712,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 return show_json(&raw);
             }
             let rows: Vec<LogRow> = serde_json::from_str(&raw)?;
-            println!("{}", out::log_text(&style, &rows, zone));
+            let asked = repo.as_deref().map(str::trim).filter(|r| !r.is_empty());
+            println!("{}", out::log_text(&style, &rows, zone, asked));
         }
         Cmd::Open { id } => {
             let t: TaskView = serde_json::from_str(&proxy.get(&id).await?)?;
