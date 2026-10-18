@@ -171,6 +171,29 @@ fn task_row(t: &TaskView, q: &str, sub: &str) -> gtk::ListBoxRow {
     )
 }
 
+/// The lists `q` (trimmed, lowercase) finds, each with the caption under
+/// it. An empty query offers what the sidebar shows, so archived lists
+/// stay out; a typed one finds them too, captioned `Archived`.
+fn list_hits<'a>(
+    lists: &'a [ListView],
+    q: &str,
+    archived: &[String],
+) -> Vec<(&'a ListView, Option<&'static str>)> {
+    lists
+        .iter()
+        .filter_map(|l| {
+            let gone = archived.contains(&l.href);
+            if q.is_empty() {
+                return (!gone).then_some((l, None));
+            }
+            l.name
+                .to_lowercase()
+                .contains(q)
+                .then_some((l, gone.then_some("Archived")))
+        })
+        .collect()
+}
+
 pub fn open(
     parent: &impl IsA<gtk::Widget>,
     lists: &[ListView],
@@ -261,11 +284,10 @@ pub fn open(
                     );
                 }
             }
-            let found_lists: Vec<&ListView> = lists.iter().filter(|l| matches(&l.name)).collect();
+            let found_lists = list_hits(&lists, &q, &archived);
             if !found_lists.is_empty() {
                 results.append(&header("Lists"));
-                for l in found_lists {
-                    let sub = archived.contains(&l.href).then_some("Archived");
+                for (l, sub) in found_lists {
                     add(
                         result_row(ui::list_mark(l, 16), &bold(&l.name, &q), sub, None),
                         Hit::Nav(Nav::List(l.href.clone())),
@@ -472,4 +494,46 @@ fn find_search(w: &gtk::Widget) -> Option<gtk::SearchEntry> {
         child = c.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_query_leaves_archived_lists_out() {
+        let list = |href: &str, name: &str| ListView {
+            href: href.into(),
+            name: name.into(),
+            color: None,
+            writable: true,
+            inbox: false,
+            open: 0,
+            done: 0,
+        };
+        let lists = [
+            list("/w/", "Work"),
+            list("/m/", "mail-digest"),
+            list("/b/", "Mailbox"),
+        ];
+        let archived = ["/m/".to_string()];
+        let hits = |q: &str| {
+            list_hits(&lists, q, &archived)
+                .into_iter()
+                .map(|(l, caption)| (l.name.as_str(), caption))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hits(""), [("Work", None), ("Mailbox", None)]);
+        assert_eq!(
+            hits("mail"),
+            [("mail-digest", Some("Archived")), ("Mailbox", None)]
+        );
+        assert_eq!(hits("dig"), [("mail-digest", Some("Archived"))]);
+        assert_eq!(hits("zzz"), []);
+        assert_eq!(
+            list_hits(&lists, "", &[]).len(),
+            3,
+            "nothing archived: all of them"
+        );
+    }
 }
