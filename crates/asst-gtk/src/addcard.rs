@@ -7,7 +7,8 @@
 //! the card is left (Esc, another view, the window closing); the cancel
 //! button is what throws it away. Text with nothing left once the date, list
 //! and priority are read out is no task: Add stays off and says so, and
-//! nothing is sent, so what was typed is still there to finish.
+//! nothing is sent, so what was typed stays in the card, to finish the next
+//! time it opens.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -307,8 +308,13 @@ impl AddCard {
             });
         }
         {
-            let on_cancel = card.on_cancel.clone();
-            cancel.connect_clicked(move |_| on_cancel());
+            let weak = Rc::downgrade(&card);
+            cancel.connect_clicked(move |_| {
+                if let Some(c) = weak.upgrade() {
+                    c.discard();
+                    (c.on_cancel)();
+                }
+            });
         }
         {
             // The list suggestions take arrows, Enter, Tab and Esc while up.
@@ -526,12 +532,33 @@ impl AddCard {
     }
 
     /// Show it for a new place: what was chosen for the last one goes.
+    /// Unfinished typing (no title, so leaving the card sent nothing) stays,
+    /// with the choices made for it.
     pub fn open(&self, target: Target) {
         *self.target.borrow_mut() = target;
+        if !self.holds_draft() {
+            self.discard();
+        }
+        self.refresh();
+    }
+
+    /// Throw away what is typed and chosen.
+    fn discard(&self) {
         *self.chosen.borrow_mut() = Chosen::default();
         self.entry.set_text("");
         self.notes.buffer().set_text("");
-        self.refresh();
+    }
+
+    /// Something is typed that is no task yet.
+    fn holds_draft(&self) -> bool {
+        !self.entry.text().trim().is_empty() || !self.notes_text().trim().is_empty()
+    }
+
+    fn notes_text(&self) -> String {
+        let buffer = self.notes.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string()
     }
 
     /// Where tasks go when nothing else says, keeping what was typed.
@@ -542,6 +569,9 @@ impl AddCard {
 
     pub fn focus(&self) {
         self.entry.grab_focus();
+        // Plain grab_focus selects the text, and a draft kept from the
+        // last time would be typed over.
+        self.entry.set_position(-1);
     }
 
     /// Lets pickers offer to make a list nothing is named for; `make`
@@ -898,11 +928,7 @@ impl AddCard {
         self.suggest.popdown();
         let text = self.entry.text().trim().to_string();
         let chosen = self.chosen.borrow();
-        let buffer = self.notes.buffer();
-        let notes = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .trim_end()
-            .to_string();
+        let notes = self.notes_text().trim_end().to_string();
         let mut spec = AddSpec {
             text,
             parse: true,
@@ -936,7 +962,7 @@ impl AddCard {
         drop(chosen);
         (self.on_add)(spec, self.leaving.get());
         self.entry.set_text("");
-        buffer.set_text("");
+        self.notes.buffer().set_text("");
         {
             let mut chosen = self.chosen.borrow_mut();
             chosen.schedule = None;
