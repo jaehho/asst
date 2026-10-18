@@ -111,6 +111,8 @@ pub struct Rules {
 pub struct Retry {
     /// A refusal with no `Retry-After` and no rate-limit reset.
     pub refused_wait_minutes: i64,
+    /// What a refusal that names a time is waited at the most.
+    pub longest_wait_minutes: i64,
     /// A repo GitHub cannot find by its id is asked for by name this often.
     pub name_lookup_minutes: i64,
     /// A repo GitHub cannot find gets a hint at `asst unlink` after this.
@@ -126,6 +128,7 @@ impl Rules {
             log_keep: GH_LOG_KEEP,
             retry: Retry {
                 refused_wait_minutes: limits::REFUSED_WAIT_MINUTES,
+                longest_wait_minutes: limits::LONGEST_WAIT_MINUTES,
                 name_lookup_minutes: limits::NAME_LOOKUP_MINUTES,
                 unlink_hint_days: limits::UNLINK_HINT_DAYS,
             },
@@ -762,6 +765,7 @@ mod tests {
                 "log_keep": 500,
                 "retry": {
                     "refused_wait_minutes": 15,
+                    "longest_wait_minutes": 60,
                     "name_lookup_minutes": 60,
                     "unlink_hint_days": 14,
                 },

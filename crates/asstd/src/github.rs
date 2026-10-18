@@ -27,6 +27,11 @@ use crate::follow::{self, ListNames};
 /// long.
 const REFUSED_WAIT: chrono::Duration = chrono::Duration::minutes(limits::REFUSED_WAIT_MINUTES);
 
+/// A refusal's own wait is taken at no more than this. `now + wait` is also
+/// a date that has to exist: a header with a number of seconds past the end
+/// of the calendar would otherwise end the task.
+const LONGEST_WAIT: chrono::Duration = chrono::Duration::minutes(limits::LONGEST_WAIT_MINUTES);
+
 /// A repo whose id GitHub cannot find is asked for by its name this often
 /// at most, to tell a name taken by another repo from a repo that is gone.
 const NAME_LOOKUP_EVERY: chrono::Duration = chrono::Duration::minutes(limits::NAME_LOOKUP_MINUTES);
@@ -181,12 +186,19 @@ async fn link_round(
     now: DateTime<Utc>,
 ) -> Result<bool> {
     let gate = identify(daemon, gh, memory, row, now).await?;
-    if gate == Gate::Go {
-        pass(daemon, gh, memory, row).await?;
-    }
-    if gate != Gate::Stop {
+    let synced = match gate {
+        Gate::Go => pass(daemon, gh, memory, row).await,
+        Gate::Moved | Gate::Stop => Ok(()),
+    };
+    // The list's name is not the issues' business: a listing that fails
+    // (issues turned off, a token that cannot read them) must not leave the
+    // rename to expire. A lost connection or a rejected token is GitHub's
+    // round ending, as before.
+    let lost = matches!(&synced, Err(Error::Remote(e)) if e.is_fatal());
+    if gate != Gate::Stop && !lost {
         follow::follow(daemon, lists, &row.list, now).await;
     }
+    synced?;
     Ok(gate == Gate::Go)
 }
 
@@ -287,10 +299,16 @@ async fn look(
         _ => {}
     }
     let again = match (&seen, row.repo_id) {
-        (Observed::Unchanged, Some(id)) => memory
-            .records
-            .get(&id)
-            .map(|(_, info)| Observed::Record(info.clone(), None)),
+        // A 304 answers an ETag that was sent. With no record to be
+        // unchanged from, nothing was confirmed: not a look at all.
+        (Observed::Unchanged, Some(id)) => Some(
+            memory
+                .records
+                .get(&id)
+                .map_or(Observed::Failed, |(_, info)| {
+                    Observed::Record(info.clone(), None)
+                }),
+        ),
         (Observed::Moved { id }, None) => Some(gh.repo(Target::Id(*id), None).await?),
         (Observed::Missing, Some(_)) => {
             if memory
@@ -311,6 +329,11 @@ async fn look(
     };
     if let Some(next) = again {
         seen = next;
+    }
+    // Whatever 304 is left answered a request that sent no ETag (a name
+    // lookup, or a proxy in between): nothing was said about the repo
+    if seen == Observed::Unchanged {
+        seen = Observed::Failed;
     }
     Ok(Some(seen))
 }
@@ -536,7 +559,7 @@ fn unsettled(
         Observed::Denied { retry } => {
             let wait = retry
                 .and_then(|d| chrono::Duration::from_std(d).ok())
-                .unwrap_or(REFUSED_WAIT);
+                .map_or(REFUSED_WAIT, |d| d.min(LONGEST_WAIT));
             let until = now + wait;
             memory.waits.insert(repo.to_string(), until);
             let at = until.with_timezone(&daemon.zone).format("%H:%M");
@@ -600,7 +623,15 @@ async fn pass(daemon: &Daemon, gh: &GitHub, memory: &mut Memory, row: &GhLinkRow
             memory.issues.remove(repo);
             issues
         }
-        None => memory.issues[repo].1.clone(),
+        None => match memory.issues.get(repo) {
+            Some((_, issues)) => issues.clone(),
+            // A 304 answers an ETag that was sent; none was
+            None => {
+                return Err(Error::Invalid(
+                    "GitHub said the issues are unchanged, and was not asked".into(),
+                ));
+            }
+        },
     };
     let (ops, hrefs) = {
         let store = daemon.store();
@@ -2435,6 +2466,693 @@ mod tests {
                     .all(|(repo, state, _)| repo.ends_with("/mail-digest") && *state == "archived"),
                 "only mail-digest needs a look: {looked:?}"
             );
+        }
+    }
+
+    // -- a review for robustness: things that went wrong, now pinned -------
+
+    #[tokio::test]
+    async fn a_second_rename_before_the_list_followed_still_renames_the_list() {
+        // The server is out of reach for the first rename, and GitHub
+        // renames the repo again before it is back: the list is still the
+        // one named for the repo as it was when the wait began.
+        let mut rig = waiting_to_follow().await;
+        rig.rename_on_github(LAB, "jaehho/lab", "jaehho/lab2", "[]");
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.rows().len(), 1);
+        assert_eq!(rig.row("jaehho/lab2").list, CHAMPALIMAUD);
+
+        rig.lists.with(|s| s.fresh_fails = None);
+        rig.later(5);
+        rig.go().await;
+
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab2");
+        let log = rig.log();
+        assert_eq!(log[0].kind, "list-renamed", "{:?}", kinds(&log));
+        assert_eq!(rig.row("jaehho/lab2").follow_from, None);
+        assert_eq!(rig.notices().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rename_and_back_before_the_list_followed_leaves_the_list_alone() {
+        let mut rig = waiting_to_follow().await;
+        rig.rename_on_github(LAB, "jaehho/lab", "jaehho/champalimaud", "[]");
+        rig.later(5);
+        rig.go().await;
+        assert_eq!(rig.row("jaehho/champalimaud").list, CHAMPALIMAUD);
+
+        rig.lists.with(|s| s.fresh_fails = None);
+        rig.later(5);
+        rig.go().await;
+
+        assert_eq!(rig.lists.renames(), 0);
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "champalimaud");
+        assert_eq!(rig.row("jaehho/champalimaud").follow_from, None);
+        assert!(rig.notices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wait_too_long_to_count_does_not_end_the_github_task() {
+        for (label, reply) in [
+            (
+                "retry-after",
+                Reply::status(429).header("retry-after", "10000000000000"),
+            ),
+            (
+                "the window's reset",
+                Reply::status(403)
+                    .header("x-ratelimit-remaining", "0")
+                    .header("x-ratelimit-reset", "99999999999999"),
+            ),
+            (
+                "retry-after at the end of the numbers",
+                Reply::status(429).header("retry-after", "18446744073709551615"),
+            ),
+        ] {
+            let mut rig = Rig::new(&["jaehho/x", "jaehho/y"]).await;
+            rig.publish(5, "jaehho/x", false);
+            rig.publish(6, "jaehho/y", false);
+            rig.go().await;
+            rig.fake.reply("GET", "/repositories/5", reply);
+
+            // A panic here would end the task `run` is, silently
+            assert_eq!(rig.go().await, Round::Done, "{label}");
+
+            // And the wait is a wait, not forever
+            rig.fake.etagged(
+                "/repositories/5",
+                &etag(5, "jaehho/x", false),
+                &record(5, "jaehho/x", false),
+            );
+            let asked = rig.fake.count("/repositories/5");
+            rig.later(24 * 60);
+            rig.go().await;
+            assert_eq!(rig.fake.count("/repositories/5"), asked + 1, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_304_that_nothing_asked_for_is_not_a_look() {
+        let mut rig = Rig::new(&["jaehho/x"]).await;
+        rig.publish(5, "jaehho/x", false);
+        rig.go().await;
+        // A new process has no record to be unchanged from
+        rig.restart();
+        rig.pair_up("jaehho/x", 3, "Three");
+        let before = rig.snap();
+        let asked = rig.issues_asked("jaehho/x");
+        rig.fake.reply("GET", "/repositories/5", Reply::status(304));
+
+        assert_eq!(rig.go().await, Round::Done);
+
+        assert_eq!(rig.snap(), before);
+        assert_eq!(rig.issues_asked("jaehho/x"), asked, "nothing was confirmed");
+        assert!(rig.link("jaehho/x").error.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_old_name_made_again_after_a_rename_is_not_the_link() {
+        let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+        rig.publish(LAB, "jaehho/champalimaud", false);
+        rig.go().await;
+        let issues = rig.pair_up("jaehho/champalimaud", 7, "One");
+        rig.go().await;
+        rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", &issues);
+        rig.go().await;
+        // Someone makes `champalimaud` again, with other issues
+        rig.publish(999, "jaehho/champalimaud", false);
+        rig.fake.reply(
+            "GET",
+            "/repos/jaehho/champalimaud/issues",
+            Reply::json(
+                200,
+                r#"[{"number":1,"title":"Not ours","state":"open","body":null,"labels":[]}]"#,
+            ),
+        );
+        let before = rig.snap();
+        let asked = rig.issues_asked("jaehho/champalimaud");
+
+        rig.later(5);
+        rig.go().await;
+        rig.later(5);
+        rig.go().await;
+
+        assert_eq!(rig.issues_asked("jaehho/champalimaud"), asked);
+        assert_eq!(rig.snap().pairs, before.pairs);
+        assert_eq!(rig.snap().tasks, before.tasks);
+        assert_eq!(rig.row("jaehho/lab").repo_id, Some(LAB));
+    }
+
+    // -- a world that changes under the daemon -----------------------------
+
+    /// What GitHub is, as a test can change it: repos with ids, names they
+    /// had, and issues, and one failure to give the next request of a kind.
+    #[derive(Clone)]
+    struct Repo {
+        id: u64,
+        name: String,
+        /// Names it answered to before, newest last: they redirect.
+        former: Vec<String>,
+        /// Every name it has had, in short, for the lists named after it.
+        had: Vec<String>,
+        archived: bool,
+        alive: bool,
+        issues: Vec<(u32, String)>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Aim {
+        Id,
+        Name,
+        Issues,
+    }
+
+    #[derive(Default)]
+    struct World {
+        repos: Vec<Repo>,
+        next_id: u64,
+        fault: Option<(Aim, Reply)>,
+    }
+
+    enum Found {
+        Current(Repo),
+        Moved(Repo),
+        Nothing,
+    }
+
+    impl Found {
+        fn is_nothing(&self) -> bool {
+            matches!(self, Found::Nothing)
+        }
+    }
+
+    impl World {
+        fn find(&self, name: &str) -> Found {
+            if let Some(r) = self.repos.iter().find(|r| r.alive && r.name == name) {
+                return Found::Current(r.clone());
+            }
+            match self
+                .repos
+                .iter()
+                .find(|r| r.alive && r.former.iter().any(|f| f == name))
+            {
+                Some(r) => Found::Moved(r.clone()),
+                None => Found::Nothing,
+            }
+        }
+
+        fn rename(&mut self, at: usize, to: &str) {
+            let r = &mut self.repos[at];
+            let old = std::mem::replace(&mut r.name, to.to_string());
+            r.former.push(old);
+            r.former.retain(|f| f != to);
+            r.had.push(short(to).to_string());
+        }
+
+        /// Deleted, and made again by someone under the same name.
+        fn replace(&mut self, at: usize) {
+            let name = self.repos[at].name.clone();
+            self.repos[at].alive = false;
+            let id = self.next_id;
+            self.next_id += 1;
+            self.repos.push(Repo {
+                id,
+                had: vec![short(&name).to_string()],
+                name,
+                former: Vec::new(),
+                archived: false,
+                alive: true,
+                issues: vec![(1, "Theirs".into())],
+            });
+        }
+    }
+
+    fn listing(issues: &[(u32, String)]) -> String {
+        let items: Vec<String> = issues
+            .iter()
+            .map(|(n, t)| {
+                format!(r#"{{"number":{n},"title":"{t}","state":"open","body":null,"labels":[]}}"#)
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    fn described(req: &asst_core::testing::Seen, r: &Repo) -> Reply {
+        let tag = etag(r.id, &r.name, r.archived);
+        if req.header("if-none-match") == Some(tag.as_str()) {
+            Reply::status(304).header("etag", &tag)
+        } else {
+            Reply::json(200, &record(r.id, &r.name, r.archived)).header("etag", &tag)
+        }
+    }
+
+    /// The fake answers from the world, whatever its names are now.
+    fn serve_world(fake: &FakeGitHub, world: &Arc<Mutex<World>>, names: &[String], ids: &[u64]) {
+        let base = fake.base();
+        for name in names {
+            let (w, b) = (world.clone(), base.clone());
+            let own = name.clone();
+            fake.on("GET", &format!("/repos/{name}"), move |req| {
+                let w = w.lock().unwrap();
+                if let Some((Aim::Name, reply)) = &w.fault {
+                    return reply.clone();
+                }
+                match w.find(&own) {
+                    Found::Current(r) => described(req, &r),
+                    Found::Moved(r) => {
+                        Reply::status(301).header("location", &format!("{b}/repositories/{}", r.id))
+                    }
+                    Found::Nothing => Reply::json(404, r#"{"message":"Not Found"}"#),
+                }
+            });
+            let (w, b) = (world.clone(), base.clone());
+            let own = name.clone();
+            fake.on("GET", &format!("/repos/{name}/issues"), move |_| {
+                let w = w.lock().unwrap();
+                if let Some((Aim::Issues, reply)) = &w.fault {
+                    return reply.clone();
+                }
+                match w.find(&own) {
+                    Found::Current(r) => Reply::json(200, &listing(&r.issues)),
+                    Found::Moved(r) => Reply::status(301)
+                        .header("location", &format!("{b}/repositories/{}/issues", r.id)),
+                    Found::Nothing => Reply::json(404, r#"{"message":"Not Found"}"#),
+                }
+            });
+        }
+        for id in ids {
+            let (w, id) = (world.clone(), *id);
+            fake.on("GET", &format!("/repositories/{id}"), move |req| {
+                let w = w.lock().unwrap();
+                if let Some((Aim::Id, reply)) = &w.fault {
+                    return reply.clone();
+                }
+                match w.repos.iter().find(|r| r.alive && r.id == id) {
+                    Some(r) => described(req, r),
+                    None => Reply::json(404, r#"{"message":"Not Found"}"#),
+                }
+            });
+        }
+    }
+
+    /// Small numbers from a seed, the same every time.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) % below
+        }
+    }
+
+    /// The same few things, in a different order for each seed, are done to
+    /// GitHub and to the server while the daemon goes round. Whatever
+    /// happens, it writes nothing to GitHub, deletes nothing, never takes
+    /// another repo for a linked one, and never renames a list that is not
+    /// named for its repo.
+    #[tokio::test]
+    async fn whatever_happens_to_the_repos_nothing_is_lost_or_written() {
+        the_world_changes(1..=2, 16, 3).await;
+    }
+
+    /// The same for a long time: `cargo test -p asstd soak -- --ignored`.
+    #[tokio::test]
+    #[ignore = "takes minutes"]
+    async fn soak_whatever_happens_to_the_repos() {
+        the_world_changes(1..=150, 60, 4).await;
+    }
+
+    async fn the_world_changes(seeds: std::ops::RangeInclusive<u64>, steps: usize, count: usize) {
+        const FRESH: usize = 70;
+        let started = std::time::Instant::now();
+        for seed in seeds {
+            let mut dice = Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut trace: Vec<String> = Vec::new();
+            let names: Vec<String> = (0..count)
+                .map(|i| format!("o/r{i}"))
+                .chain((0..FRESH).map(|i| format!("o/n{i}")))
+                .collect();
+            let repos: Vec<&str> = names[..count].iter().map(String::as_str).collect();
+            let mut rig = Rig::new(&repos).await;
+            rig.gh = GitHub::with_base("tok", &rig.fake.base())
+                .unwrap()
+                .with_timeout(Duration::from_millis(120));
+            let world = Arc::new(Mutex::new(World {
+                next_id: 500,
+                ..World::default()
+            }));
+            for (i, name) in repos.iter().enumerate() {
+                let issues = vec![(1, format!("T{i}a")), (2, format!("T{i}b"))];
+                for (number, title) in &issues {
+                    let list = rig.row(name).list;
+                    let task = rig
+                        .daemon
+                        .store()
+                        .create(&list, &[Edit::Summary(title.clone())], rig.now)
+                        .unwrap();
+                    let pair = Pair {
+                        number: *number,
+                        uid: task.task.uid,
+                        title: title.clone(),
+                        open: true,
+                        body: None,
+                        priority: 0,
+                    };
+                    rig.daemon.store().gh_pair(name, &pair).unwrap();
+                }
+                world.lock().unwrap().repos.push(Repo {
+                    id: 100 + i as u64,
+                    name: name.to_string(),
+                    former: Vec::new(),
+                    had: vec![short(name).to_string()],
+                    archived: false,
+                    alive: true,
+                    issues,
+                });
+            }
+            let ids: Vec<u64> = (100..140).collect();
+            serve_world(&rig.fake, &world, &names, &ids);
+            rig.go().await;
+            let known: HashMap<String, u64> = rig
+                .rows()
+                .into_iter()
+                .map(|r| (r.list, r.repo_id.expect("learned")))
+                .collect();
+            let hrefs: Vec<String> = rig.rows().into_iter().map(|r| r.list).collect();
+            let sorted = |mut tasks: Vec<(String, String, bool)>| {
+                tasks.sort();
+                tasks
+            };
+            let tasks_before = sorted(rig.snap().tasks);
+            let pairs_before: usize = rig.snap().pairs.iter().map(|(_, p)| p.len()).sum();
+            // Names a list may have: its own, what its repo was called, and
+            // what someone called it
+            let mut allowed: HashMap<String, Vec<String>> = hrefs
+                .iter()
+                .map(|h| (h.clone(), vec![rig.lists.name(h)]))
+                .collect();
+            let mut fresh = 0;
+            let mut asked = rig.fake.seen().len();
+
+            for step in 0..steps {
+                // What happens before this round
+                let mut happened = Vec::new();
+                for _ in 0..1 + dice.roll(2) {
+                    let pick = dice.roll(count as u64) as usize;
+                    let what = dice.roll(16);
+                    let mut w = world.lock().unwrap();
+                    match what {
+                        0..=3 if fresh < FRESH => {
+                            let to = format!("o/n{fresh}");
+                            fresh += 1;
+                            if w.repos[pick].alive && w.find(&to).is_nothing() {
+                                happened.push(format!("{} -> {to}", w.repos[pick].name));
+                                w.rename(pick, &to);
+                            }
+                        }
+                        4 => {
+                            let r = &mut w.repos[pick];
+                            r.archived = !r.archived;
+                            happened.push(format!("{} archived={}", r.name, r.archived));
+                        }
+                        5 => {
+                            let at = (0..w.repos.len()).find(|i| {
+                                w.repos[*i].alive && w.repos[*i].id == known[&hrefs[pick]]
+                            });
+                            if let Some(at) = at {
+                                happened
+                                    .push(format!("{} deleted and made again", w.repos[at].name));
+                                w.replace(at);
+                            }
+                        }
+                        6 => {
+                            // Two repos change names
+                            let other = (pick + 1 + dice.roll(count as u64 - 1) as usize) % count;
+                            let ids = (known[&hrefs[pick]], known[&hrefs[other]]);
+                            let at = |w: &World, id: u64| {
+                                w.repos.iter().position(|r| r.alive && r.id == id)
+                            };
+                            if let (Some(a), Some(b)) = (at(&w, ids.0), at(&w, ids.1)) {
+                                let (na, nb) = (w.repos[a].name.clone(), w.repos[b].name.clone());
+                                happened.push(format!("{na} and {nb} swap"));
+                                w.rename(a, "o/tmp");
+                                w.rename(b, &na);
+                                w.rename(a, &nb);
+                            }
+                        }
+                        7 => {
+                            let aim = [Aim::Id, Aim::Name, Aim::Issues][dice.roll(3) as usize];
+                            let reply = match dice.roll(9) {
+                                0 => Reply::json(403, "{}").header("retry-after", "30"),
+                                1 => Reply::json(403, "{}"),
+                                2 => Reply::json(429, "{}"),
+                                3 => Reply::status(500),
+                                4 => Reply::json(404, "{}"),
+                                5 => Reply::json(200, "{\"hello\":1}"),
+                                // Only a record that did not change is
+                                // 304 for an id; it is no fault to lie about
+                                6 if aim != Aim::Id => Reply::status(304),
+                                6 => Reply::status(504),
+                                7 => Reply::status(502),
+                                // A hang costs the whole wait, each round
+                                _ if dice.roll(4) == 0 => Reply::hang(),
+                                _ => Reply::status(503),
+                            };
+                            happened.push(format!("{aim:?} fails with {}", reply.status));
+                            w.fault = Some((aim, reply));
+                        }
+                        8 | 9 => {
+                            w.fault = None;
+                            happened.push("GitHub is well".into());
+                        }
+                        10 => {
+                            drop(w);
+                            let fail = [Fail::Network, Fail::Status(500), Fail::Status(403)]
+                                [dice.roll(3) as usize];
+                            happened.push(format!("the server fails {fail:?}"));
+                            rig.lists.with(|s| match dice.roll(3) {
+                                0 => s.fresh_fails = Some(fail),
+                                1 => s.rename_fails = Some(fail),
+                                _ => s.rename_reply_lost = Some(fail),
+                            });
+                        }
+                        11 | 12 => {
+                            drop(w);
+                            rig.lists.with(|s| {
+                                s.fresh_fails = None;
+                                s.rename_fails = None;
+                                s.rename_reply_lost = None;
+                            });
+                            happened.push("the server is well".into());
+                        }
+                        13 => {
+                            drop(w);
+                            let custom = format!("Mine {step}");
+                            happened.push(format!("{} is named {custom}", hrefs[pick]));
+                            rig.lists.set_name(&hrefs[pick], &custom);
+                            allowed.get_mut(&hrefs[pick]).unwrap().push(custom);
+                        }
+                        14 => {
+                            drop(w);
+                            happened.push("a restart".into());
+                            rig.restart();
+                        }
+                        _ => {}
+                    }
+                }
+                let minutes = [0, 1, 5, 5, 20, 90][dice.roll(6) as usize];
+                rig.later(minutes);
+                trace.push(format!("{step}: {happened:?} +{minutes}m"));
+
+                let ended = rig.go().await;
+
+                // Nothing was written to GitHub, whatever it did
+                let seen = rig.fake.seen();
+                let new = &seen[asked..];
+                asked = seen.len();
+                let at = format!("seed {seed} step {step}\n{}", trace.join("\n"));
+                assert!(
+                    new.iter().all(|r| r.method == "GET"),
+                    "a write to GitHub: {:?}\n{at}",
+                    new.iter().find(|r| r.method != "GET")
+                );
+                let identity = new
+                    .iter()
+                    .filter(|r| {
+                        r.path().starts_with("/repositories/") || !r.path().ends_with("/issues")
+                    })
+                    .count();
+                assert!(identity <= 2 * count, "{identity} identity requests\n{at}");
+                let _ = ended;
+
+                // Nothing lost
+                let snap = rig.snap();
+                assert_eq!(snap.links.len(), count, "a link was lost\n{at}");
+                assert_eq!(
+                    sorted(snap.tasks.clone()),
+                    tasks_before,
+                    "a task changed\n{at}"
+                );
+                let pairs: usize = snap.pairs.iter().map(|(_, p)| p.len()).sum();
+                assert_eq!(pairs, pairs_before, "a pair was lost\n{at}");
+                // The id is the repo's, and stays
+                for row in &snap.links {
+                    assert_eq!(row.repo_id, Some(known[&row.list]), "{}\n{at}", row.repo);
+                }
+                // A list is called what it was, what its repo was called,
+                // or what someone made it
+                for (i, href) in hrefs.iter().enumerate() {
+                    let name = rig.lists.name(href);
+                    let had = world.lock().unwrap().repos[i].had.clone();
+                    assert!(
+                        allowed[href].contains(&name) || had.contains(&name),
+                        "{href} is called {name:?}\n{at}"
+                    );
+                }
+                let hour = (rig.now - chrono::Duration::hours(1)).timestamp();
+                let renamed = snap
+                    .log
+                    .iter()
+                    .filter(|r| r.kind == "list-renamed" && r.at > hour)
+                    .count();
+                assert!(
+                    renamed <= limits::RENAMES_PER_HOUR,
+                    "{renamed} lists in an hour\n{at}"
+                );
+                for row in &snap.log {
+                    assert!(
+                        [
+                            "repo-renamed",
+                            "repo-archived",
+                            "repo-unarchived",
+                            "repo-replaced",
+                            "rename-conflict",
+                            "list-renaming",
+                            "list-renamed",
+                            "list-kept",
+                        ]
+                        .contains(&row.kind.as_str()),
+                        "{}\n{at}",
+                        row.kind
+                    );
+                }
+                // A word is said once, not every round
+                for pair in snap.log.windows(2) {
+                    let (new, old) = (&pair[0], &pair[1]);
+                    assert!(
+                        !(new.repo == old.repo
+                            && new.kind == old.kind
+                            && new.data == old.data
+                            && [
+                                "repo-replaced",
+                                "rename-conflict",
+                                "repo-archived",
+                                "repo-unarchived"
+                            ]
+                            .contains(&new.kind.as_str())),
+                        "{} twice\n{at}",
+                        new.kind
+                    );
+                }
+            }
+
+            // The world is well again: the links settle, and then rest
+            {
+                let mut w = world.lock().unwrap();
+                w.fault = None;
+            }
+            rig.lists.with(|s| {
+                s.fresh_fails = None;
+                s.rename_fails = None;
+                s.rename_reply_lost = None;
+            });
+            let mut last = None;
+            for _ in 0..6 {
+                rig.later(70);
+                rig.go().await;
+                let snap = rig.snap();
+                if last.as_ref() == Some(&snap) {
+                    break;
+                }
+                last = Some(snap);
+            }
+            rig.later(70);
+            rig.go().await;
+            let at = format!("seed {seed}, settled\n{}", trace.join("\n"));
+            assert_eq!(Some(rig.snap()), last, "it did not rest\n{at}");
+            let w = world.lock().unwrap();
+            for row in rig.rows() {
+                let link = rig.link(&row.repo);
+                let truth = w.repos.iter().find(|r| r.alive && r.id == known[&row.list]);
+                // A link that is not where its repo is says why
+                let right = truth.is_some_and(|r| r.name == row.repo);
+                assert!(
+                    right || link.state.is_some(),
+                    "{} is {truth:?}, and says nothing\n{at}",
+                    row.repo,
+                    truth = truth.map(|r| r.name.clone())
+                );
+            }
+        }
+        println!("the world: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_repo_whose_issues_cannot_be_read_still_has_its_list_follow() {
+        let mut rig = waiting_to_follow().await;
+        rig.lists.with(|s| s.fresh_fails = None);
+        rig.fake.reply(
+            "GET",
+            "/repos/jaehho/lab/issues",
+            Reply::json(410, r#"{"message":"Issues are disabled for this repo"}"#),
+        );
+        rig.later(5);
+
+        assert_eq!(rig.go().await, Round::Done);
+
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "lab");
+        assert_eq!(rig.row("jaehho/lab").follow_from, None);
+        assert!(rig.link("jaehho/lab").error.is_some(), "and the sync fails");
+        assert_eq!(rig.notices().len(), 1);
+
+        // A lost connection is the round's end, and the list waits for it
+        let mut rig = waiting_to_follow().await;
+        rig.lists.with(|s| s.fresh_fails = None);
+        rig.fake
+            .reply("GET", "/repos/jaehho/lab/issues", Reply::hang());
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Offline);
+        assert_eq!(rig.lists.name(CHAMPALIMAUD), "champalimaud");
+        assert!(rig.row("jaehho/lab").follow_from.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_that_cannot_be_followed_to_a_record_changes_nothing() {
+        // The old name moved, and the id it moved to is out of reach: a
+        // timeout, an error, a refusal or not there
+        for (label, reply, ends) in [
+            ("a timeout", Reply::hang(), Round::Offline),
+            ("a 500", Reply::status(500), Round::Done),
+            ("a 403", Reply::json(403, "{}"), Round::Done),
+            ("a 404", Reply::status(404), Round::Done),
+            ("not a record", Reply::json(200, "[]"), Round::Done),
+        ] {
+            let mut rig = Rig::new(&["jaehho/champalimaud"]).await;
+            let issues = rig.pair_up("jaehho/champalimaud", 7, "One");
+            rig.rename_on_github(LAB, "jaehho/champalimaud", "jaehho/lab", &issues);
+            rig.fake
+                .reply("GET", &format!("/repositories/{LAB}"), reply);
+            let before = rig.snap();
+
+            assert_eq!(rig.go().await, ends, "{label}");
+
+            assert_eq!(rig.snap(), before, "{label}");
+            assert_eq!(rig.row("jaehho/champalimaud").repo_id, None, "{label}");
+            assert_eq!(rig.issues_asked("jaehho/champalimaud"), 0, "{label}");
+            assert!(rig.lists.calls().is_empty(), "{label}");
         }
     }
 }

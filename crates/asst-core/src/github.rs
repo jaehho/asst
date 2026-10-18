@@ -327,6 +327,10 @@ pub mod limits {
     /// A refusal that says nothing about when to come back (no
     /// `Retry-After`, no rate-limit reset) is waited out this long.
     pub const REFUSED_WAIT_MINUTES: i64 = 15;
+    /// The longest a refusal's own wait is taken at: a rate limit resets
+    /// within the hour, and a header that asks for more (or a clock that
+    /// is off) must not park a link for days.
+    pub const LONGEST_WAIT_MINUTES: i64 = 60;
     /// A repo whose id GitHub cannot find is asked for by its name this
     /// often at most, to tell a name taken by another repo from a repo that
     /// is gone.
