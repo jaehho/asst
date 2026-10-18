@@ -1,7 +1,7 @@
 //! The Day view: one time axis, tracked ActivityWatch blocks in the left
 //! lane, plan slots in the right. The grid chrome (hour rows, now-line,
-//! day header, scroller, zoom) is `daygrid`. The unscheduled tray sits in
-//! a third column beside the grid so it never steals the time axis.
+//! day header, scroller, zoom) is `daygrid`. The tray of tasks to place sits
+//! in a third column beside the grid so it never steals the time axis.
 
 use relm4::gtk::{self, prelude::*};
 
@@ -29,7 +29,7 @@ pub fn build_column(
     let today = o.now.date_naive();
     let day = p.day;
     let note = format!(
-        "{} planned · {} unscheduled · {}",
+        "{} planned · {} to place · {}",
         p.blocks.len(),
         p.tray.len(),
         time::day_note(o.blocks)

@@ -32,7 +32,7 @@ use crate::prefs::{PrefPatch, Prefs};
 use crate::sidebar::{self, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
-use crate::{client, dialogs, find, plan, settings};
+use crate::{client, dialogs, find, settings};
 
 pub type Tx = relm4::Sender<Msg>;
 
@@ -1388,13 +1388,13 @@ impl Component for Window {
                         None => format!(
                             "Planned {}{on_day} at {}",
                             quoted(&t.task.summary),
-                            plan::clock_label(start)
+                            model::clock_label(start)
                         ),
                         Some((s, d)) if s == start && d == duration => return,
                         Some(_) => format!(
                             "Moved {} to {}",
                             quoted(&t.task.summary),
-                            plan::clock_label(start)
+                            model::clock_label(start)
                         ),
                     };
                     let toast = adw::Toast::builder()
@@ -3018,7 +3018,7 @@ impl Window {
                     let said = format!(
                         "{} is already planned at {}",
                         quoted(&t.task.summary),
-                        plan::clock_label(start)
+                        model::clock_label(start)
                     );
                     let toast = adw::Toast::builder()
                         .title(glib::markup_escape_text(&said))

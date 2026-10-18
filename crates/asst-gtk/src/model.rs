@@ -931,6 +931,14 @@ pub struct DayPlan {
     pub now_min: Option<u32>,
 }
 
+/// A clock time in the app's one voice, `9am` or `5:30pm`: the hour rules,
+/// the blocks and the toasts all say it this way. `24 * 60` reads as the
+/// next midnight.
+pub fn clock_label(min: u32) -> String {
+    let t = NaiveTime::from_hms_opt(min / 60, min % 60, 0).unwrap_or(NaiveTime::MIN);
+    fmt::time_label(t)
+}
+
 /// Snap `min` (minutes from midnight) to the plan grid.
 pub fn snap(min: i32) -> u32 {
     let s = PLAN_SNAP as i32;
@@ -1404,7 +1412,13 @@ impl Counts {
                     c.overdue += 1;
                     c.today += 1;
                 }
-                Some(d) if d == today => c.today += 1,
+                Some(d) if d == today => {
+                    c.today += 1;
+                    // Due earlier today: late, though still among today's.
+                    if t.task.due.as_ref().is_some_and(|d| fmt::is_overdue(d, now)) {
+                        c.overdue += 1;
+                    }
+                }
                 Some(d) => {
                     c.scheduled += 1;
                     if d == today + Duration::days(1) {
@@ -1597,13 +1611,16 @@ pub fn capitalize(s: &str) -> String {
     })
 }
 
-/// A due date as a row shows it, and the class that colors it.
+/// A due date as a row shows it, and the class that colors it. A time that
+/// has gone by is overdue the same day, as it is in the bar and the
+/// notification.
 pub fn due_chip(when: &When, now: DateTime<Tz>) -> (String, &'static str) {
-    let date = when.local_date(now.timezone());
-    let class = match date.cmp(&now.date_naive()) {
-        std::cmp::Ordering::Less => "overdue",
-        std::cmp::Ordering::Equal => "today",
-        std::cmp::Ordering::Greater => "upcoming",
+    let class = if fmt::is_overdue(when, now) {
+        "overdue"
+    } else if when.local_date(now.timezone()) == now.date_naive() {
+        "today"
+    } else {
+        "upcoming"
     };
     (capitalize(&fmt::due_label(when, now)), class)
 }
@@ -1926,6 +1943,50 @@ mod tests {
 
     fn uids(s: &Section) -> Vec<&str> {
         s.tasks.iter().map(|t| t.task.uid.as_str()).collect()
+    }
+
+    #[test]
+    fn a_time_gone_by_is_overdue_the_same_day() {
+        let zone = ny();
+        // now() is Monday 10:00.
+        let timed = |h, m| Some(When::local(date(9, 14).and_hms_opt(h, m, 0).unwrap(), zone));
+        let chip = |due: Option<When>| due_chip(&due.unwrap(), now());
+        assert_eq!(chip(timed(8, 0)), ("Today 8am".to_string(), "overdue"));
+        assert_eq!(chip(timed(10, 30)), ("Today 10:30am".to_string(), "today"));
+        // A date alone is today's until the day is over.
+        assert_eq!(chip(on(date(9, 14))), ("Today".to_string(), "today"));
+        assert_eq!(chip(on(date(9, 13))).1, "overdue");
+        assert_eq!(chip(on(date(9, 15))).1, "upcoming");
+        let tomorrow_early = Some(When::local(date(9, 15).and_hms_opt(8, 0, 0).unwrap(), zone));
+        assert_eq!(chip(tomorrow_early).1, "upcoming");
+
+        // The sidebar and the tray count it as overdue, and still as today's.
+        let lists = lists();
+        let open = vec![
+            task("early", "/a/", timed(8, 0)),
+            task("later", "/a/", timed(15, 0)),
+            task("all-day", "/a/", on(date(9, 14))),
+            task("yesterday", "/a/", on(date(9, 13))),
+        ];
+        let data = Data {
+            lists: &lists,
+            open: &open,
+            completed: None,
+            sunday_first: false,
+        };
+        let c = Counts::new(&data, &[], now());
+        assert_eq!((c.today, c.overdue), (4, 2));
+    }
+
+    #[test]
+    fn clock_times_read_the_same_everywhere() {
+        assert_eq!(clock_label(0), "12am");
+        assert_eq!(clock_label(9 * 60), "9am");
+        assert_eq!(clock_label(12 * 60), "12pm");
+        assert_eq!(clock_label(13 * 60 + 30), "1:30pm");
+        assert_eq!(clock_label(23 * 60 + 45), "11:45pm");
+        // The end of a block that runs to midnight.
+        assert_eq!(clock_label(24 * 60), "12am");
     }
 
     #[test]

@@ -52,12 +52,7 @@ pub fn minutes_from_midnight(ms: i64, day: NaiveDate, zone: Tz) -> f64 {
 }
 
 pub fn hour_label(hour: u32) -> String {
-    match hour {
-        0 => "12 AM".into(),
-        12 => "12 PM".into(),
-        h if h < 12 => format!("{h} AM"),
-        h => format!("{} PM", h - 12),
-    }
+    model::clock_label(hour * 60)
 }
 
 /// The hour-label gutter for the full day.
@@ -323,7 +318,7 @@ pub fn day_header(
     let title_lab = gtk::Label::new(Some(title));
     title_lab.add_css_class("view-title");
     left.append(&title_lab);
-    let date_lab = gtk::Label::new(Some(&day.format("%B %e, %Y").to_string()));
+    let date_lab = gtk::Label::new(Some(&day.format("%A, %B %-d, %Y").to_string()));
     date_lab.add_css_class("time-date");
     date_lab.set_xalign(0.0);
     left.append(&date_lab);

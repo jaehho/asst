@@ -9,14 +9,13 @@ use relm4::gtk::{self, prelude::*};
 use crate::daygrid;
 use crate::model;
 
+/// A span in the same words the plan's popover uses: `1 h 6 min`, `25 min`.
 fn dur_label(secs: f64) -> String {
-    let s = secs.max(0.0).round() as i64;
-    if s >= 3600 {
-        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
-    } else if s >= 60 {
-        format!("{}m", (s + 30) / 60)
+    let s = secs.max(0.0).round() as u64;
+    if s >= 60 {
+        asst_core::fmt::minutes((s + 30) / 60)
     } else {
-        format!("{s}s")
+        format!("{s} s")
     }
 }
 
@@ -112,8 +111,8 @@ pub fn fill_lane(
         let top = s / 60.0 * px_per_hour;
         let height_px = ((e - s) / 60.0 * px_per_hour).max(18.0);
         let label = b.label.as_deref().unwrap_or("untagged");
-        let start_s = local_of(b.start, zone).format("%H:%M").to_string();
-        let end_s = local_of(b.end, zone).format("%H:%M").to_string();
+        let start_s = asst_core::fmt::time_label(local_of(b.start, zone).time());
+        let end_s = asst_core::fmt::time_label(local_of(b.end, zone).time());
         let dur = dur_label(duration(b));
 
         let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -130,7 +129,7 @@ pub fn fill_lane(
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&title);
         if height_px >= 34.0 {
-            let meta = gtk::Label::new(Some(&format!("{start_s}–{end_s} · {dur}")));
+            let meta = gtk::Label::new(Some(&format!("{start_s} – {end_s} · {dur}")));
             meta.add_css_class("time-block-meta");
             meta.set_xalign(0.0);
             chip.append(&meta);

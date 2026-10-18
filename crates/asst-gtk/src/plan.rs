@@ -1,5 +1,5 @@
 //! Plan slots for the Day view's right lane: placed blocks on the hour
-//! timeline, and an unscheduled tray to drag from. The day's shape is
+//! timeline, and a tray of tasks to place to drag from. The day's shape is
 //! computed in `model::day_plan`; this module only draws it and turns
 //! drags into slot edits. A drag also draws a ghost of the block the drop
 //! would create, at the same place a real drop would take. The grid chrome
@@ -15,7 +15,8 @@ use relm4::gtk::{self, gdk, glib, prelude::*};
 
 use crate::daygrid;
 use crate::model::{
-    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_SNAP, PlanBlock, place, unplace,
+    self, DayPlan, PLAN_DEFAULT_DURATION, PLAN_MIN_DURATION, PLAN_SNAP, PlanBlock, clock_label,
+    place, unplace,
 };
 use crate::row::DRAG_PREFIX;
 use crate::window::{Msg, Tx};
@@ -25,17 +26,6 @@ use crate::{content, row, ui};
 /// lower floor keeps 15 min visibly shorter than 30.
 const MIN_BLOCK_H: i32 = 22;
 const MIN_BLOCK_H_SHORT: i32 = 12;
-
-fn clock(min: u32) -> String {
-    format!("{:02}:{:02}", min / 60, min % 60)
-}
-
-/// Clock time in the app's voice: `9am`, `5:30pm`.
-pub fn clock_label(min: u32) -> String {
-    let t =
-        chrono::NaiveTime::from_hms_opt(min / 60, min % 60, 0).unwrap_or(chrono::NaiveTime::MIN);
-    asst_core::fmt::time_label(t)
-}
 
 /// The tint a block wears: its priority's color, like the row's checkbox.
 fn tint_for(priority: u8) -> &'static str {
@@ -73,8 +63,8 @@ fn block_chip(b: &PlanBlock, now_min: Option<u32>, px_per_hour: f64) -> gtk::Box
     chip.set_hexpand(true);
     chip.set_tooltip_text(Some(&format!(
         "{} – {} · {} · {}",
-        clock(b.start),
-        clock(b.start + b.duration),
+        clock_label(b.start),
+        clock_label(b.start + b.duration),
         b.task.list_name,
         b.task.task.summary
     )));
@@ -87,15 +77,15 @@ fn block_chip(b: &PlanBlock, now_min: Option<u32>, px_per_hour: f64) -> gtk::Box
     if b.duration < 30 {
         // Short enough that the chip would read the same as a half hour:
         // say the length so the difference is legible either way.
-        let meta = gtk::Label::new(Some(&format!("{}m", b.duration)));
+        let meta = gtk::Label::new(Some(&asst_core::fmt::minutes(u64::from(b.duration))));
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
         chip.append(&meta);
     } else if block_height(b, px_per_hour) >= 36 {
         let meta = gtk::Label::new(Some(&format!(
             "{} – {}",
-            clock(b.start),
-            clock(b.start + b.duration)
+            clock_label(b.start),
+            clock_label(b.start + b.duration)
         )));
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
@@ -519,8 +509,8 @@ pub fn fill_lane(
     overlay.add_controller(target);
 }
 
-/// The unscheduled tray beside the day grid. On a non-today day it is the
-/// open/overdue backlog minus what sits on that day; today unchanged.
+/// The tray of tasks to place beside the day grid. On a non-today day it is
+/// the open/overdue backlog minus what sits on that day; today unchanged.
 pub fn tray(
     p: &DayPlan,
     o: &content::Opts<'_>,
@@ -533,7 +523,7 @@ pub fn tray(
     b.set_hexpand(false);
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     head.add_css_class("section-header");
-    head.append(&ui::label("Unscheduled", &["section-title"]));
+    head.append(&ui::label("To place", &["section-title"]));
     let n = p.tray.len();
     head.append(&ui::label(
         &match n {
