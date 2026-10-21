@@ -1257,7 +1257,16 @@ impl Component for Window {
             }
             Msg::ToggleSidebar => w.outer.set_show_sidebar(!w.outer.shows_sidebar()),
             Msg::Refresh => self.reload(&sender),
-            Msg::Tick => {}
+            // The now-line and the tracked lane both follow the clock.
+            // Without this a Day left on screen never sees later activity
+            // (or a moved now) until something else reloads the window.
+            Msg::Tick => {
+                if self.nav == Nav::Day {
+                    self.shown = 0;
+                    let day = self.day_day;
+                    self.reload_blocks(&sender, day);
+                }
+            }
             Msg::Focused => {
                 let stale = self
                     .last_focus_sync
@@ -2757,7 +2766,9 @@ impl Window {
         let generation = self.blocks_generation;
         sender.oneshot_command(async move {
             // Best effort: the window still shows whatever is already stored.
-            let _ = client::track_ingest(&day.to_string()).await;
+            if let Err(e) = client::track_ingest(&day.to_string()).await {
+                eprintln!("asst-gtk: track ingest {day}: {e}");
+            }
             let range = day_window(&day.to_string()).map(|(_, start, end)| {
                 let s = chrono::DateTime::parse_from_rfc3339(&start)
                     .map(|t| t.timestamp_millis())
