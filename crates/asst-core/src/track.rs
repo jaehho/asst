@@ -540,6 +540,8 @@ pub struct TaggedSpan {
     /// Human name (page title, Claude `ai_title`, file). Day shows this
     /// when present; `label` stays the project/rule identity.
     pub detail: Option<String>,
+    /// Other projects that overlapped this run, as `lab 40% · mail 30%`.
+    pub composition: Option<String>,
     pub untagged_kind: Option<SignalKind>,
 }
 
@@ -559,7 +561,22 @@ struct Clip {
     kind: SourceKind,
 }
 
-/// One non-overlapping tagged timeline from several buckets.
+/// Identity of a named span: project tag plus the words on its chip.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SpanId {
+    tag: String,
+    task_uid: Option<String>,
+    label: String,
+    detail: Option<String>,
+}
+
+/// One tagged timeline from several buckets.
+///
+/// A minute can belong to more than one project: Claude on `lab` while a
+/// paper is open in Firefox is both, not "whatever SourceKind ranks first".
+/// Each distinct identity that covers a slice gets its own span (the Day
+/// lane already packs overlaps into columns). Within one identity the
+/// lowest `SourceKind` names it.
 pub fn tagged_timeline(
     sources: &[(SourceKind, &[AwEvent])],
     allowed: &[Span],
@@ -594,6 +611,39 @@ pub fn tagged_timeline(
         return Vec::new();
     }
 
+    // Merge clips of one identity first so a long Firefox tab is not
+    // shattered by every Claude heartbeat edge.
+    clips.sort_by(|a, b| {
+        (
+            a.tag.project.clone(),
+            a.label.clone(),
+            a.detail.clone(),
+            a.span.start,
+        )
+            .cmp(&(
+                b.tag.project.clone(),
+                b.label.clone(),
+                b.detail.clone(),
+                b.span.start,
+            ))
+    });
+    let mut merged: Vec<Clip> = Vec::new();
+    for c in clips {
+        match merged.last_mut() {
+            Some(last)
+                if last.tag.project == c.tag.project
+                    && last.label == c.label
+                    && last.detail == c.detail
+                    && last.kind == c.kind
+                    && c.span.start <= last.span.end =>
+            {
+                last.span.end = last.span.end.max(c.span.end);
+            }
+            _ => merged.push(c),
+        }
+    }
+    let clips = merged;
+
     let mut edges: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     for c in &clips {
         edges.insert(c.span.start);
@@ -601,51 +651,83 @@ pub fn tagged_timeline(
     }
     let edges: Vec<_> = edges.into_iter().collect();
 
+    // id → running span, so consecutive slices of one identity join up.
+    let mut open: BTreeMap<SpanId, TaggedSpan> = BTreeMap::new();
     let mut out: Vec<TaggedSpan> = Vec::new();
     for w in edges.windows(2) {
         let (a, b) = (w[0], w[1]);
         if b <= a {
             continue;
         }
-        let mut best: Option<&Clip> = None;
+        // Best clip per identity in this slice.
+        let mut best: BTreeMap<SpanId, &Clip> = BTreeMap::new();
         for c in &clips {
-            if c.span.start < b && a < c.span.end {
-                best = match best {
-                    None => Some(c),
-                    Some(prev) if c.kind < prev.kind => Some(c),
-                    Some(prev) if c.kind == prev.kind && c.tag.source == TagSource::Explicit => {
-                        Some(c)
-                    }
-                    Some(prev) => Some(prev),
-                };
+            if !(c.span.start < b && a < c.span.end) {
+                continue;
+            }
+            let id = SpanId {
+                tag: c.tag.project.clone(),
+                task_uid: c.tag.task_uid.clone(),
+                label: c.label.clone(),
+                detail: c.detail.clone(),
+            };
+            let take = match best.get(&id) {
+                None => true,
+                Some(prev) => {
+                    c.kind < prev.kind
+                        || (c.kind == prev.kind && c.tag.source == TagSource::Explicit)
+                }
+            };
+            if take {
+                best.insert(id, c);
             }
         }
-        let Some(best) = best else { continue };
 
-        match out.last_mut() {
-            Some(last)
-                if last.tag == best.tag.project
-                    && last.task_uid == best.tag.task_uid
-                    && last.label == best.label
-                    && last.detail == best.detail
-                    && a <= last.end =>
-            {
-                if b > last.end {
+        // Close identities that did not appear in this slice.
+        let live: BTreeSet<_> = best.keys().cloned().collect();
+        let gone: Vec<_> = open
+            .keys()
+            .filter(|k| !live.contains(*k))
+            .cloned()
+            .collect();
+        for id in gone {
+            if let Some(s) = open.remove(&id) {
+                out.push(s);
+            }
+        }
+
+        for (id, c) in best {
+            match open.get_mut(&id) {
+                Some(last) if a <= last.end => {
                     last.end = b;
                 }
+                _ => {
+                    open.insert(
+                        id.clone(),
+                        TaggedSpan {
+                            start: a,
+                            end: b,
+                            tag: c.tag.project.clone(),
+                            task_uid: c.tag.task_uid.clone(),
+                            source: format!(
+                                "aw:{}:{}:{}:{}",
+                                a.timestamp_millis(),
+                                c.tag.project,
+                                c.label,
+                                c.detail.as_deref().unwrap_or("")
+                            ),
+                            label: c.label.clone(),
+                            detail: c.detail.clone(),
+                            composition: None,
+                            untagged_kind: c.untagged_kind,
+                        },
+                    );
+                }
             }
-            _ => out.push(TaggedSpan {
-                start: a,
-                end: b,
-                tag: best.tag.project.clone(),
-                task_uid: best.tag.task_uid.clone(),
-                source: format!("aw:{}:{}", a.timestamp_millis(), best.tag.project),
-                label: best.label.clone(),
-                detail: best.detail.clone(),
-                untagged_kind: best.untagged_kind,
-            }),
         }
     }
+    out.extend(open.into_values());
+    out.sort_by_key(|s| (s.start, s.end, s.tag.clone(), s.label.clone()));
     out
 }
 
@@ -661,36 +743,46 @@ pub const MIN_SPAN: Duration = Duration::seconds(5);
 
 /// Collapse fragmented spans into calendar-like session blocks.
 ///
-/// `tagged_timeline` is intentionally fine-grained (correct boundaries and
-/// rollups). The day planner wants one event per stretch of work: a gap is
-/// what starts a new event, not a tab switch or a project flicker.
+/// Identity is tag + label + detail: the same Claude session reconnects
+/// across a tab flicker, but two pages or two `ai_title`s stay two chips.
+/// Concurrent projects already have different tags, so they never join.
 pub fn coalesce_sessions(spans: &[TaggedSpan], max_gap: Duration) -> Vec<TaggedSpan> {
     let mut sorted: Vec<TaggedSpan> = spans.to_vec();
     sorted.retain(|s| s.end > s.start && s.seconds() >= MIN_SPAN.num_seconds() as f64);
-    sorted.sort_by_key(|s| (s.start, s.end));
+    sorted.sort_by_key(|s| (s.start, s.end, s.tag.clone(), s.label.clone()));
     let mut out: Vec<TaggedSpan> = Vec::new();
-    let mut members: Vec<TaggedSpan> = Vec::new();
-
-    let flush = |members: &mut Vec<TaggedSpan>, out: &mut Vec<TaggedSpan>| {
-        if members.is_empty() {
-            return;
-        }
-        out.push(session_block(members.drain(..)));
-    };
+    let mut open: BTreeMap<(String, String, Option<String>), Vec<TaggedSpan>> = BTreeMap::new();
 
     for s in sorted {
-        let joins = match members.last() {
-            None => true,
-            Some(last) => s.start <= last.end + max_gap,
-        };
-        if joins {
-            members.push(s);
+        // Untagged identity is the human name when it has one: the same
+        // Disney+ page from web and from the window bar is one chip.
+        let key = (
+            s.tag.clone(),
+            if s.tag == "untagged" {
+                s.detail.clone().unwrap_or_else(|| s.label.clone())
+            } else {
+                s.label.clone()
+            },
+            s.detail.clone(),
+        );
+        let mut gap = true;
+        if let Some(members) = open.get(&key) {
+            let run_end = members.iter().map(|m| m.end).max();
+            gap = run_end.map(|e| s.start <= e + max_gap).unwrap_or(true);
+        }
+        if gap {
+            open.entry(key).or_default().push(s);
         } else {
-            flush(&mut members, &mut out);
-            members.push(s);
+            if let Some(members) = open.remove(&key) {
+                out.push(session_block(members));
+            }
+            open.insert(key, vec![s]);
         }
     }
-    flush(&mut members, &mut out);
+    for (_, members) in open {
+        out.push(session_block(members));
+    }
+    out.sort_by_key(|s| (s.start, s.end, s.tag.clone(), s.label.clone()));
     out
 }
 
@@ -763,6 +855,198 @@ fn session_block(members: impl IntoIterator<Item = TaggedSpan>) -> TaggedSpan {
         untagged_kind: label_kind.get(&label).copied().flatten(),
         label,
         detail,
+        composition: None,
+    }
+}
+
+/// Untagged and unnamed: the window shell (`kitty`, `1:claude`) that sits
+/// under real work. Worth a chip only when nothing better covers the time.
+fn is_noise(s: &TaggedSpan) -> bool {
+    s.tag == "untagged" && s.detail.is_none()
+}
+
+/// Parts of `span` that no `taken` span covers.
+fn subtract_spans(span: Span, taken: &[Span]) -> Vec<Span> {
+    let mut holes = vec![span];
+    for t in taken {
+        let mut next = Vec::new();
+        for h in holes {
+            if t.end <= h.start || t.start >= h.end {
+                next.push(h);
+                continue;
+            }
+            if h.start < t.start {
+                next.push(Span {
+                    start: h.start,
+                    end: t.start.min(h.end),
+                });
+            }
+            if t.end < h.end {
+                next.push(Span {
+                    start: t.end.max(h.start),
+                    end: h.end,
+                });
+            }
+        }
+        holes = next;
+    }
+    holes.retain(|s| !s.is_empty());
+    holes
+}
+
+/// Prefer the web tab over the bare window app when both claim the same
+/// untagged minute: `disneyplus.com` beats `firefox-developer-edition`.
+pub fn drop_redundant_window(spans: Vec<TaggedSpan>) -> Vec<TaggedSpan> {
+    let web: Vec<Span> = spans
+        .iter()
+        .filter(|s| s.untagged_kind == Some(SignalKind::Domain))
+        .map(|s| Span {
+            start: s.start,
+            end: s.end,
+        })
+        .collect();
+    let web = merge_spans(web);
+    spans
+        .into_iter()
+        .filter(|s| {
+            if s.untagged_kind != Some(SignalKind::App) {
+                return true;
+            }
+            let leftover = subtract_spans(
+                Span {
+                    start: s.start,
+                    end: s.end,
+                },
+                &web,
+            );
+            // Keep only the app-name slices no web tab covered.
+            !leftover.is_empty()
+        })
+        .flat_map(|s| {
+            if s.untagged_kind == Some(SignalKind::App) {
+                subtract_spans(
+                    Span {
+                        start: s.start,
+                        end: s.end,
+                    },
+                    &web,
+                )
+                .into_iter()
+                .map(|hole| {
+                    let mut k = s.clone();
+                    k.start = hole.start;
+                    k.end = hole.end;
+                    k
+                })
+                .collect::<Vec<_>>()
+            } else {
+                vec![s]
+            }
+        })
+        .collect()
+}
+
+/// Drop noise spans that sit under a named span. A `kitty` bar beside
+/// `lab · lc_output_strength.py` is not a second thing you did; the
+/// leftover `kitty` time with nothing named on top still counts.
+pub fn drop_covered_noise(spans: Vec<TaggedSpan>) -> Vec<TaggedSpan> {
+    let named: Vec<Span> = spans
+        .iter()
+        .filter(|s| !is_noise(s))
+        .map(|s| Span {
+            start: s.start,
+            end: s.end,
+        })
+        .collect();
+    let named = merge_spans(named);
+    let mut out = Vec::new();
+    for s in spans {
+        if !is_noise(&s) {
+            out.push(s);
+            continue;
+        }
+        let span = Span {
+            start: s.start,
+            end: s.end,
+        };
+        for hole in subtract_spans(span, &named) {
+            let mut kept = s.clone();
+            kept.start = hole.start;
+            kept.end = hole.end;
+            if kept.seconds() >= MIN_SPAN.num_seconds() as f64 {
+                out.push(kept);
+            }
+        }
+    }
+    out
+}
+
+/// A readable name for a concurrent span: the project, or for untagged
+/// web/app the domain or title rather than the word `untagged`.
+fn composition_name(s: &TaggedSpan) -> String {
+    if s.tag != "untagged" {
+        return s.tag.clone();
+    }
+    s.detail
+        .clone()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| s.label.clone())
+}
+
+/// Write `lab 40% · Gmail 30%` on each session from the fine spans that
+/// overlap it. Display-only: the rollup already split the minutes.
+/// Percentages are of the session's own length (may sum over 100% when
+/// several sources cover the same minute).
+pub fn annotate_composition(sessions: &mut [TaggedSpan], fine: &[TaggedSpan]) {
+    for s in sessions.iter_mut() {
+        let run_secs = s.seconds();
+        if run_secs <= 0.0 {
+            s.composition = None;
+            continue;
+        }
+        let mut other: BTreeMap<String, f64> = BTreeMap::new();
+        for f in fine {
+            if f.tag == s.tag && f.label == s.label && f.detail == s.detail {
+                continue;
+            }
+            let a = f.start.max(s.start);
+            let b = f.end.min(s.end);
+            if b <= a {
+                continue;
+            }
+            let secs = (b - a).num_milliseconds() as f64 / 1000.0;
+            let name = composition_name(f);
+            // Skip the chip's own words and the shell we already dropped.
+            if name == s.label || name == "untagged" || Some(&name) == s.detail.as_ref() {
+                continue;
+            }
+            *other.entry(name).or_default() += secs;
+        }
+        if other.is_empty() {
+            s.composition = None;
+            continue;
+        }
+        let mut parts: Vec<(f64, String)> = other
+            .into_iter()
+            .map(|(name, secs)| {
+                let pct = (100.0 * secs / run_secs).round().clamp(1.0, 99.0) as i64;
+                (secs, format!("{name} {pct}%"))
+            })
+            .filter(|(secs, _)| *secs / run_secs >= 0.08)
+            .collect();
+        parts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        parts.truncate(3);
+        if parts.is_empty() {
+            s.composition = None;
+            continue;
+        }
+        s.composition = Some(
+            parts
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
     }
 }
 
@@ -790,10 +1074,39 @@ pub fn suggest_rules(spans: &[TaggedSpan]) -> String {
     out
 }
 
+/// Minutes by project tag, splitting every moment among the tags that
+/// cover it. Concurrent `lab` and web browsing is 50/50 for that minute,
+/// not a double count — the rollup stays a partition of focused time.
 pub fn tag_rollup(spans: &[TaggedSpan]) -> BTreeMap<String, f64> {
-    let mut acc: BTreeMap<String, f64> = BTreeMap::new();
+    if spans.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut edges: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     for s in spans {
-        *acc.entry(s.tag.clone()).or_default() += s.seconds();
+        edges.insert(s.start);
+        edges.insert(s.end);
+    }
+    let edges: Vec<_> = edges.into_iter().collect();
+    let mut acc: BTreeMap<String, f64> = BTreeMap::new();
+    for w in edges.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let secs = (b - a).num_milliseconds() as f64 / 1000.0;
+        if secs <= 0.0 {
+            continue;
+        }
+        let mut tags: BTreeSet<&str> = BTreeSet::new();
+        for s in spans {
+            if s.start < b && a < s.end {
+                tags.insert(s.tag.as_str());
+            }
+        }
+        if tags.is_empty() {
+            continue;
+        }
+        let share = secs / tags.len() as f64;
+        for t in tags {
+            *acc.entry(t.to_string()).or_default() += share;
+        }
     }
     acc
 }
@@ -978,21 +1291,20 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
     let allowed = not_afk_spans(&afk_raw);
     let focused: f64 = allowed.iter().map(|s| s.seconds()).sum();
 
-    let spans = coalesce_sessions(
-        &tagged_timeline(
-            &[
-                (SourceKind::Claude, &claude),
-                (SourceKind::Neovim, &neovim),
-                (SourceKind::Obsidian, &obsidian),
-                (SourceKind::Terminal, &terminal),
-                (SourceKind::Web, &web),
-                (SourceKind::Window, &window),
-            ],
-            &allowed,
-            &cfg,
-        ),
-        SESSION_GAP,
-    );
+    let fine = drop_covered_noise(drop_redundant_window(tagged_timeline(
+        &[
+            (SourceKind::Claude, &claude),
+            (SourceKind::Neovim, &neovim),
+            (SourceKind::Obsidian, &obsidian),
+            (SourceKind::Terminal, &terminal),
+            (SourceKind::Web, &web),
+            (SourceKind::Window, &window),
+        ],
+        &allowed,
+        &cfg,
+    )));
+    let mut spans = coalesce_sessions(&fine, SESSION_GAP);
+    annotate_composition(&mut spans, &fine);
     let tags = tag_rollup(&spans);
     Ok(IngestReport {
         date: date.to_string(),
@@ -1024,6 +1336,7 @@ pub fn ingest_spans(
                 s.tag.clone()
             }),
             detail: s.detail.clone(),
+            composition: s.composition.clone(),
             planned: false,
             source: Some(s.source.clone()),
             created_at: Utc::now().timestamp_millis(),
@@ -1126,27 +1439,46 @@ mod tests {
     }
 
     #[test]
-    fn overlap_counts_once_preferring_claude() {
+    fn concurrent_projects_are_both_kept_and_share_the_minute() {
         let allowed = vec![span("2026-09-30T12:00:00Z", "2026-09-30T13:00:00Z")];
         let cfg = TagsConfig::default();
+        // A paper in the browser while Claude works on champalimaud.
         let window = vec![ev(
             "2026-09-30T12:00:00Z",
             3600.0,
-            json!({"app": "kitty", "title": "x"}),
+            json!({"app": "firefox-developer-edition",
+                   "title": "Walking Modulates Speed Sensitivity — Firefox Developer Edition"}),
+        )];
+        let web = vec![ev(
+            "2026-09-30T12:00:00Z",
+            3600.0,
+            json!({"url": "https://www.cell.com/current-biology/x",
+                   "title": "Walking Modulates Speed Sensitivity — Firefox Developer Edition"}),
         )];
         let claude = vec![ev(
             "2026-09-30T12:00:00Z",
             3600.0,
-            json!({"project": "champalimaud"}),
+            json!({"project": "champalimaud", "ai_title": "lc-strength-retinotopy-clusters"}),
         )];
         let spans = tagged_timeline(
-            &[(SourceKind::Claude, &claude), (SourceKind::Window, &window)],
+            &[
+                (SourceKind::Claude, &claude),
+                (SourceKind::Web, &web),
+                (SourceKind::Window, &window),
+            ],
             &allowed,
             &cfg,
         );
+        // Both projects survive; the paper is not eaten by Claude.
+        let tags: BTreeSet<_> = spans.iter().map(|s| s.tag.as_str()).collect();
+        assert!(tags.contains("champalimaud"), "spans: {spans:?}");
+        assert!(tags.contains("untagged"), "spans: {spans:?}");
+        // Rollup is a partition: 1h of wall clock, not 3h of double count.
         let totals = tag_rollup(&spans);
-        assert_eq!(totals["champalimaud"], 3600.0);
-        assert_eq!(totals.values().sum::<f64>(), 3600.0);
+        let sum: f64 = totals.values().sum();
+        assert!((sum - 3600.0).abs() < 1.0, "rollup sum {sum}");
+        assert!(totals["champalimaud"] > 0.0);
+        assert!(totals["untagged"] > 0.0);
     }
 
     #[test]
@@ -1239,6 +1571,88 @@ mod tests {
     }
 
     #[test]
+    fn noise_under_named_work_disappears_but_orphan_noise_stays() {
+        let mk = |start: &str, end: &str, tag: &str, detail: Option<&str>| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: tag.into(),
+            task_uid: None,
+            source: format!("aw:{start}:{tag}:{detail:?}"),
+            label: tag.into(),
+            detail: detail.map(str::to_string),
+            composition: None,
+            untagged_kind: None,
+        };
+        let fine = vec![
+            // Real work…
+            mk(
+                "2026-10-02T12:00:00Z",
+                "2026-10-02T12:30:00Z",
+                "lab",
+                Some("lc_output_strength.py"),
+            ),
+            // …and the kitty shell under it.
+            mk(
+                "2026-10-02T12:00:00Z",
+                "2026-10-02T12:30:00Z",
+                "untagged",
+                None,
+            ),
+            // Shell alone before anything named starts.
+            mk(
+                "2026-10-02T11:00:00Z",
+                "2026-10-02T11:20:00Z",
+                "untagged",
+                None,
+            ),
+        ];
+        let kept = drop_covered_noise(fine);
+        // The covered kitty bar is gone; the orphan 20m stays.
+        assert_eq!(kept.len(), 2, "kept: {kept:?}");
+        assert!(kept.iter().any(|s| s.tag == "lab"));
+        let orphan = kept.iter().find(|s| s.tag == "untagged").unwrap();
+        assert_eq!(orphan.start, ts("2026-10-02T11:00:00Z"));
+        assert_eq!(orphan.end, ts("2026-10-02T11:20:00Z"));
+    }
+
+    #[test]
+    fn composition_names_the_other_projects_in_the_run() {
+        let mk =
+            |start: &str, end: &str, tag: &str, label: &str, detail: Option<&str>| TaggedSpan {
+                start: ts(start),
+                end: ts(end),
+                tag: tag.into(),
+                task_uid: None,
+                source: format!("aw:{start}:{tag}:{label}"),
+                label: label.into(),
+                detail: detail.map(str::to_string),
+                composition: None,
+                untagged_kind: None,
+            };
+        // An hour of lab with gmail open the whole time.
+        let fine = vec![
+            mk(
+                "2026-10-02T12:00:00Z",
+                "2026-10-02T13:00:00Z",
+                "lab",
+                "lab",
+                Some("lc_output_strength.py"),
+            ),
+            mk(
+                "2026-10-02T12:00:00Z",
+                "2026-10-02T13:00:00Z",
+                "untagged",
+                "mail.google.com",
+                Some("Inbox - Gmail"),
+            ),
+        ];
+        let mut sessions = coalesce_sessions(&fine, SESSION_GAP);
+        annotate_composition(&mut sessions, &fine);
+        let lab = sessions.iter().find(|s| s.tag == "lab").unwrap();
+        assert_eq!(lab.composition.as_deref(), Some("Inbox - Gmail 99%"));
+    }
+
+    #[test]
     fn coalesce_joins_same_tag_across_short_gaps() {
         let a = TaggedSpan {
             start: ts("2026-10-02T12:00:00Z"),
@@ -1248,6 +1662,7 @@ mod tests {
             source: "aw:1:champalimaud".into(),
             label: "champalimaud".into(),
             detail: None,
+            composition: None,
             untagged_kind: None,
         };
         let mut b = a.clone();
@@ -1266,45 +1681,55 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_browsing_is_one_block() {
-        let mk = |start: &str, end: &str, label: &str| TaggedSpan {
+    fn coalesce_splits_browsing_by_page_not_by_tab_switch() {
+        let mk = |start: &str, end: &str, label: &str, detail: &str| TaggedSpan {
             start: ts(start),
             end: ts(end),
             tag: "untagged".into(),
             task_uid: None,
-            source: format!("aw:{start}:{label}"),
+            source: format!("aw:{start}:{label}:{detail}"),
             label: label.into(),
-            detail: None,
+            detail: Some(detail.into()),
+            composition: None,
             untagged_kind: Some(SignalKind::Domain),
         };
         let out = coalesce_sessions(
             &[
+                // Same page, two fragments: one chip.
                 mk(
                     "2026-10-02T12:00:00Z",
                     "2026-10-02T12:02:00Z",
                     "nytimes.com",
+                    "Zipf's law - Wikipedia",
                 ),
                 mk(
                     "2026-10-02T12:02:00Z",
                     "2026-10-02T12:05:00Z",
-                    "duckduckgo.com",
+                    "nytimes.com",
+                    "Zipf's law - Wikipedia",
                 ),
+                // Different page: its own chip.
                 mk(
                     "2026-10-02T12:05:30Z",
                     "2026-10-02T12:08:00Z",
                     "nytimes.com",
+                    "Power Law: A Pattern Behind Extreme Events",
                 ),
             ],
             SESSION_GAP,
         );
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2, "spans: {out:?}");
         assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
-        assert_eq!(out[0].end, ts("2026-10-02T12:08:00Z"));
-        assert_eq!(out[0].label, "nytimes.com");
+        assert_eq!(out[0].end, ts("2026-10-02T12:05:00Z"));
+        assert_eq!(out[0].detail.as_deref(), Some("Zipf's law - Wikipedia"));
+        assert_eq!(
+            out[1].detail.as_deref(),
+            Some("Power Law: A Pattern Behind Extreme Events")
+        );
     }
 
     #[test]
-    fn coalesce_splits_only_on_real_gaps() {
+    fn coalesce_keeps_projects_apart_even_when_they_alternate() {
         let mk = |start: &str, end: &str, tag: &str| TaggedSpan {
             start: ts(start),
             end: ts(end),
@@ -1313,6 +1738,7 @@ mod tests {
             source: format!("aw:{start}:{tag}"),
             label: tag.into(),
             detail: None,
+            composition: None,
             untagged_kind: None,
         };
         let out = coalesce_sessions(
@@ -1337,15 +1763,36 @@ mod tests {
             ],
             SESSION_GAP,
         );
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
-        assert_eq!(out[0].end, ts("2026-10-02T12:30:00Z"));
-        assert_eq!(out[0].label, "champalimaud");
-        assert_eq!(out[1].label, "champalimaud");
+        // Two projects side by side are two chips, not one majority label.
+        let mut by_tag: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+        for s in &out {
+            by_tag
+                .entry(s.tag.as_str())
+                .or_default()
+                .push((s.label.as_str(), s.detail.as_deref().unwrap_or("")));
+        }
+        assert_eq!(out.len(), 4, "spans: {out:?}");
+        let lab: Vec<_> = out
+            .iter()
+            .filter(|s| s.tag == "champalimaud")
+            .map(|s| (s.start, s.end))
+            .collect();
+        assert_eq!(lab.len(), 3);
+        // The two near stretches are separate only when their gap exceeds
+        // SESSION_GAP (12:10 → 12:21 is 11 minutes).
+        assert_eq!(
+            lab[0],
+            (ts("2026-10-02T12:00:00Z"), ts("2026-10-02T12:10:00Z"))
+        );
+        assert_eq!(
+            lab[1],
+            (ts("2026-10-02T12:21:00Z"), ts("2026-10-02T12:30:00Z"))
+        );
+        assert_eq!(out.iter().filter(|s| s.tag == "dotfiles").count(), 1);
     }
 
     #[test]
-    fn coalesce_absorbs_web_blips_into_project() {
+    fn coalesce_absorbs_web_blips_into_the_same_project_run() {
         let mk = |start: &str, end: &str, tag: &str, label: &str| TaggedSpan {
             start: ts(start),
             end: ts(end),
@@ -1354,6 +1801,7 @@ mod tests {
             source: format!("aw:{start}:{label}"),
             label: label.into(),
             detail: None,
+            composition: None,
             untagged_kind: None,
         };
         let out = coalesce_sessions(
@@ -1364,12 +1812,14 @@ mod tests {
                     "champalimaud",
                     "champalimaud",
                 ),
+                // 20s github peek is its own untagged chip…
                 mk(
                     "2026-10-02T12:10:00Z",
                     "2026-10-02T12:10:20Z",
                     "untagged",
                     "github.com",
                 ),
+                // …while the project run continues underneath.
                 mk(
                     "2026-10-02T12:10:20Z",
                     "2026-10-02T12:15:00Z",
@@ -1379,10 +1829,12 @@ mod tests {
             ],
             SESSION_GAP,
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].label, "champalimaud");
-        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
-        assert_eq!(out[0].end, ts("2026-10-02T12:15:00Z"));
+        assert_eq!(out.len(), 2, "spans: {out:?}");
+        let proj = out.iter().find(|s| s.tag == "champalimaud").unwrap();
+        assert_eq!(proj.start, ts("2026-10-02T12:00:00Z"));
+        assert_eq!(proj.end, ts("2026-10-02T12:15:00Z"));
+        let peek = out.iter().find(|s| s.tag == "untagged").unwrap();
+        assert_eq!(peek.label, "github.com");
     }
 
     #[test]
@@ -1396,6 +1848,7 @@ mod tests {
             source: "aw:1:dotfiles".into(),
             label: "dotfiles".into(),
             detail: None,
+            composition: None,
             untagged_kind: None,
         }];
         let a = ingest_spans(

@@ -1075,6 +1075,7 @@ fn track_run(cmd: TrackCmd, as_json: bool) -> anyhow::Result<()> {
                                 "task_uid": s.task_uid,
                                 "label": s.label,
                                 "detail": s.detail,
+                                "composition": s.composition,
                                 "source": s.source,
                             })
                         })

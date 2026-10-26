@@ -136,9 +136,16 @@ pub fn fill_lane(
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&title);
         if height_px >= 34.0 {
-            let meta = gtk::Label::new(Some(&format!("{start_s} – {end_s} · {dur}")));
+            let meta_text = match &b.composition {
+                Some(c) if !c.is_empty() => {
+                    format!("{start_s} – {end_s} · {dur} · {c}")
+                }
+                _ => format!("{start_s} – {end_s} · {dur}"),
+            };
+            let meta = gtk::Label::new(Some(&meta_text));
             meta.add_css_class("time-block-meta");
             meta.set_xalign(0.0);
+            meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
             chip.append(&meta);
         }
 
@@ -189,6 +196,7 @@ mod tests {
             end: ms(to),
             label: None,
             detail: None,
+            composition: None,
             planned: false,
             source: None,
             created_at: 0,

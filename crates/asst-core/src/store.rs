@@ -96,6 +96,9 @@ pub struct Block {
     /// had one better than `label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Other projects that overlapped this run, as `lab 40% · mail 30%`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<String>,
     pub planned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -271,6 +274,7 @@ CREATE TABLE IF NOT EXISTS blocks (
   end INTEGER NOT NULL,
   label TEXT,
   detail TEXT,
+  composition TEXT,
   planned INTEGER NOT NULL DEFAULT 0,
   source TEXT UNIQUE,
   created_at INTEGER NOT NULL
@@ -419,6 +423,9 @@ impl Store {
         add_identity_columns(&conn)?;
         if !has_column(&conn, "blocks", "detail")? {
             conn.execute_batch("ALTER TABLE blocks ADD COLUMN detail TEXT;")?;
+        }
+        if !has_column(&conn, "blocks", "composition")? {
+            conn.execute_batch("ALTER TABLE blocks ADD COLUMN composition TEXT;")?;
         }
         let mut store = Store { conn, zone };
         let stored: Option<String> = store.meta("zone")?;
@@ -1382,7 +1389,7 @@ impl Store {
 
     pub fn blocks_between(&self, start_ms: i64, end_ms: i64) -> Result<Vec<Block>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task_uid, start, end, label, detail, planned, source, created_at
+            "SELECT id, task_uid, start, end, label, detail, composition, planned, source, created_at
              FROM blocks WHERE start < ?2 AND end > ?1 ORDER BY start",
         )?;
         let rows = stmt.query_map(params![start_ms, end_ms], |r| {
@@ -1393,9 +1400,10 @@ impl Store {
                 end: r.get(3)?,
                 label: r.get(4)?,
                 detail: r.get(5)?,
-                planned: r.get::<_, i64>(6)? != 0,
-                source: r.get(7)?,
-                created_at: r.get(8)?,
+                composition: r.get(6)?,
+                planned: r.get::<_, i64>(7)? != 0,
+                source: r.get(8)?,
+                created_at: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1450,14 +1458,15 @@ impl Store {
         )?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO blocks(task_uid, start, end, label, detail, planned, source, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+                "INSERT INTO blocks(task_uid, start, end, label, detail, composition, planned, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)
                  ON CONFLICT(source) DO UPDATE SET
                    task_uid = excluded.task_uid,
                    start = excluded.start,
                    end = excluded.end,
                    label = excluded.label,
                    detail = excluded.detail,
+                   composition = excluded.composition,
                    created_at = excluded.created_at",
             )?;
             for b in rows {
@@ -1467,6 +1476,7 @@ impl Store {
                     b.end,
                     b.label,
                     b.detail,
+                    b.composition,
                     b.source,
                     b.created_at
                 ])?;
@@ -2721,6 +2731,7 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             end: (from + hours) * hour,
             label: label.map(str::to_string),
             detail: None,
+            composition: None,
             planned: false,
             source: Some(source.to_string()),
             created_at: 0,
