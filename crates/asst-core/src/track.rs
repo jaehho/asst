@@ -1133,6 +1133,120 @@ fn rule_tag(kind: SignalKind, key: &str) -> String {
     }
 }
 
+/// One day line for `asst track report`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DayLine {
+    pub date: String,
+    pub focused_hours: f64,
+    pub projects: BTreeMap<String, f64>,
+    pub stretches: Vec<Stretch>,
+    pub switches: u32,
+    pub thrash: u32,
+}
+
+/// An uninterrupted run of one project tag.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Stretch {
+    pub start: String,
+    pub end: String,
+    pub minutes: f64,
+    pub tag: String,
+    pub detail: Option<String>,
+    pub composition: Option<String>,
+}
+
+/// Roll a few days of spans into the numbers the report shows.
+pub fn build_report(days: &[(String, IngestReport)]) -> Vec<DayLine> {
+    days.iter()
+        .map(|(date, rep)| {
+            let mut projects = tag_rollup(&rep.spans);
+            for v in projects.values_mut() {
+                *v /= 60.0;
+            }
+            // Longest same-tag runs, already coalesced.
+            let mut stretches: Vec<Stretch> = rep
+                .spans
+                .iter()
+                .map(|s| Stretch {
+                    start: s.start.to_rfc3339(),
+                    end: s.end.to_rfc3339(),
+                    minutes: s.seconds() / 60.0,
+                    tag: s.tag.clone(),
+                    detail: s.detail.clone(),
+                    composition: s.composition.clone(),
+                })
+                .collect();
+            stretches.sort_by(|a, b| {
+                b.minutes
+                    .partial_cmp(&a.minutes)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            stretches.truncate(8);
+            // Topic switches on a single primary track: one tag per slice
+            // (the non-untagged one covering most of it), so concurrent
+            // lab+web is not a "switch".
+            let mut edges: BTreeSet<DateTime<Utc>> = BTreeSet::new();
+            for s in &rep.spans {
+                edges.insert(s.start);
+                edges.insert(s.end);
+            }
+            let edges: Vec<_> = edges.into_iter().collect();
+            let mut run_secs = 0.0;
+            let mut switches = 0u32;
+            let mut thrash = 0u32;
+            let mut prev: Option<String> = None;
+            for w in edges.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let mut cover: BTreeMap<String, f64> = BTreeMap::new();
+                for s in &rep.spans {
+                    if s.start < b && a < s.end {
+                        let secs =
+                            (s.end.min(b) - s.start.max(a)).num_milliseconds() as f64 / 1000.0;
+                        *cover.entry(s.tag.clone()).or_default() += secs;
+                    }
+                }
+                let Some(tag) = cover
+                    .iter()
+                    .max_by(|(ka, x), (kb, y)| {
+                        let rank = |k: &String| if k.as_str() == "untagged" { 0u8 } else { 1u8 };
+                        rank(ka)
+                            .cmp(&rank(kb))
+                            .then(x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+                    })
+                    .map(|(k, _)| k.clone())
+                else {
+                    continue;
+                };
+                let slice = (b - a).num_milliseconds() as f64 / 1000.0;
+                match &prev {
+                    Some(p) if *p == tag => run_secs += slice,
+                    Some(_) => {
+                        switches += 1;
+                        if run_secs < 120.0 {
+                            thrash += 1;
+                        }
+                        run_secs = slice;
+                    }
+                    None => run_secs = slice,
+                }
+                prev = Some(tag);
+            }
+            if run_secs > 0.0 && run_secs < 120.0 && prev.is_some() {
+                // Trailing run under two minutes counts as thrash too.
+                thrash += 1;
+            }
+            DayLine {
+                date: date.clone(),
+                focused_hours: rep.focused_seconds / 3600.0,
+                projects,
+                stretches,
+                switches,
+                thrash,
+            }
+        })
+        .collect()
+}
+
 /// Printable `[[rule]]` stubs for unmatched signals, ranked by minutes.
 /// Does not write. Names the project, not the raw domain.
 pub fn suggest_rules(spans: &[TaggedSpan]) -> String {
@@ -1789,6 +1903,37 @@ mod tests {
         let email = out.find("email").unwrap();
         let leisure = out.find("leisure").unwrap();
         assert!(email < leisure);
+    }
+
+    #[test]
+    fn report_counts_a_switch_on_the_primary_track_not_on_overlap() {
+        let mk = |start: &str, end: &str, tag: &str| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: tag.into(),
+            task_uid: None,
+            source: format!("aw:{start}:{tag}"),
+            label: tag.into(),
+            detail: None,
+            composition: None,
+            untagged_kind: None,
+        };
+        // lab runs an hour; gmail is open the whole time (not a switch).
+        // Then a real switch to ergo.
+        let spans = vec![
+            mk("2026-10-02T12:00:00Z", "2026-10-02T13:00:00Z", "lab"),
+            mk("2026-10-02T12:00:00Z", "2026-10-02T13:00:00Z", "email"),
+            mk("2026-10-02T13:00:00Z", "2026-10-02T13:30:00Z", "ergo"),
+        ];
+        let report = IngestReport {
+            date: "2026-10-02".into(),
+            focused_seconds: 5400.0,
+            spans,
+            tags: BTreeMap::new(),
+        };
+        let lines = build_report(&[("2026-10-02".into(), report)]);
+        // Primary track is lab (beats email) then ergo: one switch.
+        assert_eq!(lines[0].switches, 1, "line: {:?}", lines[0]);
     }
 
     #[test]

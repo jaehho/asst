@@ -18,6 +18,7 @@ mod bar;
 mod out;
 mod projects;
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::ExitCode;
 
@@ -257,6 +258,15 @@ enum TrackCmd {
     Suggest {
         #[arg(long)]
         date: Option<String>,
+    },
+    /// Where the time went: projects, deep stretches, switch load
+    Report {
+        /// End day (local, inclusive). Default: today.
+        #[arg(long)]
+        to: Option<String>,
+        /// How many days back from `to` (including it). Default: 7.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
     },
 }
 
@@ -1148,6 +1158,73 @@ fn track_run(cmd: TrackCmd, as_json: bool) -> anyhow::Result<()> {
             let date = date.unwrap_or_else(track::today);
             let report = track::collect_day(&client, &date)?;
             print!("{}", track::suggest_rules(&report.spans));
+            Ok(())
+        }
+        TrackCmd::Report { to, days } => {
+            let end = to.unwrap_or_else(track::today);
+            let end_d: chrono::NaiveDate = end.parse()?;
+            let mut collected: Vec<(String, track::IngestReport)> = Vec::new();
+            for i in 0..days {
+                let d = end_d - chrono::Duration::days(i64::from(days) - 1 - i64::from(i));
+                let ds = d.to_string();
+                match track::collect_day(&client, &ds) {
+                    Ok(r) => collected.push((ds, r)),
+                    Err(e) => eprintln!("asst track report {ds}: {e}"),
+                }
+            }
+            let lines = track::build_report(&collected);
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&lines)?);
+                return Ok(());
+            }
+            let mut week: BTreeMap<String, f64> = BTreeMap::new();
+            for l in &lines {
+                for (k, v) in &l.projects {
+                    *week.entry(k.clone()).or_default() += v;
+                }
+            }
+            println!(
+                "asst track report  {} .. {}  {} days",
+                lines.first().map(|l| l.date.as_str()).unwrap_or("-"),
+                lines.last().map(|l| l.date.as_str()).unwrap_or("-"),
+                lines.len()
+            );
+            let focused: f64 = lines.iter().map(|l| l.focused_hours).sum();
+            println!("  at desk (not-afk)  {focused:.1}h");
+            println!("\nprojects (fractional, minutes):");
+            let mut week: Vec<_> = week.into_iter().collect();
+            week.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (k, v) in week.into_iter().take(15) {
+                println!("  {k:<24} {v:6.0}m  {:4.1}h", v / 60.0);
+            }
+            println!("\nday by day:");
+            for l in &lines {
+                println!(
+                    "  {}  {:>4.1}h  {} switches ({} thrash <2m)",
+                    l.date, l.focused_hours, l.switches, l.thrash
+                );
+                for s in l.stretches.iter().take(3) {
+                    if s.minutes < 15.0 {
+                        continue;
+                    }
+                    let name = s.detail.as_deref().unwrap_or(&s.tag);
+                    let comp = s
+                        .composition
+                        .as_deref()
+                        .map(|c| format!("  [{c}]"))
+                        .unwrap_or_default();
+                    println!(
+                        "      {:>5.0}m  {}{}",
+                        s.minutes,
+                        if s.tag == "untagged" {
+                            name.to_string()
+                        } else {
+                            format!("{} · {}", s.tag, name)
+                        },
+                        comp
+                    );
+                }
+            }
             Ok(())
         }
     }
