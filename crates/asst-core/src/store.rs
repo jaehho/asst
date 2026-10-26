@@ -92,6 +92,10 @@ pub struct Block {
     pub end: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Human name (page title, Claude `ai_title`, file), when the event
+    /// had one better than `label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub planned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -266,6 +270,7 @@ CREATE TABLE IF NOT EXISTS blocks (
   start INTEGER NOT NULL,
   end INTEGER NOT NULL,
   label TEXT,
+  detail TEXT,
   planned INTEGER NOT NULL DEFAULT 0,
   source TEXT UNIQUE,
   created_at INTEGER NOT NULL
@@ -412,6 +417,9 @@ impl Store {
             )?;
         }
         add_identity_columns(&conn)?;
+        if !has_column(&conn, "blocks", "detail")? {
+            conn.execute_batch("ALTER TABLE blocks ADD COLUMN detail TEXT;")?;
+        }
         let mut store = Store { conn, zone };
         let stored: Option<String> = store.meta("zone")?;
         if stored.as_deref() != Some(zone.name()) {
@@ -1374,7 +1382,7 @@ impl Store {
 
     pub fn blocks_between(&self, start_ms: i64, end_ms: i64) -> Result<Vec<Block>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task_uid, start, end, label, planned, source, created_at
+            "SELECT id, task_uid, start, end, label, detail, planned, source, created_at
              FROM blocks WHERE start < ?2 AND end > ?1 ORDER BY start",
         )?;
         let rows = stmt.query_map(params![start_ms, end_ms], |r| {
@@ -1384,9 +1392,10 @@ impl Store {
                 start: r.get(2)?,
                 end: r.get(3)?,
                 label: r.get(4)?,
-                planned: r.get::<_, i64>(5)? != 0,
-                source: r.get(6)?,
-                created_at: r.get(7)?,
+                detail: r.get(5)?,
+                planned: r.get::<_, i64>(6)? != 0,
+                source: r.get(7)?,
+                created_at: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1441,13 +1450,14 @@ impl Store {
         )?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO blocks(task_uid, start, end, label, planned, source, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                "INSERT INTO blocks(task_uid, start, end, label, detail, planned, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                  ON CONFLICT(source) DO UPDATE SET
                    task_uid = excluded.task_uid,
                    start = excluded.start,
                    end = excluded.end,
                    label = excluded.label,
+                   detail = excluded.detail,
                    created_at = excluded.created_at",
             )?;
             for b in rows {
@@ -1456,6 +1466,7 @@ impl Store {
                     b.start,
                     b.end,
                     b.label,
+                    b.detail,
                     b.source,
                     b.created_at
                 ])?;
@@ -2709,6 +2720,7 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             start: from * hour,
             end: (from + hours) * hour,
             label: label.map(str::to_string),
+            detail: None,
             planned: false,
             source: Some(source.to_string()),
             created_at: 0,

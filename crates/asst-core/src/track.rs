@@ -170,9 +170,10 @@ pub struct Tag {
 pub enum SourceKind {
     Claude = 0,
     Neovim = 1,
-    Terminal = 2,
-    Web = 3,
-    Window = 4,
+    Obsidian = 2,
+    Terminal = 3,
+    Web = 4,
+    Window = 5,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -265,7 +266,19 @@ pub fn signals_of(e: &AwEvent) -> Signals {
         .get("project")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(str::to_string)
+        .map(|p| {
+            // Obsidian's project field is always the product name.
+            if p == "Obsidian" {
+                e.data
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .and_then(project_from_vault_file)
+                    .unwrap_or_else(|| "notes".into())
+            } else {
+                p
+            }
+        });
     let cwd = e
         .data
         .get("cwd")
@@ -330,6 +343,18 @@ pub fn project_from_cwd(cwd: &str) -> Option<String> {
         return None;
     }
     Some(leaf.to_string())
+}
+
+/// Obsidian stamps `project = "Obsidian"` for every note; the vault folder
+/// is the useful name (`/lab/types/README.md` → `lab`).
+pub fn project_from_vault_file(file: &str) -> Option<String> {
+    let f = file.trim_start_matches('/');
+    let top = f.split('/').next().filter(|s| !s.is_empty())?;
+    if top.contains('.') {
+        // A note at the vault root (`Home.md`) is not a project.
+        return Some("notes".into());
+    }
+    Some(top.to_string())
 }
 
 /// tmux `#S:#W` titles on kitty: session name when it is not a bare index.
@@ -420,6 +445,89 @@ pub fn untagged_key(sig: &Signals) -> (SignalKind, String) {
     (SignalKind::Project, "(none)".into())
 }
 
+/// True when `t` is a Claude kind string (`user_prompt`, `tool`, …) rather
+/// than a session title.
+fn is_kind_word(t: &str) -> bool {
+    matches!(
+        t,
+        "user_prompt" | "assistant" | "tool" | "user" | "system" | "kind"
+    )
+}
+
+/// A UUID (`3b65c44c-…`) is an identifier, not a name.
+fn looks_like_uuid(t: &str) -> bool {
+    let t = t.trim();
+    let parts: Vec<&str> = t.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let lens = [8, 4, 4, 4, 12];
+    parts
+        .iter()
+        .zip(lens)
+        .all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Drop a title that only names the product or a blank tab.
+fn weak_title(t: &str) -> bool {
+    let t = t.trim();
+    t.is_empty()
+        || t == "New Tab"
+        || t == "about:blank"
+        || t == "about:newtab"
+        || t == "Problem loading page"
+        || t == "YouTube"
+        || t == "Obsidian"
+        || looks_like_uuid(t)
+}
+
+/// Browser chrome suffixes that are not part of the page name.
+fn strip_browser_chrome(title: &str) -> &str {
+    let mut t = title.trim();
+    for sep in [" — ", " - "] {
+        if let Some((head, tail)) = t.rsplit_once(sep) {
+            let tail_l = tail.to_ascii_lowercase();
+            if tail_l.contains("firefox")
+                || tail_l.contains("chrome")
+                || tail_l.contains("private browsing")
+            {
+                t = head.trim();
+            }
+        }
+    }
+    t
+}
+
+/// Human name for a span, when the event has one better than its tag.
+/// Claude `ai_title`, then a cleaned web/window title, then a file name.
+pub fn detail_of(e: &AwEvent) -> Option<String> {
+    if let Some(t) = e.data.get("ai_title").and_then(|v| v.as_str()) {
+        let t = t.trim();
+        if !t.is_empty() && !t.split('+').all(is_kind_word) && !weak_title(t) {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(t) = e.data.get("title").and_then(|v| v.as_str()) {
+        let t = strip_browser_chrome(t);
+        if !weak_title(t)
+            && !t
+                .split(':')
+                .next()
+                .is_some_and(|h| h.chars().all(|c| c.is_ascii_digit()) && t.contains(':'))
+        {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(f) = e.data.get("file").and_then(|v| v.as_str())
+        && let Some((_, name)) = f.rsplit_once('/')
+        && !name.is_empty()
+        && !weak_title(name)
+    {
+        return Some(name.to_string());
+    }
+    None
+}
+
 /// Classified, AFK-clipped span from one merged timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaggedSpan {
@@ -429,6 +537,9 @@ pub struct TaggedSpan {
     pub task_uid: Option<String>,
     pub source: String,
     pub label: String,
+    /// Human name (page title, Claude `ai_title`, file). Day shows this
+    /// when present; `label` stays the project/rule identity.
+    pub detail: Option<String>,
     pub untagged_kind: Option<SignalKind>,
 }
 
@@ -443,6 +554,7 @@ struct Clip {
     span: Span,
     tag: Tag,
     label: String,
+    detail: Option<String>,
     untagged_kind: Option<SignalKind>,
     kind: SourceKind,
 }
@@ -465,11 +577,13 @@ pub fn tagged_timeline(
             } else {
                 (None, tag.project.clone())
             };
+            let detail = detail_of(e);
             for c in clip_to_allowed(sp, allowed) {
                 clips.push(Clip {
                     span: c,
                     tag: tag.clone(),
                     label: label.clone(),
+                    detail: detail.clone(),
                     untagged_kind: unkind,
                     kind: *src_kind,
                 });
@@ -513,6 +627,7 @@ pub fn tagged_timeline(
                 if last.tag == best.tag.project
                     && last.task_uid == best.tag.task_uid
                     && last.label == best.label
+                    && last.detail == best.detail
                     && a <= last.end =>
             {
                 if b > last.end {
@@ -526,6 +641,7 @@ pub fn tagged_timeline(
                 task_uid: best.tag.task_uid.clone(),
                 source: format!("aw:{}:{}", a.timestamp_millis(), best.tag.project),
                 label: best.label.clone(),
+                detail: best.detail.clone(),
                 untagged_kind: best.untagged_kind,
             }),
         }
@@ -585,11 +701,17 @@ fn session_block(members: impl IntoIterator<Item = TaggedSpan>) -> TaggedSpan {
     let mut first: Option<TaggedSpan> = None;
     let mut by_tag: BTreeMap<String, f64> = BTreeMap::new();
     let mut by_label: BTreeMap<String, f64> = BTreeMap::new();
+    // (tag, detail) → seconds, so the detail follows the winning tag
+    // instead of whatever concurrent source happened to name itself.
+    let mut by_detail: BTreeMap<(String, String), f64> = BTreeMap::new();
     let mut label_kind: BTreeMap<String, Option<SignalKind>> = BTreeMap::new();
     for m in members {
         let secs = m.seconds();
         *by_tag.entry(m.tag.clone()).or_default() += secs;
         *by_label.entry(m.label.clone()).or_default() += secs;
+        if let Some(d) = &m.detail {
+            *by_detail.entry((m.tag.clone(), d.clone())).or_default() += secs;
+        }
         label_kind.insert(m.label.clone(), m.untagged_kind);
         start = Some(match start {
             None => m.start,
@@ -626,6 +748,12 @@ fn session_block(members: impl IntoIterator<Item = TaggedSpan>) -> TaggedSpan {
     } else {
         tag.clone()
     };
+    // Longest-running human name among the spans that carry the winning tag.
+    let detail = by_detail
+        .iter()
+        .filter(|((t, _), _)| *t == tag)
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|((_, d), _)| d.clone());
     TaggedSpan {
         start,
         end,
@@ -634,6 +762,7 @@ fn session_block(members: impl IntoIterator<Item = TaggedSpan>) -> TaggedSpan {
         task_uid: first.task_uid.clone(),
         untagged_kind: label_kind.get(&label).copied().flatten(),
         label,
+        detail,
     }
 }
 
@@ -710,10 +839,20 @@ impl AwClient {
         Ok(obj.keys().cloned().collect())
     }
 
-    pub fn find_bucket(&self, prefix: &str) -> Result<Option<String>> {
+    /// Every bucket whose id starts with `prefix`, sorted. A prefix can
+    /// match more than one (the Firefox web watcher wrote both
+    /// `aw-watcher-web-firefox` and `aw-watcher-web-firefox_<host>`).
+    pub fn find_buckets(&self, prefix: &str) -> Result<Vec<String>> {
         let mut ids = self.bucket_ids()?;
         ids.sort();
-        Ok(ids.into_iter().find(|id| id.starts_with(prefix)))
+        Ok(ids
+            .into_iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect())
+    }
+
+    pub fn find_bucket(&self, prefix: &str) -> Result<Option<String>> {
+        Ok(self.find_buckets(prefix)?.into_iter().next())
     }
 
     /// Stock query language: one statement list per time period.
@@ -735,10 +874,11 @@ impl AwClient {
     }
 }
 
-/// Stock AFK-join query for one bucket (prefix-matched).
-pub fn afk_joined_query(bucket_prefix: &str) -> String {
+/// Stock AFK-join query for one bucket id (not a prefix: `find_bucket`
+/// returns a single id, which drops sibling buckets that share a prefix).
+pub fn afk_joined_query(bucket_id: &str) -> String {
     format!(
-        r#"events = flood(query_bucket(find_bucket("{bucket_prefix}")));
+        r#"events = flood(query_bucket("{bucket_id}"));
 not_afk = flood(query_bucket(find_bucket("aw-watcher-afk_")));
 return filter_period_intersect(events, filter_keyvals(not_afk, "status", ["not-afk"]));"#
     )
@@ -816,15 +956,19 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
     let cfg = TagsConfig::load_default()?;
     let (_, start, end) = day_window(date)?;
 
+    // Every bucket under the prefix: the web watcher has left a second id
+    // behind after a client rename, and `find_bucket` only names one.
     let fetch = |prefix: &str| -> Result<Vec<AwEvent>> {
-        if client.find_bucket(prefix)?.is_none() {
-            return Ok(Vec::new());
+        let mut out = Vec::new();
+        for id in client.find_buckets(prefix)? {
+            out.extend(client.query_events(&afk_joined_query(&id), &start, &end)?);
         }
-        client.query_events(&afk_joined_query(prefix), &start, &end)
+        Ok(out)
     };
 
     let claude = fetch("aw-watcher-claude_")?;
     let neovim = fetch("aw-watcher-neovim_")?;
+    let obsidian = fetch("aw-watcher-obsidian_")?;
     let terminal = fetch("aw-watcher-terminal_")?;
     let window = fetch("aw-watcher-window_")?;
     let web = fetch("aw-watcher-web-")?;
@@ -839,9 +983,10 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
             &[
                 (SourceKind::Claude, &claude),
                 (SourceKind::Neovim, &neovim),
+                (SourceKind::Obsidian, &obsidian),
                 (SourceKind::Terminal, &terminal),
-                (SourceKind::Window, &window),
                 (SourceKind::Web, &web),
+                (SourceKind::Window, &window),
             ],
             &allowed,
             &cfg,
@@ -878,6 +1023,7 @@ pub fn ingest_spans(
             } else {
                 s.tag.clone()
             }),
+            detail: s.detail.clone(),
             planned: false,
             source: Some(s.source.clone()),
             created_at: Utc::now().timestamp_millis(),
@@ -1010,6 +1156,89 @@ mod tests {
     }
 
     #[test]
+    fn detail_prefers_ai_title_then_page_title() {
+        let claude = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({
+                "project": "ergo",
+                "ai_title": "3d-stick-figure-joint-angles",
+                "kind": "user_prompt",
+            }),
+        };
+        assert_eq!(
+            detail_of(&claude).as_deref(),
+            Some("3d-stick-figure-joint-angles")
+        );
+        // Kind words alone are not a title.
+        let kind_only = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({"project": "lab", "ai_title": "user_prompt+tool", "kind": "tool"}),
+        };
+        assert_eq!(detail_of(&kind_only), None);
+
+        let web = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({
+                "url": "https://www.cell.com/current-biology/x",
+                "title": "Walking Modulates Speed Sensitivity — Firefox Developer Edition",
+            }),
+        };
+        assert_eq!(
+            detail_of(&web).as_deref(),
+            Some("Walking Modulates Speed Sensitivity")
+        );
+
+        let blank = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({"url": "about:newtab", "title": "New Tab"}),
+        };
+        assert_eq!(detail_of(&blank), None);
+
+        // tmux `1:claude` is an index, not a name.
+        let tmux = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({"app": "kitty", "title": "1:claude"}),
+        };
+        assert_eq!(detail_of(&tmux), None);
+
+        // A session id is not a name either.
+        let uuid = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({"ai_title": "3b65c44c-55cc-4cd8-8071-d010881602f7"}),
+        };
+        assert_eq!(detail_of(&uuid), None);
+    }
+
+    #[test]
+    fn obsidian_project_comes_from_the_vault_folder() {
+        assert_eq!(
+            project_from_vault_file("/lab/types/README.md").as_deref(),
+            Some("lab")
+        );
+        assert_eq!(
+            project_from_vault_file("/Home.md").as_deref(),
+            Some("notes")
+        );
+        let e = AwEvent {
+            timestamp: "2026-10-02T12:00:00Z".into(),
+            duration: 0.0,
+            data: json!({
+                "project": "Obsidian",
+                "file": "/literatures/wu2016.md",
+                "projectPath": "/home/jaeho/Obsidian",
+            }),
+        };
+        let sig = signals_of(&e);
+        assert_eq!(sig.project.as_deref(), Some("literatures"));
+    }
+
+    #[test]
     fn coalesce_joins_same_tag_across_short_gaps() {
         let a = TaggedSpan {
             start: ts("2026-10-02T12:00:00Z"),
@@ -1018,6 +1247,7 @@ mod tests {
             task_uid: None,
             source: "aw:1:champalimaud".into(),
             label: "champalimaud".into(),
+            detail: None,
             untagged_kind: None,
         };
         let mut b = a.clone();
@@ -1044,6 +1274,7 @@ mod tests {
             task_uid: None,
             source: format!("aw:{start}:{label}"),
             label: label.into(),
+            detail: None,
             untagged_kind: Some(SignalKind::Domain),
         };
         let out = coalesce_sessions(
@@ -1081,6 +1312,7 @@ mod tests {
             task_uid: None,
             source: format!("aw:{start}:{tag}"),
             label: tag.into(),
+            detail: None,
             untagged_kind: None,
         };
         let out = coalesce_sessions(
@@ -1121,6 +1353,7 @@ mod tests {
             task_uid: None,
             source: format!("aw:{start}:{label}"),
             label: label.into(),
+            detail: None,
             untagged_kind: None,
         };
         let out = coalesce_sessions(
@@ -1162,6 +1395,7 @@ mod tests {
             task_uid: None,
             source: "aw:1:dotfiles".into(),
             label: "dotfiles".into(),
+            detail: None,
             untagged_kind: None,
         }];
         let a = ingest_spans(

@@ -111,6 +111,13 @@ pub fn fill_lane(
         let top = s / 60.0 * px_per_hour;
         let height_px = ((e - s) / 60.0 * px_per_hour).max(18.0);
         let label = b.label.as_deref().unwrap_or("untagged");
+        // Prefer the human name (page title, Claude session) on the chip;
+        // `label` stays the project tint and the rollup key.
+        let title_text = b
+            .detail
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .unwrap_or(label);
         let start_s = asst_core::fmt::time_label(local_of(b.start, zone).time());
         let end_s = asst_core::fmt::time_label(local_of(b.end, zone).time());
         let dur = dur_label(duration(b));
@@ -123,7 +130,7 @@ pub fn fill_lane(
         chip.set_margin_start(4);
         chip.set_margin_end(4);
 
-        let title = gtk::Label::new(Some(label));
+        let title = gtk::Label::new(Some(title_text));
         title.add_css_class("time-block-title");
         title.set_xalign(0.0);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -181,6 +188,7 @@ mod tests {
             start: ms(from),
             end: ms(to),
             label: None,
+            detail: None,
             planned: false,
             source: None,
             created_at: 0,
