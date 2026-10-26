@@ -414,28 +414,36 @@ pub fn scroll_top_minute(step: DayStep, px_per_hour: f64) -> Option<(f64, f64)> 
 /// phase: GTK otherwise hands the event to the overlay packing and the
 /// zoom never sees it.
 pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
-    let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-    ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let (scroll, tx) = (scroll.clone(), tx.clone());
-        ctrl.connect_scroll(move |ctl, _dx, dy| {
-            if !ctl
-                .current_event_state()
-                .contains(relm4::gtk::gdk::ModifierType::CONTROL_MASK)
-            {
-                return glib::Propagation::Proceed;
-            }
-            let y_in_view = ctl
-                .current_event()
-                .and_then(|ev| ev.position().map(|(_, y)| y))
-                .unwrap_or_else(|| scroll.vadjustment().page_size() / 3.0);
-            let hold = minute_under(&scroll, y_in_view, px_per_hour);
-            let factor = if dy > 0.0 { 1.0 / 1.2 } else { 1.2 };
-            tx.emit(Msg::ZoomBy(factor, hold));
-            glib::Propagation::Stop
-        });
+    let make = || {
+        let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let (scroll, tx) = (scroll.clone(), tx.clone());
+            ctrl.connect_scroll(move |ctl, _dx, dy| {
+                if !ctl
+                    .current_event_state()
+                    .contains(relm4::gtk::gdk::ModifierType::CONTROL_MASK)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                let y_in_view = ctl
+                    .current_event()
+                    .and_then(|ev| ev.position().map(|(_, y)| y))
+                    .unwrap_or_else(|| scroll.vadjustment().page_size() / 3.0);
+                let hold = minute_under(&scroll, y_in_view, px_per_hour);
+                let factor = if dy > 0.0 { 1.0 / 1.2 } else { 1.2 };
+                tx.emit(Msg::ZoomBy(factor, hold));
+                glib::Propagation::Stop
+            });
+        }
+        ctrl
+    };
+    // Scroller and the grid overlay both: one of them usually wins the
+    // event, and it was never the zoom.
+    scroll.add_controller(make());
+    if let Some(child) = scroll.child() {
+        child.add_controller(make());
     }
-    scroll.add_controller(ctrl);
 }
 
 /// Where a day scroller rests on attach.
