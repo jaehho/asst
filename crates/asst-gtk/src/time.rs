@@ -49,12 +49,26 @@ pub fn total_seconds(blocks: &[BlockView]) -> f64 {
     blocks.iter().filter(|b| !b.planned).map(duration).sum()
 }
 
-pub fn day_note(blocks: &[BlockView]) -> String {
-    let total = total_seconds(blocks);
-    if total <= 0.0 {
-        return "no tracked time".into();
+/// Header line for the Day view. Plan and tracked are kept apart (two
+/// lanes); this is the only summary that names both, so you can compare
+/// what you meant to do with what the sensors saw.
+pub fn day_note(blocks: &[BlockView], planned_secs: f64) -> String {
+    let tracked = total_seconds(blocks);
+    match (planned_secs > 0.0, tracked > 0.0) {
+        (false, false) => "no plan · no tracked time".into(),
+        (false, true) => format!("{} tracked", dur_label(tracked)),
+        (true, false) => format!("{} planned", dur_label(planned_secs)),
+        (true, true) => {
+            let delta = tracked - planned_secs;
+            let sign = if delta >= 0.0 { "+" } else { "−" };
+            format!(
+                "{} planned · {} tracked · {sign}{}",
+                dur_label(planned_secs),
+                dur_label(tracked),
+                dur_label(delta.abs())
+            )
+        }
     }
-    format!("{} tracked", dur_label(total))
 }
 
 /// Whether any of `b` falls on `day`. Blocks the day stepped away from stay
@@ -175,6 +189,17 @@ pub fn fill_lane(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn day_note_compares_plan_to_tracked() {
+        let b = block((15, 13, 0), (15, 15, 0));
+        assert_eq!(day_note(&[], 0.0), "no plan · no tracked time");
+        assert_eq!(day_note(std::slice::from_ref(&b), 0.0), "2 h tracked");
+        assert_eq!(day_note(&[], 3600.0), "1 h planned");
+        assert_eq!(
+            day_note(std::slice::from_ref(&b), 3600.0),
+            "1 h planned · 2 h tracked · +1 h"
+        );
+    }
     use chrono::TimeZone;
 
     use super::*;

@@ -28,11 +28,18 @@ pub fn build_column(
 
     let today = o.now.date_naive();
     let day = p.day;
+    // Plan and actual stay two lanes; the note is the only place they
+    // meet, so a day reads "3h planned · 2.5h tracked · −30m".
+    let planned_secs: f64 = p.blocks.iter().map(|b| f64::from(b.duration) * 60.0).sum();
     let note = format!(
-        "{} planned · {} to place · {}",
-        p.blocks.len(),
+        "{} · {} to place · {}",
+        time::day_note(o.blocks, planned_secs),
         p.tray.len(),
-        time::day_note(o.blocks)
+        if p.blocks.is_empty() {
+            "nothing placed".to_string()
+        } else {
+            format!("{} placed", p.blocks.len())
+        }
     );
     // Unfinished work on this day can be carried to the next: one button,
     // there only while there is something to carry.

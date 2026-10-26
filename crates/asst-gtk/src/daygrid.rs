@@ -409,8 +409,13 @@ pub fn scroll_top_minute(step: DayStep, px_per_hour: f64) -> Option<(f64, f64)> 
 
 /// Ctrl+scroll over the day grid zooms, keeping the minute under the
 /// pointer at the same viewport y. Plain scroll is left to the scroller.
+///
+/// The controller sits on the scroller **and** its child in the capture
+/// phase: GTK otherwise hands the event to the overlay packing and the
+/// zoom never sees it.
 pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
     let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
         let (scroll, tx) = (scroll.clone(), tx.clone());
         ctrl.connect_scroll(move |ctl, _dx, dy| {
