@@ -738,8 +738,9 @@ pub fn tagged_timeline(
 pub const SESSION_GAP: Duration = Duration::minutes(5);
 
 /// Spans shorter than this are sensor noise (about:blank flicker, focus
-/// races) and are dropped when they stand alone.
-pub const MIN_SPAN: Duration = Duration::seconds(5);
+/// races, tab thrash) and are dropped when they stand alone. High enough
+/// that a Day lane is not a hundred 6-second slivers.
+pub const MIN_SPAN: Duration = Duration::seconds(30);
 
 /// Collapse fragmented spans into calendar-like session blocks.
 ///
@@ -2096,16 +2097,16 @@ mod tests {
                     "champalimaud",
                     "champalimaud",
                 ),
-                // 20s github peek is its own untagged chip…
+                // A 40s github peek is its own untagged chip…
                 mk(
                     "2026-10-02T12:10:00Z",
-                    "2026-10-02T12:10:20Z",
+                    "2026-10-02T12:10:40Z",
                     "untagged",
                     "github.com",
                 ),
                 // …while the project run continues underneath.
                 mk(
-                    "2026-10-02T12:10:20Z",
+                    "2026-10-02T12:10:40Z",
                     "2026-10-02T12:15:00Z",
                     "champalimaud",
                     "champalimaud",
