@@ -1050,9 +1050,93 @@ pub fn annotate_composition(sessions: &mut [TaggedSpan], fine: &[TaggedSpan]) {
     }
 }
 
-/// Printable `[[rule]]` stubs for unmatched signals. Does not write.
+/// Keys that are not worth a rule: ids, internal pages, the shell.
+fn rule_noise(kind: SignalKind, key: &str) -> bool {
+    if key.is_empty() || key == "(none)" {
+        return true;
+    }
+    if looks_like_uuid(key) {
+        return true;
+    }
+    match kind {
+        SignalKind::Domain => {
+            key.starts_with("about:")
+                || key.starts_with("127.0.0.1")
+                || key.starts_with("localhost")
+                || key.ends_with(".local")
+        }
+        SignalKind::App => matches!(
+            key,
+            "kitty"
+                | "firefox-developer-edition"
+                | "firefox-nvidia"
+                | "xdg-desktop-portal-gtk"
+                | "floating-tui"
+        ),
+        SignalKind::Cwd => key == "/home/jaeho" || key == "/tmp" || key.starts_with("/tmp/claude"),
+        SignalKind::Project => matches!(key, "home" | "jaeho" | "tmp" | "bin" | "Downloads"),
+    }
+}
+
+/// A project-ish name for an unmatched key, not the key itself.
+fn rule_tag(kind: SignalKind, key: &str) -> String {
+    let k = key.to_ascii_lowercase();
+    if k.contains("mail.google") || k.contains("outlook") || k.starts_with("inbox") {
+        return "email".into();
+    }
+    if k.contains("zoom.us") || k.contains("meet.google") {
+        return "meetings".into();
+    }
+    if k.contains("youtube") || k.contains("reddit") || k.contains("disneyplus") {
+        return "leisure".into();
+    }
+    if k.contains("wonhomelab")
+        || k.contains("jellyfin")
+        || k.contains("radarr")
+        || k.contains("sonarr")
+        || k.contains("qbittorrent")
+    {
+        return "homelab".into();
+    }
+    if k.contains("github.com") || k.contains("gitlab") {
+        return "coding".into();
+    }
+    if k.contains("chase.com") || k.contains("robinhood") || k.contains("bcbs") {
+        return "finance".into();
+    }
+    if k.contains("obsidian") {
+        return "notes".into();
+    }
+    if k.contains("steno") {
+        return "steno".into();
+    }
+    if k.contains("zoom") {
+        return "meetings".into();
+    }
+    if k.contains("libreoffice") || k.contains("writer") || k.contains("calc") {
+        return "docs".into();
+    }
+    if k.contains("sharepoint") || k.contains("mtsinai") {
+        return "lab".into();
+    }
+    if k.contains("betterbird") || k.contains("thunderbird") {
+        return "email".into();
+    }
+    match kind {
+        SignalKind::Domain => {
+            // Bare host as a tag is what made the timeline unreadable.
+            key.split('.').next().unwrap_or(key).to_string()
+        }
+        SignalKind::App => key.to_string(),
+        SignalKind::Cwd => key.rsplit('/').next().unwrap_or(key).to_string(),
+        SignalKind::Project => key.to_string(),
+    }
+}
+
+/// Printable `[[rule]]` stubs for unmatched signals, ranked by minutes.
+/// Does not write. Names the project, not the raw domain.
 pub fn suggest_rules(spans: &[TaggedSpan]) -> String {
-    let mut seen: BTreeMap<(SignalKind, String), ()> = BTreeMap::new();
+    let mut mins: BTreeMap<(SignalKind, String), f64> = BTreeMap::new();
     for s in spans {
         if s.tag != "untagged" {
             continue;
@@ -1060,15 +1144,19 @@ pub fn suggest_rules(spans: &[TaggedSpan]) -> String {
         let Some(kind) = s.untagged_kind else {
             continue;
         };
-        if s.label.is_empty() || s.label == "(none)" {
+        if rule_noise(kind, &s.label) {
             continue;
         }
-        seen.insert((kind, s.label.clone()), ());
+        *mins.entry((kind, s.label.clone())).or_default() += s.seconds() / 60.0;
     }
+    let mut ranked: Vec<_> = mins.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut out = String::new();
-    for (kind, key) in seen.keys() {
+    for ((kind, key), minutes) in ranked.into_iter().take(25) {
+        let tag = rule_tag(kind, &key);
+        out.push_str(&format!("# {:.0} min\n", minutes));
         out.push_str("[[rule]]\n");
-        out.push_str(&format!("tag = \"{key}\"\n"));
+        out.push_str(&format!("tag = \"{tag}\"\n"));
         out.push_str(&format!("{} = \"{key}\"\n\n", kind.as_str()));
     }
     out
@@ -1650,6 +1738,57 @@ mod tests {
         annotate_composition(&mut sessions, &fine);
         let lab = sessions.iter().find(|s| s.tag == "lab").unwrap();
         assert_eq!(lab.composition.as_deref(), Some("Inbox - Gmail 99%"));
+    }
+
+    #[test]
+    fn suggest_names_projects_not_raw_domains() {
+        let mk = |start: &str, end: &str, kind: SignalKind, label: &str| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: "untagged".into(),
+            task_uid: None,
+            source: format!("aw:{start}:{label}"),
+            label: label.into(),
+            detail: None,
+            composition: None,
+            untagged_kind: Some(kind),
+        };
+        let out = suggest_rules(&[
+            mk(
+                "2026-10-02T12:00:00Z",
+                "2026-10-02T12:30:00Z",
+                SignalKind::Domain,
+                "mail.google.com",
+            ),
+            mk(
+                "2026-10-02T13:00:00Z",
+                "2026-10-02T13:10:00Z",
+                SignalKind::Domain,
+                "youtube.com",
+            ),
+            // Noise: no rule stub.
+            mk(
+                "2026-10-02T14:00:00Z",
+                "2026-10-02T14:05:00Z",
+                SignalKind::Domain,
+                "about:newtab",
+            ),
+            mk(
+                "2026-10-02T15:00:00Z",
+                "2026-10-02T15:05:00Z",
+                SignalKind::App,
+                "kitty",
+            ),
+        ]);
+        assert!(out.contains("tag = \"email\""), "out:\n{out}");
+        assert!(out.contains("domain = \"mail.google.com\""), "out:\n{out}");
+        assert!(out.contains("tag = \"leisure\""), "out:\n{out}");
+        assert!(!out.contains("about:newtab"), "out:\n{out}");
+        assert!(!out.contains("kitty"), "out:\n{out}");
+        // Ranked: email (30m) before leisure (10m).
+        let email = out.find("email").unwrap();
+        let leisure = out.find("leisure").unwrap();
+        assert!(email < leisure);
     }
 
     #[test]
