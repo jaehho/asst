@@ -1,8 +1,9 @@
 //! Location alarms: asstd follows GeoClue and rings a reminder on arrival,
 //! the way the phone does for an iPhone-made one. Each alarm rings once per
 //! arrival: it re-arms when the position leaves its radius. GeoClue missing
-//! (or refusing us) is logged once and retried on the next wake. With no
-//! location alarm on any open task asstd does not talk to GeoClue at all.
+//! (or refusing us) is logged on every attempt and retried on the next wake.
+//! With no location alarm on any open task asstd does not talk to GeoClue at
+//! all.
 //! A GeoClue that cannot be reached, or reports no position for two
 //! minutes, is no silent failure (#12): the status carries why (the window
 //! and `asst status` show it), and one notification names the reminders
@@ -89,19 +90,24 @@ type Inside = Arc<Mutex<HashSet<(String, String)>>>;
 
 pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
     let inside: Inside = Arc::default();
-    let mut warned = false;
     loop {
         // With no alarm to watch for, leave GeoClue alone: it would be
         // started every round just to say nothing.
         if has_alarms(&daemon) {
-            match one_round(&daemon, &conn, &inside).await {
-                Err(e) => {
-                    if !warned {
-                        log::info!("location reminders wait for GeoClue: {e}");
-                        warned = true;
-                    }
-                }
-                Ok(()) => warned = false,
+            if let Err(e) = one_round(&daemon, &conn, &inside).await {
+                // Every failed round, not just the first: on a machine with
+                // no position source this is the record that reminders were
+                // waiting and could not ring (#12).
+                let waiting = alarmed(&daemon).len();
+                let noun = if waiting == 1 {
+                    "reminder"
+                } else {
+                    "reminders"
+                };
+                log::info!(
+                    "location reminders wait for GeoClue: {e} ({waiting} \
+                     place {noun} waiting)"
+                );
             }
         } else {
             daemon.set_location_problem(None);
