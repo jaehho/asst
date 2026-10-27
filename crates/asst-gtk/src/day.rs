@@ -95,11 +95,18 @@ pub fn build_column(
     scroll.set_min_content_height(400);
     scroll.add_css_class("time-scroll");
     scroll.add_css_class("day-scroll");
+    if o.hold.is_some() {
+        // A rebuild after a zoom (the detail level changed): settle in.
+        scroll.add_css_class("zoom-settle");
+    }
     let zone = o.now.timezone();
     let (blocks, plan, px, tday) = (o.blocks, p, o.px_per_hour, day);
-    scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, |lanes| {
-        time::fill_lane(blocks, tday, zone, &lanes.time, px);
-        plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan);
+    // One reflow for the whole grid: a zoom moves the hour rows, the
+    // now-line and every chip through it without rebuilding the tree.
+    let reflow = daygrid::Reflow::default();
+    scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, &reflow, |lanes| {
+        time::fill_lane(blocks, tday, zone, &lanes.time, px, &reflow);
+        plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
     })));
     cols.append(&scroll);
     cols.append(&plan::tray(p, o, tx, &mut rows));
@@ -132,6 +139,7 @@ pub fn build_column(
             px_per_hour: px,
         },
     );
+    daygrid::live(&reflow, &scroll);
     daygrid::attach_zoom(&scroll, tx, px);
 
     content::Built { root, rows }

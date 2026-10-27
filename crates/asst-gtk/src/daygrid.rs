@@ -4,6 +4,9 @@
 //! What lands on the grid (tracked chips, plan blocks, the tray) stays in
 //! the view that owns it.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use chrono::{NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
@@ -56,7 +59,7 @@ pub fn hour_label(hour: u32) -> String {
 }
 
 /// The hour-label gutter for the full day.
-fn gutter(height: i32, px_per_hour: f64) -> gtk::Box {
+fn gutter(height: i32, px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
     let gutter = gtk::Box::new(gtk::Orientation::Vertical, 0);
     gutter.set_size_request(GUTTER, height);
     gutter.add_css_class("time-gutter");
@@ -73,6 +76,7 @@ fn gutter(height: i32, px_per_hour: f64) -> gtk::Box {
         // into it by a negative margin.
         lab.set_margin_end(8);
         slot.append(&lab);
+        reflow.hour(&slot);
         gutter.append(&slot);
     }
     gutter
@@ -81,7 +85,7 @@ fn gutter(height: i32, px_per_hour: f64) -> gtk::Box {
 /// Hour rules for the full day, as stacked rows (reliable allocation).
 /// Spans the same extent as the now-line: the full grid width, gutter
 /// included (the calendar convention), from one width source below.
-fn rules(height: i32, px_per_hour: f64) -> gtk::Box {
+fn rules(height: i32, px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
     let hours = HOUR_END - HOUR_START;
     let rules = gtk::Box::new(gtk::Orientation::Vertical, 0);
     rules.set_hexpand(true);
@@ -93,35 +97,31 @@ fn rules(height: i32, px_per_hour: f64) -> gtk::Box {
         slot.set_hexpand(true);
         slot.set_height_request(hour_h);
         slot.add_css_class("time-hour-slot");
+        reflow.hour(&slot);
         rules.append(&slot);
     }
     rules
 }
 
-/// The now-line: a red rule on a drawn dot. Both centers sit on `y` (the
-/// minute's line center), so the dot's bottom edge is not what the rule
+/// The now-line: a red rule on a drawn dot. Both centers sit on the same
+/// minute's line center, so the dot's bottom edge is not what the rule
 /// rides. Only when `now` falls on `day`. The dot is a sized circle, not a
 /// glyph: a Label's box is not its ink. Sized Fixed children: a 2px box
 /// measures to zero here.
-fn now_line(
-    now: chrono::DateTime<Tz>,
-    day: NaiveDate,
-    px_per_hour: f64,
-) -> Option<(gtk::Box, gtk::Box, f64)> {
+fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk::Box, f64)> {
     if now.date_naive() != day {
         return None;
     }
     let mins = f64::from(now.time().hour()) * 60.0
         + f64::from(now.time().minute())
         + f64::from(now.time().second()) / 60.0;
-    let y = y_at(mins, px_per_hour);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     line.add_css_class("time-now");
     line.set_size_request(MIN_GRID_W, LINE_H as i32);
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("time-now-dot");
     dot.set_size_request(DOT_SIZE as i32, DOT_SIZE as i32);
-    Some((line, dot, y))
+    Some((line, dot, mins))
 }
 
 /// Place `child` so its vertical center is `y`, using its measured size
@@ -154,6 +154,174 @@ pub struct Lanes {
     pub plan: gtk::Overlay,
 }
 
+/// A chip on the grid, remembered so a zoom can move it without rebuilding
+/// the tree. `wrap` is the overlay child that carries the top margin; `body`
+/// is the chip whose height follows the span. `meta` is a second line that
+/// only reads when the chip is tall enough for it.
+pub struct Placed {
+    wrap: glib::WeakRef<gtk::Widget>,
+    body: glib::WeakRef<gtk::Widget>,
+    span: Span,
+    meta: Option<glib::WeakRef<gtk::Widget>>,
+}
+
+/// The now-line, its dot and the minute they ride.
+struct NowLine {
+    fixed: glib::WeakRef<gtk::Fixed>,
+    line: glib::WeakRef<gtk::Widget>,
+    dot: glib::WeakRef<gtk::Widget>,
+    mins: f64,
+}
+
+/// Where a chip sits on the axis and when its second line shows.
+#[derive(Clone, Copy)]
+pub struct Span {
+    pub start_min: f64,
+    pub end_min: f64,
+    /// Never shorter than this, so a short span stays clickable.
+    pub min_h: f64,
+    /// The meta line shows once the chip is this tall.
+    pub meta_at: f64,
+}
+
+#[derive(Default)]
+struct ReflowInner {
+    /// The zoom the grid is drawn at now. Widgets are placed against this
+    /// when they are built and every time it moves.
+    px: Cell<f64>,
+    hours: RefCell<Vec<glib::WeakRef<gtk::Widget>>>,
+    sized: RefCell<Vec<glib::WeakRef<gtk::Widget>>>,
+    now_line: RefCell<Option<NowLine>>,
+    placed: RefCell<Vec<Placed>>,
+}
+
+/// Everything a zoom has to move, gathered while the grid and its chips are
+/// built. Cheap to clone (`Rc`), so the gesture handlers and the window's
+/// zoom commands both reach the same grid.
+///
+/// A zoom is a geometry change: chips slide to new places and text
+/// re-renders at the new size. It is not a rebuild. Rebuilding the tree is
+/// what made the lane flash, so this only sets margins and heights — GTK
+/// relays out from there.
+#[derive(Clone, Default)]
+pub struct Reflow(Rc<ReflowInner>);
+
+impl Reflow {
+    /// An hour row in the rules or the gutter: its height is one hour.
+    pub fn hour(&self, slot: &impl IsA<gtk::Widget>) {
+        slot.set_height_request(self.0.hour_h());
+        self.0.hours.borrow_mut().push(slot.as_ref().downgrade());
+    }
+
+    /// A container that spans the whole day (rules, the lane row, the Fixed):
+    /// its height follows the zoom.
+    pub fn sized(&self, w: &impl IsA<gtk::Widget>) {
+        w.set_height_request(self.0.grid_h());
+        self.0.sized.borrow_mut().push(w.as_ref().downgrade());
+    }
+
+    /// The now-line and its dot, centered on `mins` minutes from midnight.
+    pub fn now_line(
+        &self,
+        fixed: &gtk::Fixed,
+        line: &impl IsA<gtk::Widget>,
+        dot: &impl IsA<gtk::Widget>,
+        mins: f64,
+    ) {
+        let y = y_at(mins, self.0.px());
+        center_at(fixed, line.as_ref(), y, LINE_H);
+        center_at(fixed, dot.as_ref(), y, DOT_SIZE);
+        *self.0.now_line.borrow_mut() = Some(NowLine {
+            fixed: fixed.downgrade(),
+            line: line.as_ref().downgrade(),
+            dot: dot.as_ref().downgrade(),
+            mins,
+        });
+    }
+
+    /// A chip: `wrap` sits at the span's start, `body` is as tall as the
+    /// span, and `meta` shows once the chip is tall enough for it.
+    pub fn place(
+        &self,
+        wrap: &impl IsA<gtk::Widget>,
+        body: &impl IsA<gtk::Widget>,
+        span: Span,
+        meta: Option<&impl IsA<gtk::Widget>>,
+    ) {
+        let p = Placed {
+            wrap: wrap.as_ref().downgrade(),
+            body: body.as_ref().downgrade(),
+            span,
+            meta: meta.map(|m| m.as_ref().downgrade()),
+        };
+        p.apply(self.0.px());
+        self.0.placed.borrow_mut().push(p);
+    }
+
+    /// Move the whole grid to `px_per_hour`. No widget is created or
+    /// destroyed, so a pinch tracks the fingers frame by frame.
+    pub fn apply(&self, px_per_hour: f64) {
+        self.0.px.set(model::clamp_px_per_hour(px_per_hour));
+        let hour_h = self.0.hour_h();
+        for w in self.0.hours.borrow().iter() {
+            if let Some(w) = w.upgrade() {
+                w.set_height_request(hour_h);
+            }
+        }
+        let grid_h = self.0.grid_h();
+        for w in self.0.sized.borrow().iter() {
+            if let Some(w) = w.upgrade() {
+                w.set_height_request(grid_h);
+            }
+        }
+        if let Some(n) = self.0.now_line.borrow().as_ref()
+            && let (Some(fixed), Some(line), Some(dot)) =
+                (n.fixed.upgrade(), n.line.upgrade(), n.dot.upgrade())
+        {
+            let y = y_at(n.mins, self.0.px());
+            center_at(&fixed, &line, y, LINE_H);
+            center_at(&fixed, &dot, y, DOT_SIZE);
+        }
+        for p in self.0.placed.borrow().iter() {
+            p.apply(self.0.px());
+        }
+    }
+
+    /// Where the grid is zoomed to now.
+    pub fn px(&self) -> f64 {
+        self.0.px()
+    }
+}
+
+impl Placed {
+    fn apply(&self, px_per_hour: f64) {
+        let Some(wrap) = self.wrap.upgrade() else {
+            return;
+        };
+        let sp = self.span;
+        wrap.set_margin_top(y_at(sp.start_min, px_per_hour) as i32);
+        let h = ((sp.end_min - sp.start_min) / 60.0 * px_per_hour).max(sp.min_h);
+        if let Some(body) = self.body.upgrade() {
+            body.set_height_request(h as i32);
+        }
+        if let Some(meta) = self.meta.as_ref().and_then(|m| m.upgrade()) {
+            meta.set_visible(h >= sp.meta_at);
+        }
+    }
+}
+
+impl ReflowInner {
+    fn px(&self) -> f64 {
+        self.px.get()
+    }
+    fn hour_h(&self) -> i32 {
+        self.px() as i32
+    }
+    fn grid_h(&self) -> i32 {
+        ((HOUR_END - HOUR_START) as f64 * self.px()).round() as i32
+    }
+}
+
 fn lane() -> gtk::Overlay {
     let overlay = gtk::Overlay::new();
     overlay.set_hexpand(true);
@@ -171,18 +339,22 @@ fn lane() -> gtk::Overlay {
 /// Both take their width from `grid_width`. Placement is reapplied after
 /// allocation: the first build's put lands, a rebuild's does not until the
 /// Fixed has been sized once.
+///
+/// Everything this builds registers with `reflow`, so a zoom can move the
+/// hour rows, the sized containers and the now-line without tearing the
+/// tree down.
 pub fn day_grid(
     day: NaiveDate,
     now: chrono::DateTime<Tz>,
     px_per_hour: f64,
+    reflow: &Reflow,
     content: impl FnOnce(&Lanes),
 ) -> gtk::Widget {
-    let px_per_hour = model::clamp_px_per_hour(px_per_hour);
-    let height = ((HOUR_END - HOUR_START) as f64 * px_per_hour).round() as i32;
+    reflow.apply(px_per_hour);
 
     // Rules under everything, including the gutter, so the hour ticks and
     // the now-line share one extent.
-    let rules = rules(height, px_per_hour);
+    let rules = rules(reflow.0.grid_h(), reflow.px(), reflow);
 
     // Time on the left, plan on the right: one axis, two lanes.
     let lanes = Lanes {
@@ -199,48 +371,36 @@ pub fn day_grid(
     let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     column.add_css_class("time-planner");
     column.set_hexpand(true);
-    column.set_size_request(MIN_GRID_W, height);
-    column.append(&gutter(height, px_per_hour));
+    column.append(&gutter(reflow.0.grid_h(), reflow.px(), reflow));
     column.append(&row);
 
     let fixed = gtk::Fixed::new();
-    fixed.set_size_request(MIN_GRID_W, height);
     fixed.put(&rules, 0.0, 0.0);
     fixed.put(&column, 0.0, 0.0);
-    let line_dot = now_line(now, day, px_per_hour);
-    if let Some((_, _, y)) = &line_dot {
-        // Both centers on `y`: the rule's and the dot's midpoints meet.
-        center_at(
-            &fixed,
-            line_dot.as_ref().unwrap().0.upcast_ref(),
-            *y,
-            LINE_H,
-        );
-        center_at(
-            &fixed,
-            line_dot.as_ref().unwrap().1.upcast_ref(),
-            *y,
-            DOT_SIZE,
-        );
+    reflow.sized(&rules);
+    reflow.sized(&column);
+    reflow.sized(&fixed);
+    let line_dot = now_line(now, day);
+    if let Some((line, dot, mins)) = &line_dot {
+        // Both centers on the same y: the rule's and the dot's midpoints meet.
+        reflow.now_line(&fixed, line, dot, *mins);
     }
     let place = {
-        let (weak, line_dot, rules, column) = (
-            fixed.downgrade(),
-            line_dot.clone(),
-            rules.clone(),
-            column.clone(),
-        );
+        let (weak, rules, column) = (fixed.downgrade(), rules.clone(), column.clone());
+        let (line_dot, reflow) = (line_dot.clone(), reflow.clone());
         move || {
             let Some(fixed) = weak.upgrade() else { return };
             // One width for rules, line, and the lane row: they cannot
-            // drift apart, and the lanes fill the same extent.
+            // drift apart, and the lanes fill the same extent. Heights are
+            // the reflow's job; only the width is settled here.
             let w = grid_width(&fixed) as i32;
-            rules.set_size_request(w, height);
-            column.set_size_request(w, height);
-            if let Some((line, dot, y)) = &line_dot {
+            rules.set_width_request(w);
+            column.set_width_request(w);
+            if let Some((line, dot, mins)) = &line_dot {
                 line.set_size_request(w, LINE_H as i32);
-                center_at(&fixed, line.upcast_ref(), *y, LINE_H);
-                center_at(&fixed, dot.upcast_ref(), *y, DOT_SIZE);
+                let y = y_at(*mins, reflow.px());
+                center_at(&fixed, line.upcast_ref(), y, LINE_H);
+                center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
                 line.queue_draw();
                 dot.queue_draw();
             }
@@ -407,12 +567,140 @@ pub fn scroll_top_minute(step: DayStep, px_per_hour: f64) -> Option<(f64, f64)> 
     Some((y / px_per_hour * 60.0, 0.0))
 }
 
+// The day grid on view now, if any: its reflow and its scroller. Set when a
+// Day column is built, so the window's zoom keys and the gesture handlers
+// reach the same tree without threading it through every message.
+struct Live {
+    reflow: Reflow,
+    scroll: glib::WeakRef<gtk::ScrolledWindow>,
+    /// Bumped by every glide, so a newer one retires the older.
+    glide: Cell<u64>,
+}
+
+thread_local! {
+    static LIVE: RefCell<Option<Rc<Live>>> = const { RefCell::new(None) };
+}
+
+/// Put the day grid on view into `LIVE`, so zoom commands can reach it.
+pub fn live(reflow: &Reflow, scroll: &gtk::ScrolledWindow) {
+    LIVE.with(|l| {
+        let glide = l.borrow().as_ref().map_or(0, |o| o.glide.get() + 1);
+        *l.borrow_mut() = Some(Rc::new(Live {
+            reflow: reflow.clone(),
+            scroll: scroll.downgrade(),
+            glide: Cell::new(glide),
+        }));
+    });
+}
+
+fn live_now() -> Option<Rc<Live>> {
+    LIVE.with(|l| l.borrow().clone())
+}
+
+/// The zoom the grid on view is at, else `fallback`. Drags and drops read
+/// this, not the zoom they were built at: a pinch moves the grid without a
+/// rebuild.
+pub fn live_px(fallback: f64) -> f64 {
+    live_now().map_or(fallback, |l| l.reflow.px())
+}
+
+/// Scroll so minute `hold.0` sits at `hold.1` from the top of the viewport.
+/// Float math (a minute is two pixels at the closest zoom, so truncating it
+/// jitters), and the adjustment's upper bound is moved first: the viewport
+/// only learns the new height at the next layout, and a value set before
+/// that is clamped to the old one.
+fn pin_scroll(scroll: &gtk::ScrolledWindow, hold: Option<(f64, f64)>, px_per_hour: f64) {
+    let Some((mins, keep_y)) = hold else {
+        return;
+    };
+    let vadj = scroll.vadjustment();
+    let view_h = vadj.page_size();
+    if view_h <= 0.0 {
+        return;
+    }
+    let grid_h = model::grid_height(HOUR_START, HOUR_END, px_per_hour);
+    vadj.set_upper(grid_h.max(view_h));
+    let max = (grid_h - view_h).max(0.0);
+    vadj.set_value((y_at(mins, px_per_hour) - keep_y).clamp(0.0, max));
+}
+
+/// Move the grid on view to `px_per_hour` right now, keeping `hold` put.
+/// Geometry only: no widgets are made or dropped, so this is safe to call
+/// on every frame of a pinch or a glide.
+pub fn zoom_now(px_per_hour: f64, hold: Option<(f64, f64)>) {
+    let px = model::clamp_px_per_hour(px_per_hour);
+    let Some(l) = live_now() else { return };
+    l.reflow.apply(px);
+    if let Some(scroll) = l.scroll.upgrade() {
+        pin_scroll(&scroll, hold, px);
+    }
+}
+
+/// Glide the grid on view from where it is to `to`, on the frame clock, and
+/// call `step` with each zoom on the way and `done` at the end. A newer
+/// glide retires this one; `done` then does not run.
+pub fn glide(
+    to: f64,
+    hold: Option<(f64, f64)>,
+    ms: u32,
+    step: impl Fn(f64) + 'static,
+    done: impl FnOnce() + 'static,
+) {
+    let to = model::clamp_px_per_hour(to);
+    let Some(l) = live_now() else {
+        done();
+        return;
+    };
+    let from = l.reflow.px();
+    if ms == 0 || (from - to).abs() < 0.01 {
+        zoom_now(to, hold);
+        step(to);
+        done();
+        return;
+    }
+    let mine = l.glide.get() + 1;
+    l.glide.set(mine);
+    let Some(scroll) = l.scroll.upgrade() else {
+        done();
+        return;
+    };
+    let start = Cell::new(None::<i64>);
+    let done = RefCell::new(Some(done));
+    scroll.add_tick_callback(move |_, clock| {
+        if l.glide.get() != mine {
+            return glib::ControlFlow::Break;
+        }
+        // Frame time, not wall time: the glide keeps pace with what is
+        // painted, and a dropped frame catches up instead of stuttering.
+        let now = clock.frame_time();
+        let t0 = start.get().unwrap_or(now);
+        start.set(Some(t0));
+        let t = ((now - t0) as f64 / (f64::from(ms) * 1000.0)).clamp(0.0, 1.0);
+        // Ease-out quintic: a quick start that settles without a thud.
+        let eased = 1.0 - (1.0 - t).powi(5);
+        let px = from + (to - from) * eased;
+        zoom_now(px, hold);
+        step(px);
+        if t >= 1.0 {
+            if let Some(d) = done.borrow_mut().take() {
+                d();
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 /// Ctrl+scroll over the day grid zooms, keeping the minute under the
 /// pointer at the same viewport y. Plain scroll is left to the scroller.
 ///
 /// The controller sits on the scroller **and** its child in the capture
 /// phase: GTK otherwise hands the event to the overlay packing and the
 /// zoom never sees it.
+///
+/// Every event moves the grid itself (`reflow`) so a pinch or a scroll
+/// tracks the hand frame by frame. The window is only told afterwards, to
+/// remember the zoom and rebuild if the detail level changed.
 pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
     let make_scroll = || {
         let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
@@ -430,9 +718,18 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
                     .current_event()
                     .and_then(|ev| ev.position().map(|(_, y)| y))
                     .unwrap_or_else(|| scroll.vadjustment().page_size() / 3.0);
-                let hold = minute_under(&scroll, y_in_view, px_per_hour);
-                let factor = if dy > 0.0 { 1.0 / 1.2 } else { 1.2 };
-                tx.emit(Msg::ZoomBy(factor, hold));
+                let px = live_px(px_per_hour);
+                let hold = minute_under(&scroll, y_in_view, px);
+                if dy.abs() >= 1.0 {
+                    // A wheel click is a step, not a stream: glide to it.
+                    let factor = if dy > 0.0 { 1.0 / 1.2 } else { 1.2 };
+                    tx.emit(Msg::ZoomBy(factor, hold));
+                } else {
+                    // A touchpad's two-finger stream tracks the hand.
+                    let target = model::clamp_px_per_hour(px * (1.0 - dy * 0.12));
+                    zoom_now(target, hold);
+                    tx.emit(Msg::Zoom(target, hold));
+                }
                 glib::Propagation::Stop
             });
         }
@@ -440,33 +737,45 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
     };
     // Touchpad pinch is a zoom gesture, not Ctrl+scroll. Attached in the
     // capture phase on the scroller and its child so the overlay cannot
-    // swallow it.
+    // swallow it. The scale is absolute from the gesture's start, so the
+    // grid tracks the fingers 1:1 with no drift.
     let make_pinch = || {
         let pinch = gtk::GestureZoom::new();
         pinch.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
             let (scroll, tx) = (scroll.clone(), tx.clone());
-            let last = std::rc::Rc::new(std::cell::Cell::new(1.0f64));
+            let base = Rc::new(Cell::new(px_per_hour));
+            let hold = Rc::new(Cell::new(None::<(f64, f64)>));
             {
-                let last = last.clone();
-                pinch.connect_scale_changed(move |g, scale| {
-                    let prev = last.get();
-                    last.set(scale);
-                    if prev <= 0.0 || (scale - prev).abs() < 0.01 {
-                        return;
-                    }
-                    let factor = scale / prev;
+                let (scroll, base, hold) = (scroll.clone(), base.clone(), hold.clone());
+                pinch.connect_begin(move |g, _seq| {
+                    let px = live_px(px_per_hour);
+                    base.set(px);
                     let y_in_view = g
                         .bounding_box_center()
                         .map(|(_, y)| y)
                         .unwrap_or_else(|| scroll.vadjustment().page_size() / 3.0);
-                    let hold = minute_under(&scroll, y_in_view, px_per_hour);
-                    tx.emit(Msg::ZoomBy(factor, hold));
+                    hold.set(minute_under(&scroll, y_in_view, px));
                 });
             }
-            pinch.connect_end(move |_g, _seq| {
-                last.set(1.0);
-            });
+            {
+                let (base, hold) = (base.clone(), hold.clone());
+                pinch.connect_scale_changed(move |_g, scale| {
+                    if !scale.is_finite() || scale <= 0.0 {
+                        return;
+                    }
+                    let target = model::clamp_px_per_hour(base.get() * scale);
+                    zoom_now(target, hold.get());
+                    tx.emit(Msg::Zoom(target, hold.get()));
+                });
+            }
+            {
+                let (base, hold) = (base.clone(), hold.clone());
+                pinch.connect_end(move |_g, _seq| {
+                    base.set(px_per_hour);
+                    hold.set(None);
+                });
+            }
         }
         pinch
     };

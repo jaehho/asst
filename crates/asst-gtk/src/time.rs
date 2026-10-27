@@ -256,12 +256,16 @@ pub fn display_spans(
 /// overlay (the Plan blocks' pattern) so a sibling overlay like the
 /// now-line still measures. What is drawn, and how much of it, follows
 /// `detail_for(px_per_hour)`.
+///
+/// Every chip registers with `reflow`, so a zoom can slide and resize the
+/// whole lane without rebuilding it.
 pub fn fill_lane(
     blocks: &[BlockView],
     day: NaiveDate,
     zone: Tz,
     overlay: &gtk::Overlay,
     px_per_hour: f64,
+    reflow: &daygrid::Reflow,
 ) {
     let detail = detail_for(px_per_hour);
     let spans = display_spans(blocks, day, zone, detail);
@@ -279,14 +283,11 @@ pub fn fill_lane(
         let (mut col, ncol) = cols[i];
         let ncol = ncol.min(max_cols).max(1);
         col = col.min(ncol - 1);
-        let top = d.start_min / 60.0 * px_per_hour;
-        let height_px = ((d.end_min - d.start_min) / 60.0 * px_per_hour).max(18.0);
 
         let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
         chip.add_css_class("time-block");
         chip.add_css_class(tint_for(&d.label));
         chip.set_hexpand(true);
-        chip.set_height_request(height_px as i32);
         chip.set_margin_start(4);
         chip.set_margin_end(4);
 
@@ -295,15 +296,17 @@ pub fn fill_lane(
         title.set_xalign(0.0);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&title);
-        if let Some(meta_text) = &d.meta
-            && height_px >= 34.0
-        {
+        // The meta line is built either way and only *shown* once the chip
+        // is tall enough for it, so a zoom that grows the chip can reveal
+        // it without a rebuild.
+        let meta = d.meta.as_ref().map(|meta_text| {
             let meta = gtk::Label::new(Some(meta_text));
             meta.add_css_class("time-block-meta");
             meta.set_xalign(0.0);
             meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
             chip.append(&meta);
-        }
+            meta
+        });
 
         // Equal-expand spacers put the chip in its overlap column.
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -323,9 +326,15 @@ pub fn fill_lane(
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
         wrap.set_hexpand(true);
-        wrap.set_margin_top(top as i32);
         wrap.append(&row);
         overlay.add_overlay(&wrap);
+        let span = daygrid::Span {
+            start_min: d.start_min,
+            end_min: d.end_min,
+            min_h: 18.0,
+            meta_at: 34.0,
+        };
+        reflow.place(&wrap, &chip, span, meta.as_ref());
     }
 }
 

@@ -32,12 +32,14 @@ use crate::prefs::{PrefPatch, Prefs};
 use crate::sidebar::{self, Reach, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
-use crate::{client, dialogs, find, plan, settings};
+use crate::{client, daygrid, dialogs, find, plan, settings, time};
 
 pub type Tx = relm4::Sender<Msg>;
 
 /// How long a repeating task's new date stays lit (`.due-chip.rolled`).
 const ROLLED_MS: u32 = 1200;
+/// A keyboard or wheel zoom gliding to its target.
+const GLIDE_MS: u32 = 260;
 
 /// Seconds an Undo for a change to the sidebar stays on screen: long enough
 /// to read where the view can be added back.
@@ -133,6 +135,8 @@ pub enum Msg {
     /// Change the day-grid zoom (pixels per hour). `hold` pins a minute at
     /// a y from the top of the viewport so the view does not jump.
     Zoom(f64, Option<(f64, f64)>),
+    /// A frame of an animated zoom: record the scale, rebuild nothing.
+    ZoomQuiet(f64),
     /// Zoom by a factor (Ctrl+scroll, Ctrl+= / Ctrl+-).
     ZoomBy(f64, Option<(f64, f64)>),
     ToggleSidebar,
@@ -1217,17 +1221,37 @@ impl Component for Window {
             Msg::Zoom(px, hold) => {
                 self.prefs.day_zoom = model::clamp_px_per_hour(px);
                 self.zoom_hold = hold;
+                // The gesture already moved the grid (daygrid::zoom_now), so
+                // nothing is rebuilt per event. Once it settles, the render
+                // after it rebuilds only if the detail level changed (the
+                // view key holds the level, not the pixels); never while
+                // the fingers are still down, which would replace the
+                // widgets under the gesture.
                 self.dirty = true;
-                // Rebuild once the gesture settles, not every scroll tick.
-                self.hold(&sender, Duration::from_millis(140));
+                self.hold(&sender, Duration::from_millis(160));
+                return;
+            }
+            Msg::ZoomQuiet(px) => {
+                self.prefs.day_zoom = model::clamp_px_per_hour(px);
                 return;
             }
             Msg::ZoomBy(factor, hold) => {
-                let px = self.prefs.day_zoom * factor;
-                self.prefs.day_zoom = model::clamp_px_per_hour(px);
+                // Keys and wheel clicks glide to the target; the gestures
+                // already track the hand and send `Zoom` instead.
+                let to = model::clamp_px_per_hour(self.prefs.day_zoom * factor);
                 self.zoom_hold = hold;
-                self.dirty = true;
-                self.hold(&sender, Duration::from_millis(140));
+                let tx = sender.input_sender().clone();
+                let ms = motion::lasts(GLIDE_MS).as_millis() as u32;
+                daygrid::glide(
+                    to,
+                    hold,
+                    ms,
+                    {
+                        let tx = tx.clone();
+                        move |px| tx.emit(Msg::ZoomQuiet(px))
+                    },
+                    move || tx.emit(Msg::Zoom(to, hold)),
+                );
                 return;
             }
             Msg::Navigate(nav) => {
@@ -3602,7 +3626,7 @@ impl Window {
                 self.prefs.list_order,
                 self.prefs.lists_by_name,
                 self.prefs.sunday_first,
-                self.prefs.day_zoom.to_bits(),
+                time::detail_for(self.prefs.day_zoom) as u8,
             )
             .hash(&mut h);
             let mut sel: Vec<&String> = self.selected.iter().collect();
@@ -4097,7 +4121,8 @@ impl Window {
             "zoom" => {
                 if let Ok(px) = arg.trim().parse::<f64>() {
                     let hold = self.top_visible_hold();
-                    sender.input(Msg::Zoom(px, hold));
+                    let now = self.prefs.day_zoom.max(1.0);
+                    sender.input(Msg::ZoomBy(px / now, hold));
                 }
             }
             "zoomby" => {
