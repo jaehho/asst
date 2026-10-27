@@ -27,47 +27,28 @@ struct TimeLane {
 }
 
 impl TimeLane {
-    /// Draw the chips again for `px`. With `fade` the old ones dissolve out
-    /// as the new dissolve in; without, they swap inside one frame, which
-    /// is what keeps a block growing by a minute from being seen at all.
-    fn redraw(&self, px: f64, fade: bool) {
+    /// Draw the chips again for `px`. The old ones go and the new ones
+    /// arrive inside one frame, so nothing of the last zoom is left behind
+    /// (a dissolve left them hanging at their old places, not following the
+    /// grid) and a block growing by a minute is not seen at all.
+    fn redraw(&self, px: f64) {
         let Some(lane) = self.lane.as_ref().and_then(|l| l.upgrade()) else {
             return;
         };
-        self.shown.set(time::detail_for(px));
+        self.shown.set(time::detail_from(self.shown.get(), px));
         let old = self.chips.take();
         self.reflow.forget(&old);
-        if fade {
-            for w in &old {
-                w.set_can_target(false);
-                w.add_css_class("chip-out");
-            }
-            glib::timeout_add_local_once(std::time::Duration::from_millis(200), {
-                let lane = lane.clone();
-                move || {
-                    for w in &old {
-                        lane.remove_overlay(w);
-                    }
-                }
-            });
-        } else {
-            for w in &old {
-                lane.remove_overlay(w);
-            }
+        for w in &old {
+            lane.remove_overlay(w);
         }
         let fresh = time::fill_lane(
             &self.blocks.borrow(),
             self.day,
             self.zone,
             &lane,
-            px,
+            self.shown.get(),
             &self.reflow,
         );
-        if fade {
-            for w in &fresh {
-                w.add_css_class("chip-in");
-            }
-        }
         *self.chips.borrow_mut() = fresh;
     }
 }
@@ -166,7 +147,14 @@ pub fn build_column(
     let mut time_lane: Option<gtk::Overlay> = None;
     let mut chips: Vec<gtk::Widget> = Vec::new();
     scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, &reflow, |lanes| {
-        chips = time::fill_lane(blocks, tday, zone, &lanes.time, px, &reflow);
+        chips = time::fill_lane(
+            blocks,
+            tday,
+            zone,
+            &lanes.time,
+            time::detail_for(px),
+            &reflow,
+        );
         time_lane = Some(lanes.time.clone());
         plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
     })));
@@ -186,8 +174,8 @@ pub fn build_column(
     let refill: Rc<dyn Fn(f64)> = {
         let lane = lane.clone();
         Rc::new(move |px| {
-            if time::detail_for(px) != lane.shown.get() {
-                lane.redraw(px, true);
+            if time::detail_from(lane.shown.get(), px) != lane.shown.get() {
+                lane.redraw(px);
             }
         })
     };
@@ -196,7 +184,7 @@ pub fn build_column(
         Rc::new(move |blocks, tracked_changed, now| {
             if tracked_changed {
                 *lane.blocks.borrow_mut() = blocks.to_vec();
-                lane.redraw(lane.reflow.px(), false);
+                lane.redraw(lane.reflow.px());
                 if let Some(l) = note_label.as_ref().and_then(|l| l.upgrade()) {
                     l.set_text(&note_for(blocks));
                 }

@@ -3986,6 +3986,12 @@ impl Window {
         );
         let mut state = state;
         state.rebuilt_for = self.rebuilt_for.clone();
+        if let Some((h, page, upper)) = crate::daygrid::viewport() {
+            state.scroller_h = Some(h);
+            state.page_size = Some(page);
+            state.scroll_upper = Some(upper);
+            state.grid_px = Some(crate::daygrid::live_px(-1.0));
+        }
         let json = crate::devel::dump_json(&state);
         if path.is_empty() {
             eprintln!("{json}");

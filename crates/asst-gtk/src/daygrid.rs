@@ -60,9 +60,12 @@ pub fn hour_label(hour: u32) -> String {
 }
 
 /// The hour-label gutter for the full day.
-fn gutter(height: i32, px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
+fn gutter(px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
     let gutter = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    gutter.set_size_request(GUTTER, height);
+    // Width only: its height is the zoom's (`sized`), and a height fixed at
+    // build would keep the day from ever shrinking below where it opened.
+    gutter.set_width_request(GUTTER);
+    reflow.sized(&gutter);
     gutter.add_css_class("time-gutter");
     let hour_h = px_per_hour as i32;
     for h in HOUR_START..HOUR_END {
@@ -86,11 +89,11 @@ fn gutter(height: i32, px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
 /// Hour rules for the full day, as stacked rows (reliable allocation).
 /// Spans the same extent as the now-line: the full grid width, gutter
 /// included (the calendar convention), from one width source below.
-fn rules(height: i32, px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
+fn rules(px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
     let hours = HOUR_END - HOUR_START;
     let rules = gtk::Box::new(gtk::Orientation::Vertical, 0);
     rules.set_hexpand(true);
-    rules.set_size_request(MIN_GRID_W, height);
+    rules.set_width_request(MIN_GRID_W);
     rules.add_css_class("time-grid");
     let hour_h = px_per_hour as i32;
     for _ in 0..hours {
@@ -385,7 +388,7 @@ pub fn day_grid(
 
     // Rules under everything, including the gutter, so the hour ticks and
     // the now-line share one extent.
-    let rules = rules(reflow.0.grid_h(), reflow.px(), reflow);
+    let rules = rules(reflow.px(), reflow);
 
     // Time on the left, plan on the right: one axis, two lanes.
     let lanes = Lanes {
@@ -402,7 +405,7 @@ pub fn day_grid(
     let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     column.add_css_class("time-planner");
     column.set_hexpand(true);
-    column.append(&gutter(reflow.0.grid_h(), reflow.px(), reflow));
+    column.append(&gutter(reflow.px(), reflow));
     column.append(&row);
 
     let fixed = gtk::Fixed::new();
@@ -656,6 +659,14 @@ pub fn refresh_live(
     };
     refresh(blocks, tracked_changed, now);
     true
+}
+
+/// The day scroller's allocated height, its viewport's page size and how
+/// far it can scroll, for the dev dump.
+pub fn viewport() -> Option<(i32, f64, f64)> {
+    let scroll = live_now()?.scroll.upgrade()?;
+    let vadj = scroll.vadjustment();
+    Some((scroll.height(), vadj.page_size(), vadj.upper()))
 }
 
 /// Minutes from midnight on `now`'s own day, seconds as a fraction.

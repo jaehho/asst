@@ -1137,12 +1137,3 @@ button.pill {
   min-width: 4.5em;
 }
 
-/* Tracked chips redrawn for a new zoom level: the old fade out as the new
-   fade in (day.rs), so crossing a level is a dissolve, not a rebuild. */
-.chip-in {
-  animation: arrive 200ms ease-out;
-}
-
-.chip-out {
-  animation: leave 160ms ease-in forwards;
-}

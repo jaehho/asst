@@ -116,6 +116,35 @@ pub fn detail_for(px_per_hour: f64) -> Detail {
     }
 }
 
+/// The level to draw at `px_per_hour` when the grid was at `prev`. A pinch
+/// hovering at a boundary would otherwise flip the chips back and forth
+/// every frame; the level only changes once the zoom is a few pixels past
+/// the boundary.
+pub fn detail_from(prev: Detail, px_per_hour: f64) -> Detail {
+    const SLACK: f64 = 4.0;
+    let toward = detail_for(px_per_hour);
+    if toward == prev {
+        return prev;
+    }
+    // Where each level begins, and so how far past it the zoom has gone.
+    let edge = |d: Detail| match d {
+        Detail::Day => f64::NEG_INFINITY,
+        Detail::Session => 36.0,
+        Detail::Fine => 72.0,
+    };
+    let rank = |d: Detail| match d {
+        Detail::Day => 0,
+        Detail::Session => 1,
+        Detail::Fine => 2,
+    };
+    let past = if rank(toward) > rank(prev) {
+        px_per_hour - edge(toward)
+    } else {
+        edge(prev) - px_per_hour
+    };
+    if past >= SLACK { toward } else { prev }
+}
+
 /// A chip to draw: already merged for this zoom, in minutes from midnight.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplaySpan {
@@ -255,7 +284,7 @@ pub fn display_spans(
 /// Tracked chips over the rules in the time lane. Each chip is its own
 /// overlay (the Plan blocks' pattern) so a sibling overlay like the
 /// now-line still measures. What is drawn, and how much of it, follows
-/// `detail_for(px_per_hour)`.
+/// `detail`.
 ///
 /// Every chip registers with `reflow`, so a zoom can slide and resize the
 /// whole lane without rebuilding it.
@@ -264,10 +293,9 @@ pub fn fill_lane(
     day: NaiveDate,
     zone: Tz,
     overlay: &gtk::Overlay,
-    px_per_hour: f64,
+    detail: Detail,
     reflow: &daygrid::Reflow,
 ) -> Vec<gtk::Widget> {
-    let detail = detail_for(px_per_hour);
     let mut added: Vec<gtk::Widget> = Vec::new();
     let spans = display_spans(blocks, day, zone, detail);
     // One column always at Day; at Session at most two; Fine packs a
@@ -352,6 +380,23 @@ mod tests {
         assert_eq!(detail_for(20.0), Detail::Day);
         assert_eq!(detail_for(52.0), Detail::Session);
         assert_eq!(detail_for(90.0), Detail::Fine);
+    }
+
+    #[test]
+    fn a_pinch_at_a_boundary_does_not_flip_the_level() {
+        // Out and in around 36 px/h: it stays where it was until the zoom
+        // is clearly past the edge, in either direction.
+        assert_eq!(detail_from(Detail::Day, 37.0), Detail::Day);
+        assert_eq!(detail_from(Detail::Day, 40.5), Detail::Session);
+        assert_eq!(detail_from(Detail::Session, 35.0), Detail::Session);
+        assert_eq!(detail_from(Detail::Session, 31.5), Detail::Day);
+        assert_eq!(detail_from(Detail::Session, 74.0), Detail::Session);
+        assert_eq!(detail_from(Detail::Session, 76.5), Detail::Fine);
+        assert_eq!(detail_from(Detail::Fine, 70.0), Detail::Fine);
+        assert_eq!(detail_from(Detail::Fine, 67.5), Detail::Session);
+        // A jump across both levels is not held back.
+        assert_eq!(detail_from(Detail::Day, 100.0), Detail::Fine);
+        assert_eq!(detail_from(Detail::Fine, 12.0), Detail::Day);
     }
 
     #[test]

@@ -298,6 +298,13 @@ pub struct Dump {
     pub rebuilt_for: String,
     /// Times the Day grid took new tracked time or the clock in place.
     pub refreshes: u64,
+    /// The Day scroller: its allocated height and its viewport page size.
+    pub scroller_h: Option<i32>,
+    pub page_size: Option<f64>,
+    /// How tall the scrollable content is; the grid is 24 × `px_per_hour`.
+    pub scroll_upper: Option<f64>,
+    /// The zoom the grid itself is drawn at (reflow), as against `px_per_hour`.
+    pub grid_px: Option<f64>,
 }
 
 /// The sidebar's badges, before `show_counts` hides the numbers.
@@ -418,6 +425,10 @@ pub fn build_dump(
         builds: BUILDS.load(std::sync::atomic::Ordering::Relaxed),
         rebuilt_for: String::new(),
         refreshes: REFRESHES.load(std::sync::atomic::Ordering::Relaxed),
+        scroller_h: None,
+        page_size: None,
+        scroll_upper: None,
+        grid_px: None,
     }
 }
 
