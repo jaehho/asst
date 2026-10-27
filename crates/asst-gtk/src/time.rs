@@ -266,8 +266,9 @@ pub fn fill_lane(
     overlay: &gtk::Overlay,
     px_per_hour: f64,
     reflow: &daygrid::Reflow,
-) {
+) -> Vec<gtk::Widget> {
     let detail = detail_for(px_per_hour);
+    let mut added: Vec<gtk::Widget> = Vec::new();
     let spans = display_spans(blocks, day, zone, detail);
     // One column always at Day; at Session at most two; Fine packs a
     // real overlap group into up to four. Past that the text is a lie.
@@ -335,7 +336,9 @@ pub fn fill_lane(
             meta_at: 34.0,
         };
         reflow.place(&wrap, &chip, span, meta.as_ref());
+        added.push(wrap.upcast());
     }
+    added
 }
 
 #[cfg(test)]

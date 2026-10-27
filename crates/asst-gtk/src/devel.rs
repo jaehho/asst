@@ -25,6 +25,9 @@ use serde::Serialize;
 use crate::model::{Counts, DayPlan, Kind, Nav, Section};
 use crate::window::{Msg, Tx};
 
+/// Rebuilds of the content column (`Window::render`), for `dump`.
+pub static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn enabled() -> bool {
     std::env::var_os("ASST_DEVEL").is_some()
 }
@@ -285,6 +288,9 @@ pub struct Dump {
     /// The keyboard cursor's task.
     pub cursor: Option<String>,
     pub counts: DumpCounts,
+    /// Times the content column was rebuilt since the window opened. A zoom
+    /// inside one detail level must not add to it.
+    pub builds: u64,
 }
 
 /// The sidebar's badges, before `show_counts` hides the numbers.
@@ -402,6 +408,7 @@ pub fn build_dump(
         toast: toast.map(str::to_string),
         cursor: cursor.map(str::to_string),
         counts,
+        builds: BUILDS.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 

@@ -287,6 +287,14 @@ impl Reflow {
         }
     }
 
+    /// Stop moving these chips (their widgets are leaving).
+    pub fn forget(&self, wraps: &[gtk::Widget]) {
+        self.0
+            .placed
+            .borrow_mut()
+            .retain(|p| p.wrap.upgrade().is_none_or(|w| !wraps.contains(&w)));
+    }
+
     /// Where the grid is zoomed to now.
     pub fn px(&self) -> f64 {
         self.0.px()
@@ -575,6 +583,9 @@ struct Live {
     scroll: glib::WeakRef<gtk::ScrolledWindow>,
     /// Bumped by every glide, so a newer one retires the older.
     glide: Cell<u64>,
+    /// Redraws what the zoom level decides (which chips, how much text)
+    /// when a zoom crosses into another level. Given the new zoom.
+    refill: Option<Rc<dyn Fn(f64)>>,
 }
 
 thread_local! {
@@ -582,13 +593,14 @@ thread_local! {
 }
 
 /// Put the day grid on view into `LIVE`, so zoom commands can reach it.
-pub fn live(reflow: &Reflow, scroll: &gtk::ScrolledWindow) {
+pub fn live(reflow: &Reflow, scroll: &gtk::ScrolledWindow, refill: Option<Rc<dyn Fn(f64)>>) {
     LIVE.with(|l| {
         let glide = l.borrow().as_ref().map_or(0, |o| o.glide.get() + 1);
         *l.borrow_mut() = Some(Rc::new(Live {
             reflow: reflow.clone(),
             scroll: scroll.downgrade(),
             glide: Cell::new(glide),
+            refill,
         }));
     });
 }
@@ -633,6 +645,9 @@ pub fn zoom_now(px_per_hour: f64, hold: Option<(f64, f64)>) {
     l.reflow.apply(px);
     if let Some(scroll) = l.scroll.upgrade() {
         pin_scroll(&scroll, hold, px);
+    }
+    if let Some(refill) = &l.refill {
+        refill(px);
     }
 }
 
@@ -795,17 +810,13 @@ pub struct ScrollRest {
     pub now_min: Option<f64>,
     pub first_min: Option<f64>,
     pub fresh_view: bool,
-    /// A minute pinned at `hold.1` from the top of the viewport (a zoom).
-    pub hold: Option<(f64, f64)>,
     pub px_per_hour: f64,
 }
 
 /// Attach scroll-to-now (today) or scroll-to-first-content (other days) to
 /// `scroll`. `first_min` is the earliest minute the view drew, if any; on a
 /// non-today day the scroller opens an hour above it, or at 7 AM when the
-/// day is empty. Rebuilds of the same day keep the reader's place. `hold` is a
-/// minute to pin at `hold_y` from the top of the viewport (a zoom), and
-/// wins over both.
+/// day is empty. Rebuilds of the same day keep the reader's place.
 pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
     let ScrollRest {
         step,
@@ -814,7 +825,6 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
         now_min,
         first_min,
         fresh_view,
-        hold,
         px_per_hour: px,
     } = rest;
     let recenter = fresh_view || scroll_slot(step).1 != Some(day);
@@ -832,9 +842,7 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
             if view_h <= 0.0 {
                 return;
             }
-            let y = if let Some((mins, keep_y)) = hold {
-                model::scroll_keep_min(mins as u32, HOUR_START, HOUR_END, view_h, keep_y, px)
-            } else if recenter && day == today {
+            let y = if recenter && day == today {
                 now_min.map_or(0.0, |m| {
                     scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
                 })

@@ -56,11 +56,6 @@ window.dark {
   to { opacity: 0; }
 }
 
-@keyframes zoom-settle {
-  from { opacity: 0.55; }
-  to { opacity: 1; }
-}
-
 @keyframes view-enter {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: none; }
@@ -1142,7 +1137,12 @@ button.pill {
   min-width: 4.5em;
 }
 
-/* The day grid after a zoom changed how much it shows: the new chips ease in. */
-.day-scroll.zoom-settle {
-  animation: zoom-settle 180ms ease-out;
+/* Tracked chips redrawn for a new zoom level: the old fade out as the new
+   fade in (day.rs), so crossing a level is a dissolve, not a rebuild. */
+.chip-in {
+  animation: arrive 200ms ease-out;
+}
+
+.chip-out {
+  animation: leave 160ms ease-in forwards;
 }

@@ -32,7 +32,7 @@ use crate::prefs::{PrefPatch, Prefs};
 use crate::sidebar::{self, Reach, Sidebar};
 use crate::tray::{self, Tray};
 use crate::ui::{self, Item};
-use crate::{client, daygrid, dialogs, find, plan, settings, time};
+use crate::{client, daygrid, dialogs, find, plan, settings};
 
 pub type Tx = relm4::Sender<Msg>;
 
@@ -469,7 +469,6 @@ pub struct Window {
     /// The Day tray's No date section is unfolded. Not kept: it starts shut.
     no_date_open: bool,
     /// Minute pinned at a viewport y across the next zoom rebuild.
-    zoom_hold: Option<(f64, f64)>,
     lists: Vec<ListView>,
     open: Vec<TaskView>,
     completed: Option<Vec<TaskView>>,
@@ -1103,7 +1102,6 @@ impl Component for Window {
             blocks: Vec::new(),
             day_day: chrono::Local::now().date_naive(),
             no_date_open: false,
-            zoom_hold: None,
             status: None,
             links: Vec::new(),
             settings: None,
@@ -1218,16 +1216,11 @@ impl Component for Window {
                 }
                 return;
             }
-            Msg::Zoom(px, hold) => {
+            Msg::Zoom(px, _hold) => {
+                // The gesture already moved the grid and redrew the chips
+                // it needed to (daygrid::zoom_now), so nothing is rebuilt.
+                // The hold only lets the zoom be saved once it settles.
                 self.prefs.day_zoom = model::clamp_px_per_hour(px);
-                self.zoom_hold = hold;
-                // The gesture already moved the grid (daygrid::zoom_now), so
-                // nothing is rebuilt per event. Once it settles, the render
-                // after it rebuilds only if the detail level changed (the
-                // view key holds the level, not the pixels); never while
-                // the fingers are still down, which would replace the
-                // widgets under the gesture.
-                self.dirty = true;
                 self.hold(&sender, Duration::from_millis(160));
                 return;
             }
@@ -1239,7 +1232,6 @@ impl Component for Window {
                 // Keys and wheel clicks glide to the target; the gestures
                 // already track the hand and send `Zoom` instead.
                 let to = model::clamp_px_per_hour(self.prefs.day_zoom * factor);
-                self.zoom_hold = hold;
                 let tx = sender.input_sender().clone();
                 let ms = motion::lasts(GLIDE_MS).as_millis() as u32;
                 daygrid::glide(
@@ -3617,7 +3609,7 @@ impl Window {
                 _ => now.date_naive().hash(&mut h),
             }
             format!(
-                "{:?}{:?}{:?}{:?}{:?}{:?}{}{}{}",
+                "{:?}{:?}{:?}{:?}{:?}{:?}{}{}",
                 self.adding,
                 self.select_mode,
                 opts,
@@ -3626,7 +3618,6 @@ impl Window {
                 self.prefs.list_order,
                 self.prefs.lists_by_name,
                 self.prefs.sunday_first,
-                time::detail_for(self.prefs.day_zoom) as u8,
             )
             .hash(&mut h);
             let mut sel: Vec<&String> = self.selected.iter().collect();
@@ -3747,7 +3738,6 @@ impl Window {
                     plan: &day,
                     no_date_open: self.no_date_open,
                     px_per_hour: self.prefs.day_zoom,
-                    hold: self.zoom_hold,
                     archived: self.nav_archived(),
                     now,
                     completing: &self.completing.keys().cloned().collect(),
@@ -3771,8 +3761,7 @@ impl Window {
                 follow.connect_enter(move |_| tx.emit(Msg::CursorTo(href.clone())));
                 row.add_controller(follow);
             }
-            // The pin is for this rebuild only.
-            self.zoom_hold = None;
+            crate::devel::BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             w.clamp.set_child(Some(&built.root));
             // On screen now, so what opens can slide.
             motion::open_new();

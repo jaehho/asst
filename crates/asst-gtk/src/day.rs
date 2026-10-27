@@ -3,7 +3,10 @@
 //! day header, scroller, zoom) is `daygrid`. The tray of tasks to place sits
 //! in a third column beside the grid so it never steals the time axis.
 
-use relm4::gtk::{self, prelude::*};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use relm4::gtk::{self, glib, prelude::*};
 
 use crate::daygrid::{self, DayStep};
 use crate::{content, plan, row, time};
@@ -95,19 +98,54 @@ pub fn build_column(
     scroll.set_min_content_height(400);
     scroll.add_css_class("time-scroll");
     scroll.add_css_class("day-scroll");
-    if o.hold.is_some() {
-        // A rebuild after a zoom (the detail level changed): settle in.
-        scroll.add_css_class("zoom-settle");
-    }
     let zone = o.now.timezone();
     let (blocks, plan, px, tday) = (o.blocks, p, o.px_per_hour, day);
     // One reflow for the whole grid: a zoom moves the hour rows, the
     // now-line and every chip through it without rebuilding the tree.
     let reflow = daygrid::Reflow::default();
+    let mut time_lane: Option<gtk::Overlay> = None;
+    let mut chips: Vec<gtk::Widget> = Vec::new();
     scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, &reflow, |lanes| {
-        time::fill_lane(blocks, tday, zone, &lanes.time, px, &reflow);
+        chips = time::fill_lane(blocks, tday, zone, &lanes.time, px, &reflow);
+        time_lane = Some(lanes.time.clone());
         plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
     })));
+    // Crossing into another detail level redraws only the tracked chips,
+    // old ones fading out as the new fade in: no rebuild of the column.
+    let refill: Rc<dyn Fn(f64)> = {
+        let owned: Vec<asst_core::api::BlockView> = o.blocks.to_vec();
+        let (reflow, lane) = (reflow.clone(), time_lane.map(|l| l.downgrade()));
+        let (shown, chips) = (Cell::new(time::detail_for(px)), RefCell::new(chips));
+        Rc::new(move |px| {
+            let now = time::detail_for(px);
+            let Some(lane) = lane.as_ref().and_then(|l| l.upgrade()) else {
+                return;
+            };
+            if now == shown.get() {
+                return;
+            }
+            shown.set(now);
+            let old = chips.take();
+            reflow.forget(&old);
+            for w in &old {
+                w.set_can_target(false);
+                w.add_css_class("chip-out");
+            }
+            glib::timeout_add_local_once(std::time::Duration::from_millis(200), {
+                let lane = lane.clone();
+                move || {
+                    for w in &old {
+                        lane.remove_overlay(w);
+                    }
+                }
+            });
+            let fresh = time::fill_lane(&owned, tday, zone, &lane, px, &reflow);
+            for w in &fresh {
+                w.add_css_class("chip-in");
+            }
+            *chips.borrow_mut() = fresh;
+        })
+    };
     cols.append(&scroll);
     cols.append(&plan::tray(p, o, tx, &mut rows));
     root.append(&cols);
@@ -135,11 +173,10 @@ pub fn build_column(
             now_min,
             first_min,
             fresh_view: o.fresh.view,
-            hold: o.hold,
             px_per_hour: px,
         },
     );
-    daygrid::live(&reflow, &scroll);
+    daygrid::live(&reflow, &scroll, Some(refill));
     daygrid::attach_zoom(&scroll, tx, px);
 
     content::Built { root, rows }
