@@ -329,13 +329,17 @@ pub fn fill_lane(
         wrap.set_hexpand(true);
         wrap.append(&row);
         overlay.add_overlay(&wrap);
+        // A day-long view makes a ten-minute span a few pixels: it stays a
+        // sliver (its words wait for room) instead of a chip that overlaps
+        // the next.
         let span = daygrid::Span {
             start_min: d.start_min,
             end_min: d.end_min,
-            min_h: 18.0,
+            min_h: 4.0,
+            title_at: 16.0,
             meta_at: 34.0,
         };
-        reflow.place(&wrap, &chip, span, meta.as_ref());
+        reflow.place(&wrap, &chip, span, Some(&title), meta.as_ref());
         added.push(wrap.upcast());
     }
     added

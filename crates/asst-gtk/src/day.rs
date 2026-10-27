@@ -6,10 +6,71 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use asst_core::api::BlockView;
+use chrono::NaiveDate;
+use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
 
 use crate::daygrid::{self, DayStep};
 use crate::{content, plan, row, time};
+
+/// The tracked lane once built: enough to draw it again at another zoom
+/// level or for new data, in place.
+struct TimeLane {
+    lane: Option<glib::WeakRef<gtk::Overlay>>,
+    reflow: daygrid::Reflow,
+    day: NaiveDate,
+    zone: Tz,
+    blocks: RefCell<Vec<BlockView>>,
+    chips: RefCell<Vec<gtk::Widget>>,
+    shown: Cell<time::Detail>,
+}
+
+impl TimeLane {
+    /// Draw the chips again for `px`. With `fade` the old ones dissolve out
+    /// as the new dissolve in; without, they swap inside one frame, which
+    /// is what keeps a block growing by a minute from being seen at all.
+    fn redraw(&self, px: f64, fade: bool) {
+        let Some(lane) = self.lane.as_ref().and_then(|l| l.upgrade()) else {
+            return;
+        };
+        self.shown.set(time::detail_for(px));
+        let old = self.chips.take();
+        self.reflow.forget(&old);
+        if fade {
+            for w in &old {
+                w.set_can_target(false);
+                w.add_css_class("chip-out");
+            }
+            glib::timeout_add_local_once(std::time::Duration::from_millis(200), {
+                let lane = lane.clone();
+                move || {
+                    for w in &old {
+                        lane.remove_overlay(w);
+                    }
+                }
+            });
+        } else {
+            for w in &old {
+                lane.remove_overlay(w);
+            }
+        }
+        let fresh = time::fill_lane(
+            &self.blocks.borrow(),
+            self.day,
+            self.zone,
+            &lane,
+            px,
+            &self.reflow,
+        );
+        if fade {
+            for w in &fresh {
+                w.add_css_class("chip-in");
+            }
+        }
+        *self.chips.borrow_mut() = fresh;
+    }
+}
 
 /// The Day column: header, two-lane grid, and the tray.
 pub fn build_column(
@@ -34,16 +95,19 @@ pub fn build_column(
     // Plan and actual stay two lanes; the note is the only place they
     // meet, so a day reads "3h planned · 2.5h tracked · −30m".
     let planned_secs: f64 = p.blocks.iter().map(|b| f64::from(b.duration) * 60.0).sum();
-    let note = format!(
-        "{} · {} to place · {}",
-        time::day_note(o.blocks, planned_secs),
-        p.tray.len(),
-        if p.blocks.is_empty() {
-            "nothing placed".to_string()
-        } else {
-            format!("{} placed", p.blocks.len())
-        }
-    );
+    let (to_place, placed) = (p.tray.len(), p.blocks.len());
+    let note_for = move |blocks: &[asst_core::api::BlockView]| {
+        format!(
+            "{} · {to_place} to place · {}",
+            time::day_note(blocks, planned_secs),
+            if placed == 0 {
+                "nothing placed".to_string()
+            } else {
+                format!("{placed} placed")
+            }
+        )
+    };
+    let note = note_for(o.blocks);
     // Unfinished work on this day can be carried to the next: one button,
     // there only while there is something to carry.
     let carry = (!p.blocks.is_empty()).then(|| {
@@ -61,15 +125,11 @@ pub fn build_column(
         button.connect_clicked(move |_| tx.emit(crate::window::Msg::PlanCarry));
         button
     });
-    root.append(&daygrid::day_header(
-        "Day",
-        day,
-        &note,
-        today,
-        DayStep::Day,
-        carry,
-        tx,
-    ));
+    let header = daygrid::day_header("Day", day, &note, today, DayStep::Day, carry, tx);
+    // The header's last child is the note line: it follows the tracked
+    // total without the column being rebuilt.
+    let note_label = header.last_child().and_downcast::<gtk::Label>();
+    root.append(&header);
 
     if o.adding.is_some() {
         root.append(&content::card(o, add_card));
@@ -110,40 +170,38 @@ pub fn build_column(
         time_lane = Some(lanes.time.clone());
         plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
     })));
-    // Crossing into another detail level redraws only the tracked chips,
-    // old ones fading out as the new fade in: no rebuild of the column.
+    // What the grid redraws without a rebuild of the column: the tracked
+    // chips when the zoom crosses into another level (a dissolve) or when
+    // fresh data arrives (a plain swap, in one frame), the header note, and
+    // the now-line.
+    let lane = Rc::new(TimeLane {
+        lane: time_lane.map(|l| l.downgrade()),
+        reflow: reflow.clone(),
+        day: tday,
+        zone,
+        blocks: RefCell::new(o.blocks.to_vec()),
+        chips: RefCell::new(chips),
+        shown: Cell::new(time::detail_for(px)),
+    });
     let refill: Rc<dyn Fn(f64)> = {
-        let owned: Vec<asst_core::api::BlockView> = o.blocks.to_vec();
-        let (reflow, lane) = (reflow.clone(), time_lane.map(|l| l.downgrade()));
-        let (shown, chips) = (Cell::new(time::detail_for(px)), RefCell::new(chips));
+        let lane = lane.clone();
         Rc::new(move |px| {
-            let now = time::detail_for(px);
-            let Some(lane) = lane.as_ref().and_then(|l| l.upgrade()) else {
-                return;
-            };
-            if now == shown.get() {
-                return;
+            if time::detail_for(px) != lane.shown.get() {
+                lane.redraw(px, true);
             }
-            shown.set(now);
-            let old = chips.take();
-            reflow.forget(&old);
-            for w in &old {
-                w.set_can_target(false);
-                w.add_css_class("chip-out");
-            }
-            glib::timeout_add_local_once(std::time::Duration::from_millis(200), {
-                let lane = lane.clone();
-                move || {
-                    for w in &old {
-                        lane.remove_overlay(w);
-                    }
+        })
+    };
+    let refresh: daygrid::Refresh = {
+        let note_label = note_label.map(|l| l.downgrade());
+        Rc::new(move |blocks, tracked_changed, now| {
+            if tracked_changed {
+                *lane.blocks.borrow_mut() = blocks.to_vec();
+                lane.redraw(lane.reflow.px(), false);
+                if let Some(l) = note_label.as_ref().and_then(|l| l.upgrade()) {
+                    l.set_text(&note_for(blocks));
                 }
-            });
-            let fresh = time::fill_lane(&owned, tday, zone, &lane, px, &reflow);
-            for w in &fresh {
-                w.add_css_class("chip-in");
             }
-            *chips.borrow_mut() = fresh;
+            lane.reflow.set_now(daygrid::now_minutes(now));
         })
     };
     cols.append(&scroll);
@@ -176,7 +234,7 @@ pub fn build_column(
             px_per_hour: px,
         },
     );
-    daygrid::live(&reflow, &scroll, Some(refill));
+    daygrid::live(&reflow, &scroll, Some(refill), Some(refresh));
     daygrid::attach_zoom(&scroll, tx, px);
 
     content::Built { root, rows }

@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use asst_core::api::BlockView;
 use chrono::{NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
@@ -162,6 +163,7 @@ pub struct Placed {
     wrap: glib::WeakRef<gtk::Widget>,
     body: glib::WeakRef<gtk::Widget>,
     span: Span,
+    title: Option<glib::WeakRef<gtk::Widget>>,
     meta: Option<glib::WeakRef<gtk::Widget>>,
 }
 
@@ -180,6 +182,8 @@ pub struct Span {
     pub end_min: f64,
     /// Never shorter than this, so a short span stays clickable.
     pub min_h: f64,
+    /// The title shows once the chip is this tall (0: always).
+    pub title_at: f64,
     /// The meta line shows once the chip is this tall.
     pub meta_at: f64,
 }
@@ -209,7 +213,9 @@ pub struct Reflow(Rc<ReflowInner>);
 impl Reflow {
     /// An hour row in the rules or the gutter: its height is one hour.
     pub fn hour(&self, slot: &impl IsA<gtk::Widget>) {
-        slot.set_height_request(self.0.hour_h());
+        // Rules and gutter each register 24 rows, in order.
+        let at = self.0.hours.borrow().len() % (HOUR_END - HOUR_START) as usize;
+        slot.set_height_request(self.0.hour_h(at));
         self.0.hours.borrow_mut().push(slot.as_ref().downgrade());
     }
 
@@ -246,12 +252,14 @@ impl Reflow {
         wrap: &impl IsA<gtk::Widget>,
         body: &impl IsA<gtk::Widget>,
         span: Span,
+        title: Option<&impl IsA<gtk::Widget>>,
         meta: Option<&impl IsA<gtk::Widget>>,
     ) {
         let p = Placed {
             wrap: wrap.as_ref().downgrade(),
             body: body.as_ref().downgrade(),
             span,
+            title: title.map(|t| t.as_ref().downgrade()),
             meta: meta.map(|m| m.as_ref().downgrade()),
         };
         p.apply(self.0.px());
@@ -262,10 +270,10 @@ impl Reflow {
     /// destroyed, so a pinch tracks the fingers frame by frame.
     pub fn apply(&self, px_per_hour: f64) {
         self.0.px.set(model::clamp_px_per_hour(px_per_hour));
-        let hour_h = self.0.hour_h();
-        for w in self.0.hours.borrow().iter() {
+        let rows = (HOUR_END - HOUR_START) as usize;
+        for (i, w) in self.0.hours.borrow().iter().enumerate() {
             if let Some(w) = w.upgrade() {
-                w.set_height_request(hour_h);
+                w.set_height_request(self.0.hour_h(i % rows));
             }
         }
         let grid_h = self.0.grid_h();
@@ -285,6 +293,14 @@ impl Reflow {
         for p in self.0.placed.borrow().iter() {
             p.apply(self.0.px());
         }
+    }
+
+    /// The now-line moves to `mins` minutes from midnight.
+    pub fn set_now(&self, mins: f64) {
+        if let Some(n) = self.0.now_line.borrow_mut().as_mut() {
+            n.mins = mins;
+        }
+        self.apply(self.px());
     }
 
     /// Stop moving these chips (their widgets are leaving).
@@ -312,6 +328,10 @@ impl Placed {
         if let Some(body) = self.body.upgrade() {
             body.set_height_request(h as i32);
         }
+        // A sliver has no room for words: they appear as the chip grows.
+        if let Some(title) = self.title.as_ref().and_then(|t| t.upgrade()) {
+            title.set_visible(h >= sp.title_at);
+        }
         if let Some(meta) = self.meta.as_ref().and_then(|m| m.upgrade()) {
             meta.set_visible(h >= sp.meta_at);
         }
@@ -322,8 +342,11 @@ impl ReflowInner {
     fn px(&self) -> f64 {
         self.px.get()
     }
-    fn hour_h(&self) -> i32 {
-        self.px() as i32
+    /// Height of hour row `at`: cumulative rounding, so the rows add up to
+    /// the grid and a rule never drifts from the chips placed by minute.
+    fn hour_h(&self, at: usize) -> i32 {
+        let edge = |i: usize| (i as f64 * self.px()).round() as i32;
+        edge(at + 1) - edge(at)
     }
     fn grid_h(&self) -> i32 {
         ((HOUR_END - HOUR_START) as f64 * self.px()).round() as i32
@@ -404,11 +427,10 @@ pub fn day_grid(
             let w = grid_width(&fixed) as i32;
             rules.set_width_request(w);
             column.set_width_request(w);
-            if let Some((line, dot, mins)) = &line_dot {
+            if let Some((line, dot, _)) = &line_dot {
                 line.set_size_request(w, LINE_H as i32);
-                let y = y_at(*mins, reflow.px());
-                center_at(&fixed, line.upcast_ref(), y, LINE_H);
-                center_at(&fixed, dot.upcast_ref(), y, DOT_SIZE);
+                // Re-centers the line and dot on the reflow's current minute.
+                reflow.apply(reflow.px());
                 line.queue_draw();
                 dot.queue_draw();
             }
@@ -586,14 +608,25 @@ struct Live {
     /// Redraws what the zoom level decides (which chips, how much text)
     /// when a zoom crosses into another level. Given the new zoom.
     refill: Option<Rc<dyn Fn(f64)>>,
+    /// Takes new tracked data and the clock in place, so a minute passing
+    /// or a block growing never rebuilds the column.
+    refresh: Option<Refresh>,
 }
+
+/// Whether the tracked blocks changed, the new blocks and the clock.
+pub type Refresh = Rc<dyn Fn(&[BlockView], bool, chrono::DateTime<Tz>)>;
 
 thread_local! {
     static LIVE: RefCell<Option<Rc<Live>>> = const { RefCell::new(None) };
 }
 
 /// Put the day grid on view into `LIVE`, so zoom commands can reach it.
-pub fn live(reflow: &Reflow, scroll: &gtk::ScrolledWindow, refill: Option<Rc<dyn Fn(f64)>>) {
+pub fn live(
+    reflow: &Reflow,
+    scroll: &gtk::ScrolledWindow,
+    refill: Option<Rc<dyn Fn(f64)>>,
+    refresh: Option<Refresh>,
+) {
     LIVE.with(|l| {
         let glide = l.borrow().as_ref().map_or(0, |o| o.glide.get() + 1);
         *l.borrow_mut() = Some(Rc::new(Live {
@@ -601,12 +634,47 @@ pub fn live(reflow: &Reflow, scroll: &gtk::ScrolledWindow, refill: Option<Rc<dyn
             scroll: scroll.downgrade(),
             glide: Cell::new(glide),
             refill,
+            refresh,
         }));
     });
 }
 
 fn live_now() -> Option<Rc<Live>> {
     LIVE.with(|l| l.borrow().clone())
+}
+
+/// Hand new tracked blocks and the clock to the grid on view. False when
+/// there is no live grid (the caller rebuilds instead).
+pub fn refresh_live(
+    blocks: &[BlockView],
+    tracked_changed: bool,
+    now: chrono::DateTime<Tz>,
+) -> bool {
+    let Some(l) = live_now() else { return false };
+    let (Some(_), Some(refresh)) = (l.scroll.upgrade(), &l.refresh) else {
+        return false;
+    };
+    refresh(blocks, tracked_changed, now);
+    true
+}
+
+/// Minutes from midnight on `now`'s own day, seconds as a fraction.
+pub fn now_minutes(now: chrono::DateTime<Tz>) -> f64 {
+    f64::from(now.time().hour()) * 60.0
+        + f64::from(now.time().minute())
+        + f64::from(now.time().second()) / 60.0
+}
+
+/// `px` kept where the day grid is usable: never so far out that the day
+/// is shorter than its viewport (empty space under 11 pm), never past the
+/// zoom limits.
+pub fn clamp_live(px: f64) -> f64 {
+    let floor = live_now()
+        .and_then(|l| l.scroll.upgrade())
+        .map(|s| (s.vadjustment().page_size() / f64::from(HOUR_END - HOUR_START)).ceil())
+        .unwrap_or(0.0)
+        .min(model::PX_PER_HOUR_MAX);
+    model::clamp_px_per_hour(px).max(floor)
 }
 
 /// The zoom the grid on view is at, else `fallback`. Drags and drops read
@@ -640,7 +708,7 @@ fn pin_scroll(scroll: &gtk::ScrolledWindow, hold: Option<(f64, f64)>, px_per_hou
 /// Geometry only: no widgets are made or dropped, so this is safe to call
 /// on every frame of a pinch or a glide.
 pub fn zoom_now(px_per_hour: f64, hold: Option<(f64, f64)>) {
-    let px = model::clamp_px_per_hour(px_per_hour);
+    let px = clamp_live(px_per_hour);
     let Some(l) = live_now() else { return };
     l.reflow.apply(px);
     if let Some(scroll) = l.scroll.upgrade() {
@@ -659,24 +727,24 @@ pub fn glide(
     hold: Option<(f64, f64)>,
     ms: u32,
     step: impl Fn(f64) + 'static,
-    done: impl FnOnce() + 'static,
+    done: impl FnOnce(f64) + 'static,
 ) {
-    let to = model::clamp_px_per_hour(to);
+    let to = clamp_live(to);
     let Some(l) = live_now() else {
-        done();
+        done(to);
         return;
     };
     let from = l.reflow.px();
     if ms == 0 || (from - to).abs() < 0.01 {
         zoom_now(to, hold);
         step(to);
-        done();
+        done(to);
         return;
     }
     let mine = l.glide.get() + 1;
     l.glide.set(mine);
     let Some(scroll) = l.scroll.upgrade() else {
-        done();
+        done(to);
         return;
     };
     let start = Cell::new(None::<i64>);
@@ -698,7 +766,7 @@ pub fn glide(
         step(px);
         if t >= 1.0 {
             if let Some(d) = done.borrow_mut().take() {
-                d();
+                d(to);
             }
             return glib::ControlFlow::Break;
         }
@@ -741,7 +809,7 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
                     tx.emit(Msg::ZoomBy(factor, hold));
                 } else {
                     // A touchpad's two-finger stream tracks the hand.
-                    let target = model::clamp_px_per_hour(px * (1.0 - dy * 0.12));
+                    let target = clamp_live(px * (1.0 - dy * 0.12));
                     zoom_now(target, hold);
                     tx.emit(Msg::Zoom(target, hold));
                 }
@@ -779,7 +847,7 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
                     if !scale.is_finite() || scale <= 0.0 {
                         return;
                     }
-                    let target = model::clamp_px_per_hour(base.get() * scale);
+                    let target = clamp_live(base.get() * scale);
                     zoom_now(target, hold.get());
                     tx.emit(Msg::Zoom(target, hold.get()));
                 });
@@ -800,6 +868,17 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
         child.add_controller(make_scroll());
         child.add_controller(make_pinch());
     }
+    // A taller window (or a saved zoom from a shorter one) can leave the day
+    // shorter than its viewport: zoom in just far enough to fill it.
+    let tx = tx.clone();
+    scroll.vadjustment().connect_page_size_notify(move |_| {
+        let px = live_px(px_per_hour);
+        let fit = clamp_live(px);
+        if fit > px {
+            zoom_now(fit, None);
+            tx.emit(Msg::Zoom(fit, None));
+        }
+    });
 }
 
 /// Where a day scroller rests on attach.

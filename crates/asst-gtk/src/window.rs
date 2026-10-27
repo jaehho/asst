@@ -509,6 +509,14 @@ pub struct Window {
     blocks_generation: u64,
     dirty: bool,
     shown: u64,
+    /// The parts of the view key at the last rebuild, and which of them
+    /// moved to cause it (`dump` reports it; "forced" when none did).
+    key_parts: Vec<(&'static str, u64)>,
+    /// The tracked blocks and the clock as last drawn on the Day grid,
+    /// which takes both in place.
+    shown_tracked: u64,
+    shown_clock: u64,
+    rebuilt_for: String,
     pending_d: Option<Instant>,
     /// The toast for the last change to the window's own state (plan,
     /// sidebar, archive), on screen or waiting, which the next one replaces.
@@ -1129,6 +1137,10 @@ impl Component for Window {
             blocks_generation: 0,
             dirty: false,
             shown: 0,
+            key_parts: Vec::new(),
+            shown_tracked: 0,
+            shown_clock: 0,
+            rebuilt_for: String::new(),
             pending_d: None,
             edit_toast: None,
             last_focus_sync: None,
@@ -1242,7 +1254,7 @@ impl Component for Window {
                         let tx = tx.clone();
                         move |px| tx.emit(Msg::ZoomQuiet(px))
                     },
-                    move || tx.emit(Msg::Zoom(to, hold)),
+                    move |px| tx.emit(Msg::Zoom(px, hold)),
                 );
                 return;
             }
@@ -3600,79 +3612,163 @@ impl Window {
             }
         }
 
-        let key = {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            self.nav.key().hash(&mut h);
-            // Day steps change `day_day`, not the wall-clock date.
-            match self.nav {
-                Nav::Day => self.day_day.hash(&mut h),
-                _ => now.date_naive().hash(&mut h),
+        // The view's key, in named parts so a rebuild can say which one moved.
+        let parts: Vec<(&'static str, u64)> = {
+            fn part(f: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> u64 {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                f(&mut h);
+                h.finish()
             }
-            format!(
-                "{:?}{:?}{:?}{:?}{:?}{:?}{}{}",
-                self.adding,
-                self.select_mode,
-                opts,
-                self.editing,
-                self.prefs.archived,
-                self.prefs.list_order,
-                self.prefs.lists_by_name,
-                self.prefs.sunday_first,
-            )
-            .hash(&mut h);
-            let mut sel: Vec<&String> = self.selected.iter().collect();
-            sel.sort();
-            sel.hash(&mut h);
-            let mut comp: Vec<&String> = self.completing.keys().collect();
-            comp.sort();
-            comp.hash(&mut h);
-            for l in &self.lists {
-                (&l.href, &l.name, &l.color, l.inbox).hash(&mut h);
-            }
-            // An empty list says whether anything was ever done in it.
-            if let Nav::List(href) = &self.nav {
-                self.lists
-                    .iter()
-                    .find(|l| &l.href == href)
-                    .map(|l| (l.open == 0, l.done > 0))
-                    .hash(&mut h);
-            }
+            let editing = self.editing.as_deref();
+            // The editor shows its own changes; only where it sits matters.
+            let task_key = |t: &TaskView, h: &mut std::collections::hash_map::DefaultHasher| {
+                if editing == Some(t.href.as_str()) {
+                    t.href.hash(h);
+                } else {
+                    serde_json::to_string(t).unwrap_or_default().hash(h);
+                }
+            };
+            let mut parts = vec![
+                (
+                    "nav",
+                    part(|h| {
+                        self.nav.key().hash(h);
+                        // Day steps change `day_day`, not the wall-clock date.
+                        match self.nav {
+                            Nav::Day => self.day_day.hash(h),
+                            _ => now.date_naive().hash(h),
+                        }
+                    }),
+                ),
+                (
+                    "opts",
+                    part(|h| {
+                        format!(
+                            "{:?}{:?}{:?}{:?}{:?}{:?}{}{}",
+                            self.adding,
+                            self.select_mode,
+                            opts,
+                            self.editing,
+                            self.prefs.archived,
+                            self.prefs.list_order,
+                            self.prefs.lists_by_name,
+                            self.prefs.sunday_first,
+                        )
+                        .hash(h);
+                    }),
+                ),
+                (
+                    "selection",
+                    part(|h| {
+                        let mut sel: Vec<&String> = self.selected.iter().collect();
+                        sel.sort();
+                        sel.hash(h);
+                        let mut comp: Vec<&String> = self.completing.keys().collect();
+                        comp.sort();
+                        comp.hash(h);
+                    }),
+                ),
+                (
+                    "lists",
+                    part(|h| {
+                        for l in &self.lists {
+                            (&l.href, &l.name, &l.color, l.inbox).hash(h);
+                        }
+                        // An empty list says whether anything was ever done in it.
+                        if let Nav::List(href) = &self.nav {
+                            self.lists
+                                .iter()
+                                .find(|l| &l.href == href)
+                                .map(|l| (l.open == 0, l.done > 0))
+                                .hash(h);
+                        }
+                    }),
+                ),
+            ];
             // Day's chips come from `blocks` and the window's slots, not
             // from task sections.
             if self.nav == Nav::Day {
-                for b in &self.blocks {
-                    (b.start, b.end, &b.label, b.planned).hash(&mut h);
-                }
-                for s in &self.prefs.plan {
-                    (&s.uid, s.date, s.start, s.duration).hash(&mut h);
-                }
-                for b in &day.blocks {
-                    (&b.task.href, b.start, b.duration, b.col, b.cols).hash(&mut h);
-                }
-                self.no_date_open.hash(&mut h);
-                for t in day.tray.iter().chain(&day.no_date) {
-                    if self.editing.as_deref() == Some(t.href.as_str()) {
-                        t.href.hash(&mut h);
-                    } else {
-                        serde_json::to_string(t).unwrap_or_default().hash(&mut h);
-                    }
-                }
-                day.now_min.hash(&mut h);
+                parts.push((
+                    "tracked",
+                    part(|h| {
+                        for b in &self.blocks {
+                            (b.start, b.end, &b.label, b.planned).hash(h);
+                        }
+                    }),
+                ));
+                parts.push((
+                    "slots",
+                    part(|h| {
+                        for s in &self.prefs.plan {
+                            (&s.uid, s.date, s.start, s.duration).hash(h);
+                        }
+                        for b in &day.blocks {
+                            // Which block is running is drawn into it, so a
+                            // block starting or ending is a rebuild.
+                            let running = day
+                                .now_min
+                                .is_some_and(|n| b.start <= n && n < b.start + b.duration);
+                            (&b.task.href, b.start, b.duration, b.col, b.cols, running).hash(h);
+                        }
+                    }),
+                ));
+                parts.push((
+                    "tray",
+                    part(|h| {
+                        self.no_date_open.hash(h);
+                        for t in day.tray.iter().chain(&day.no_date) {
+                            task_key(t, h);
+                        }
+                    }),
+                ));
+                parts.push(("now", part(|h| day.now_min.hash(h))));
             }
-            counts.of(&self.nav).hash(&mut h);
-            for s in &sections {
-                format!("{:?}{:?}{:?}", s.kind, s.title, s.note).hash(&mut h);
-                for t in &s.tasks {
-                    if self.editing.as_deref() == Some(t.href.as_str()) {
-                        // The editor shows its own changes; only where it sits matters.
-                        t.href.hash(&mut h);
-                    } else {
-                        serde_json::to_string(t).unwrap_or_default().hash(&mut h);
+            parts.push(("counts", part(|h| counts.of(&self.nav).hash(h))));
+            parts.push((
+                "sections",
+                part(|h| {
+                    for s in &sections {
+                        format!("{:?}{:?}{:?}", s.kind, s.title, s.note).hash(h);
+                        for t in &s.tasks {
+                            task_key(t, h);
+                        }
                     }
-                }
-            }
+                }),
+            ));
+            parts
+        };
+        // Tracked time and the clock change all day with nothing else
+        // moving. The Day grid takes them in place (`daygrid::refresh_live`)
+        // so they are not part of what rebuilds the column.
+        let live_part = |name: &str| {
+            parts
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(0, |(_, v)| *v)
+        };
+        let (tracked, clock) = (live_part("tracked"), live_part("now"));
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            parts
+                .iter()
+                .filter(|(n, _)| !matches!(*n, "tracked" | "now"))
+                .collect::<Vec<_>>()
+                .hash(&mut h);
             h.finish()
         };
+        if key == self.shown
+            && self.nav == Nav::Day
+            && (tracked != self.shown_tracked || clock != self.shown_clock)
+        {
+            if daygrid::refresh_live(&self.blocks, tracked != self.shown_tracked, now) {
+                self.shown_tracked = tracked;
+                self.shown_clock = clock;
+                crate::devel::REFRESHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                // No live grid to hand it to: rebuild.
+                self.shown = 0;
+            }
+        }
         let settling = passive && self.settle_until.is_some_and(|u| Instant::now() < u);
         if key != self.shown && (typing || settling || self.folding.is_some()) {
             // A rebuild takes the field from under the keyboard, and an input
@@ -3681,6 +3777,24 @@ impl Window {
             self.dirty = true;
         } else if key != self.shown {
             self.shown = key;
+            let moved: Vec<&str> = parts
+                .iter()
+                .filter(|(n, v)| {
+                    self.key_parts
+                        .iter()
+                        .find(|(m, _)| m == n)
+                        .is_none_or(|(_, o)| o != v)
+                })
+                .map(|(n, _)| *n)
+                .collect();
+            self.rebuilt_for = if moved.is_empty() {
+                "forced".to_string()
+            } else {
+                moved.join(",")
+            };
+            self.key_parts = parts;
+            self.shown_tracked = tracked;
+            self.shown_clock = clock;
             let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
             let had_focus = focus.as_ref().is_some_and(|f| f.is_ancestor(&w.clamp));
             // The editor and the add card outlive rebuilds; so does the
@@ -3870,6 +3984,8 @@ impl Window {
                 &self.prefs.sidebar_views(),
             ),
         );
+        let mut state = state;
+        state.rebuilt_for = self.rebuilt_for.clone();
         let json = crate::devel::dump_json(&state);
         if path.is_empty() {
             eprintln!("{json}");

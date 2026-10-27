@@ -481,9 +481,10 @@ pub fn fill_lane(
             start_min: f64::from(b.start),
             end_min: f64::from(b.start + b.duration),
             min_h: f64::from(min_block_h(b)),
+            title_at: 0.0,
             meta_at: 36.0,
         };
-        reflow.place(&wrap, &chip, span, meta.as_ref());
+        reflow.place(&wrap, &chip, span, None::<&gtk::Label>, meta.as_ref());
     }
     ghost.attach(overlay);
 
