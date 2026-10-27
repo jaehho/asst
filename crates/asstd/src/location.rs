@@ -34,6 +34,10 @@ use crate::daemon::Daemon;
 )]
 trait Manager {
     fn get_client(&self) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(property)]
+    fn available_accuracy_level(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn in_use(&self) -> zbus::Result<bool>;
 }
 
 #[zbus::proxy(
@@ -260,9 +264,14 @@ async fn one_round(
     let setup = async {
         let conn = zbus::Connection::system()
             .await
-            .map_err(|e| e.to_string())?;
-        let manager = ManagerProxy::new(&conn).await.map_err(|e| e.to_string())?;
-        let path = manager.get_client().await.map_err(|e| e.to_string())?;
+            .map_err(|e| format!("system bus: {e}"))?;
+        let manager = ManagerProxy::new(&conn)
+            .await
+            .map_err(|e| format!("manager proxy: {e}"))?;
+        let path = manager
+            .get_client()
+            .await
+            .map_err(|e| format!("GetClient: {e}"))?;
         let client = ClientProxy::builder(&conn)
             .path(path)
             .map_err(|e| e.to_string())?
@@ -285,17 +294,25 @@ async fn one_round(
             .receive_location_updated()
             .await
             .map_err(|e| e.to_string())?;
-        client.start().await.map_err(|e| e.to_string())?;
+        client.start().await.map_err(|e| format!("Start: {e}"))?;
         Ok::<_, String>((conn, updates))
     };
     let (conn, mut updates) = match setup.await {
         Ok(started) => started,
         Err(e) => {
-            let said = e.replace("org.freedesktop.DBus.Error.", "");
+            // The step label (`Start: `) is for the journal only; the
+            // sentence people read keeps the bare error.
+            let bare = match e.split_once(": ") {
+                Some((label, rest)) if !label.contains('.') => rest,
+                _ => e.as_str(),
+            };
+            let said = bare.replace("org.freedesktop.DBus.Error.", "");
+            log::info!("geoclue: setup failed ({e}); {}", geoclue_state().await);
             unavailable(daemon, session, geoclue_down(&said)).await;
             return Err(e);
         }
     };
+    log::info!("geoclue: client started; {}", geoclue_state().await);
     let mut fixed = false;
     let silence = tokio::time::sleep(NO_FIX_AFTER);
     tokio::pin!(silence);
@@ -311,6 +328,7 @@ async fn one_round(
                      until it has one",
                     NO_FIX_AFTER.as_secs()
                 );
+                log::info!("geoclue: silent; {}", geoclue_state().await);
                 unavailable(daemon, session, NO_POSITION.to_string()).await;
                 continue;
             }
@@ -330,6 +348,10 @@ async fn one_round(
                         continue;
                     }
                 };
+                if !fixed {
+                    // First fix of the round only; coordinates to ~100 m.
+                    log::info!("geoclue: first fix {lat:.3},{lon:.3}");
+                }
                 fixed = true;
                 position = (lat, lon);
             }
@@ -344,6 +366,29 @@ async fn one_round(
         let (lat, lon) = position;
         daemon.set_location_problem(None);
         check(daemon, session, inside, lat, lon);
+    }
+}
+
+/// One line of what GeoClue's manager says about itself, for the journal
+/// when a round fails or stays silent (#12). Best effort: it may be the
+/// very thing that is down. Accuracy level 0 means no source at all.
+async fn geoclue_state() -> String {
+    let probe = async {
+        let conn = zbus::Connection::system()
+            .await
+            .map_err(|e| e.to_string())?;
+        let m = ManagerProxy::new(&conn).await.map_err(|e| e.to_string())?;
+        let level = m
+            .available_accuracy_level()
+            .await
+            .map_err(|e| e.to_string())?;
+        let in_use = m.in_use().await.map_err(|e| e.to_string())?;
+        Ok::<_, String>(format!("AvailableAccuracyLevel={level} InUse={in_use}"))
+    };
+    match tokio::time::timeout(Duration::from_secs(5), probe).await {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => format!("manager unreadable: {e}"),
+        Err(_) => "manager unreadable: timed out".into(),
     }
 }
 

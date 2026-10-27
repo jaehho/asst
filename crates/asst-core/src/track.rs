@@ -744,33 +744,37 @@ pub const MIN_SPAN: Duration = Duration::seconds(30);
 
 /// Collapse fragmented spans into calendar-like session blocks.
 ///
-/// Identity is tag + label + detail: the same Claude session reconnects
-/// across a tab flicker, but two pages or two `ai_title`s stay two chips.
-/// Concurrent projects already have different tags, so they never join.
+/// One chip per **project tag** run (gap-bounded). Inside a run the chip
+/// takes the longest-running `detail` as its title; the other names show
+/// up in `composition`. Concurrent projects still have different tags, so
+/// they stay separate — but a tab flicker is not a new chip.
+///
+/// Untagged browsing keys on the label (domain / app) so Gmail and
+/// YouTube do not become one gray bar, while every Gmail tab does.
 pub fn coalesce_sessions(spans: &[TaggedSpan], max_gap: Duration) -> Vec<TaggedSpan> {
     let mut sorted: Vec<TaggedSpan> = spans.to_vec();
     sorted.retain(|s| s.end > s.start && s.seconds() >= MIN_SPAN.num_seconds() as f64);
     sorted.sort_by_key(|s| (s.start, s.end, s.tag.clone(), s.label.clone()));
     let mut out: Vec<TaggedSpan> = Vec::new();
-    let mut open: BTreeMap<(String, String, Option<String>), Vec<TaggedSpan>> = BTreeMap::new();
+    let mut open: BTreeMap<(String, String), Vec<TaggedSpan>> = BTreeMap::new();
 
     for s in sorted {
-        // Untagged identity is the human name when it has one: the same
-        // Disney+ page from web and from the window bar is one chip.
         let key = (
             s.tag.clone(),
             if s.tag == "untagged" {
-                s.detail.clone().unwrap_or_else(|| s.label.clone())
-            } else {
                 s.label.clone()
+            } else {
+                // Named projects share one run regardless of ai_title.
+                s.tag.clone()
             },
-            s.detail.clone(),
         );
-        let mut gap = true;
-        if let Some(members) = open.get(&key) {
-            let run_end = members.iter().map(|m| m.end).max();
-            gap = run_end.map(|e| s.start <= e + max_gap).unwrap_or(true);
-        }
+        let gap = match open.get(&key) {
+            None => true,
+            Some(members) => {
+                let run_end = members.iter().map(|m| m.end).max();
+                run_end.map(|e| s.start <= e + max_gap).unwrap_or(true)
+            }
+        };
         if gap {
             open.entry(key).or_default().push(s);
         } else {
@@ -860,12 +864,6 @@ fn session_block(members: impl IntoIterator<Item = TaggedSpan>) -> TaggedSpan {
     }
 }
 
-/// Untagged and unnamed: the window shell (`kitty`, `1:claude`) that sits
-/// under real work. Worth a chip only when nothing better covers the time.
-fn is_noise(s: &TaggedSpan) -> bool {
-    s.tag == "untagged" && s.detail.is_none()
-}
-
 /// Parts of `span` that no `taken` span covers.
 fn subtract_spans(span: Span, taken: &[Span]) -> Vec<Span> {
     let mut holes = vec![span];
@@ -947,13 +945,13 @@ pub fn drop_redundant_window(spans: Vec<TaggedSpan>) -> Vec<TaggedSpan> {
         .collect()
 }
 
-/// Drop noise spans that sit under a named span. A `kitty` bar beside
-/// `lab · lc_output_strength.py` is not a second thing you did; the
-/// leftover `kitty` time with nothing named on top still counts.
+/// Drop untagged spans that sit under a named project. A Gmail tab and a
+/// `firefox-developer-edition` bar over the same minute are one thing
+/// (`email`), not two chips; the page title rides along in `composition`.
 pub fn drop_covered_noise(spans: Vec<TaggedSpan>) -> Vec<TaggedSpan> {
     let named: Vec<Span> = spans
         .iter()
-        .filter(|s| !is_noise(s))
+        .filter(|s| s.tag != "untagged")
         .map(|s| Span {
             start: s.start,
             end: s.end,
@@ -962,7 +960,7 @@ pub fn drop_covered_noise(spans: Vec<TaggedSpan>) -> Vec<TaggedSpan> {
     let named = merge_spans(named);
     let mut out = Vec::new();
     for s in spans {
-        if !is_noise(&s) {
+        if s.tag != "untagged" {
             out.push(s);
             continue;
         }
@@ -983,7 +981,8 @@ pub fn drop_covered_noise(spans: Vec<TaggedSpan>) -> Vec<TaggedSpan> {
 }
 
 /// A readable name for a concurrent span: the project, or for untagged
-/// web/app the domain or title rather than the word `untagged`.
+/// web/app the domain or title rather than the word `untagged`. The
+/// window shell is never worth a mention.
 fn composition_name(s: &TaggedSpan) -> String {
     if s.tag != "untagged" {
         return s.tag.clone();
@@ -992,6 +991,18 @@ fn composition_name(s: &TaggedSpan) -> String {
         .clone()
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| s.label.clone())
+}
+
+fn composition_noise(name: &str) -> bool {
+    matches!(
+        name,
+        "kitty"
+            | "untagged"
+            | "firefox-developer-edition"
+            | "firefox-nvidia"
+            | "xdg-desktop-portal-gtk"
+            | "floating-tui"
+    ) || name.is_empty()
 }
 
 /// Write `lab 40% · Gmail 30%` on each session from the fine spans that
@@ -1017,8 +1028,8 @@ pub fn annotate_composition(sessions: &mut [TaggedSpan], fine: &[TaggedSpan]) {
             }
             let secs = (b - a).num_milliseconds() as f64 / 1000.0;
             let name = composition_name(f);
-            // Skip the chip's own words and the shell we already dropped.
-            if name == s.label || name == "untagged" || Some(&name) == s.detail.as_ref() {
+            // Skip the chip's own words and the window shell.
+            if name == s.label || composition_noise(&name) || Some(&name) == s.detail.as_ref() {
                 continue;
             }
             *other.entry(name).or_default() += secs;
@@ -1494,7 +1505,7 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
     let allowed = not_afk_spans(&afk_raw);
     let focused: f64 = allowed.iter().map(|s| s.seconds()).sum();
 
-    let fine = drop_covered_noise(drop_redundant_window(tagged_timeline(
+    let all = tagged_timeline(
         &[
             (SourceKind::Claude, &claude),
             (SourceKind::Neovim, &neovim),
@@ -1505,9 +1516,11 @@ pub fn collect_day(client: &AwClient, date: &str) -> Result<IngestReport> {
         ],
         &allowed,
         &cfg,
-    )));
+    );
+    // Chips stay quiet; composition still names what we hid.
+    let fine = drop_covered_noise(drop_redundant_window(all.clone()));
     let mut spans = coalesce_sessions(&fine, SESSION_GAP);
-    annotate_composition(&mut spans, &fine);
+    annotate_composition(&mut spans, &all);
     let tags = tag_rollup(&spans);
     Ok(IngestReport {
         date: date.to_string(),
@@ -1774,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn noise_under_named_work_disappears_but_orphan_noise_stays() {
+    fn untagged_under_named_work_disappears_but_orphan_stays() {
         let mk = |start: &str, end: &str, tag: &str, detail: Option<&str>| TaggedSpan {
             start: ts(start),
             end: ts(end),
@@ -1787,30 +1800,28 @@ mod tests {
             untagged_kind: None,
         };
         let fine = vec![
-            // Real work…
             mk(
                 "2026-10-02T12:00:00Z",
                 "2026-10-02T12:30:00Z",
                 "lab",
                 Some("lc_output_strength.py"),
             ),
-            // …and the kitty shell under it.
+            // Browser bar over the same work, even with a title.
             mk(
                 "2026-10-02T12:00:00Z",
                 "2026-10-02T12:30:00Z",
                 "untagged",
-                None,
+                Some("lc_output_strength.py"),
             ),
-            // Shell alone before anything named starts.
+            // Untagged alone before anything named starts.
             mk(
                 "2026-10-02T11:00:00Z",
                 "2026-10-02T11:20:00Z",
                 "untagged",
-                None,
+                Some("Zipf's law - Wikipedia"),
             ),
         ];
         let kept = drop_covered_noise(fine);
-        // The covered kitty bar is gone; the orphan 20m stays.
         assert_eq!(kept.len(), 2, "kept: {kept:?}");
         assert!(kept.iter().any(|s| s.tag == "lab"));
         let orphan = kept.iter().find(|s| s.tag == "untagged").unwrap();
@@ -1966,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_splits_browsing_by_page_not_by_tab_switch() {
+    fn coalesce_is_quiet_one_chip_per_site_not_per_page() {
         let mk = |start: &str, end: &str, label: &str, detail: &str| TaggedSpan {
             start: ts(start),
             end: ts(end),
@@ -1980,7 +1991,6 @@ mod tests {
         };
         let out = coalesce_sessions(
             &[
-                // Same page, two fragments: one chip.
                 mk(
                     "2026-10-02T12:00:00Z",
                     "2026-10-02T12:02:00Z",
@@ -1991,25 +2001,65 @@ mod tests {
                     "2026-10-02T12:02:00Z",
                     "2026-10-02T12:05:00Z",
                     "nytimes.com",
-                    "Zipf's law - Wikipedia",
+                    "Power Law: A Pattern Behind Extreme Events",
                 ),
-                // Different page: its own chip.
+                // Other site: its own chip.
                 mk(
                     "2026-10-02T12:05:30Z",
                     "2026-10-02T12:08:00Z",
-                    "nytimes.com",
-                    "Power Law: A Pattern Behind Extreme Events",
+                    "youtube.com",
+                    "Some video",
                 ),
             ],
             SESSION_GAP,
         );
         assert_eq!(out.len(), 2, "spans: {out:?}");
-        assert_eq!(out[0].start, ts("2026-10-02T12:00:00Z"));
-        assert_eq!(out[0].end, ts("2026-10-02T12:05:00Z"));
-        assert_eq!(out[0].detail.as_deref(), Some("Zipf's law - Wikipedia"));
+        // Two NYT pages are one nytimes.com chip (longest detail wins).
+        let nyt = out.iter().find(|s| s.label == "nytimes.com").unwrap();
+        assert_eq!(nyt.start, ts("2026-10-02T12:00:00Z"));
+        assert_eq!(nyt.end, ts("2026-10-02T12:05:00Z"));
         assert_eq!(
-            out[1].detail.as_deref(),
-            Some("Power Law: A Pattern Behind Extreme Events")
+            nyt.detail.as_deref(),
+            Some("Power Law: A Pattern Behind Extreme Events"),
+            "longest-running page is the title"
+        );
+    }
+
+    #[test]
+    fn coalesce_is_one_chip_per_project_across_ai_titles() {
+        let mk = |start: &str, end: &str, detail: &str| TaggedSpan {
+            start: ts(start),
+            end: ts(end),
+            tag: "lab".into(),
+            task_uid: None,
+            source: format!("aw:{start}:{detail}"),
+            label: "lab".into(),
+            detail: Some(detail.into()),
+            composition: None,
+            untagged_kind: None,
+        };
+        let out = coalesce_sessions(
+            &[
+                mk(
+                    "2026-10-02T12:00:00Z",
+                    "2026-10-02T12:10:00Z",
+                    "Dashed edges",
+                ),
+                mk(
+                    "2026-10-02T12:10:00Z",
+                    "2026-10-02T12:25:00Z",
+                    "Type tracking database note",
+                ),
+            ],
+            SESSION_GAP,
+        );
+        assert_eq!(out.len(), 1, "spans: {out:?}");
+        assert_eq!(out[0].tag, "lab");
+        assert_eq!(out[0].end, ts("2026-10-02T12:25:00Z"));
+        assert_eq!(
+            out[0].detail.as_deref(),
+            Some("Type tracking database note"),
+            "longest title wins"
         );
     }
 

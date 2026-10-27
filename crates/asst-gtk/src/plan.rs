@@ -42,17 +42,29 @@ fn block_top(b: &PlanBlock, px_per_hour: f64) -> i32 {
 }
 
 fn block_height(b: &PlanBlock, px_per_hour: f64) -> i32 {
-    let natural = f64::from(b.duration) / 60.0 * px_per_hour;
-    let floor = if b.duration < 30 {
+    natural_height(b, px_per_hour).max(f64::from(min_block_h(b))) as i32
+}
+
+fn natural_height(b: &PlanBlock, px_per_hour: f64) -> f64 {
+    f64::from(b.duration) / 60.0 * px_per_hour
+}
+
+fn min_block_h(b: &PlanBlock) -> i32 {
+    if b.duration < 30 {
         MIN_BLOCK_H_SHORT
     } else {
         MIN_BLOCK_H
-    };
-    natural.max(floor as f64) as i32
+    }
 }
 
-/// The chip body both a placed block and the drag ghost wear.
-fn block_chip(b: &PlanBlock, now_min: Option<u32>, px_per_hour: f64) -> gtk::Box {
+/// The chip body both a placed block and the drag ghost wear. The meta line
+/// is built either way and gated by height, so a zoom that grows the chip
+/// reveals it without a rebuild.
+fn block_chip(
+    b: &PlanBlock,
+    now_min: Option<u32>,
+    px_per_hour: f64,
+) -> (gtk::Box, Option<gtk::Label>) {
     let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
     chip.add_css_class("plan-block");
     chip.add_css_class(tint_for(b.task.task.priority));
@@ -81,7 +93,8 @@ fn block_chip(b: &PlanBlock, now_min: Option<u32>, px_per_hour: f64) -> gtk::Box
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
         chip.append(&meta);
-    } else if block_height(b, px_per_hour) >= 36 {
+        (chip, None)
+    } else {
         let meta = gtk::Label::new(Some(&format!(
             "{} – {}",
             clock_label(b.start),
@@ -90,8 +103,9 @@ fn block_chip(b: &PlanBlock, now_min: Option<u32>, px_per_hour: f64) -> gtk::Box
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
         chip.append(&meta);
+        meta.set_visible(block_height(b, px_per_hour) >= 36);
+        (chip, Some(meta))
     }
-    chip
 }
 
 /// Equal-expand spacers put `chip` in `col` of `cols` across the grid.
@@ -121,8 +135,8 @@ fn block_widget(
     ghost: &Ghost,
     tx: &Tx,
     px_per_hour: f64,
-) -> gtk::Widget {
-    let chip = block_chip(b, now_min, px_per_hour);
+) -> (gtk::Widget, gtk::Box, Option<gtk::Label>) {
+    let (chip, meta) = block_chip(b, now_min, px_per_hour);
 
     // Bottom edge: drag to change the duration, with a ghost of the new end.
     // Thinner on a short chip so the floor can keep it short.
@@ -142,14 +156,14 @@ fn block_widget(
         {
             let (ghost, task) = (ghost.clone(), task.clone());
             drag.connect_drag_update(move |_, _, dy| {
-                let end = model::edge_end(start, dur0, dy, px_per_hour);
+                let end = model::edge_end(start, dur0, dy, daygrid::live_px(px_per_hour));
                 let duration = end.saturating_sub(start).max(PLAN_MIN_DURATION);
                 ghost.show(&task, start, duration);
             });
         }
         drag.connect_drag_end(move |_, _, dy| {
             ghost.hide();
-            let end = model::edge_end(start, dur0, dy, px_per_hour);
+            let end = model::edge_end(start, dur0, dy, daygrid::live_px(px_per_hour));
             let duration = end.saturating_sub(start).max(PLAN_MIN_DURATION);
             tx.emit(Msg::PlanSet(href.clone(), start, duration));
         });
@@ -173,7 +187,11 @@ fn block_widget(
                     return;
                 }
                 moved.set(true);
-                ghost.show(&task, model::move_start(start, dy, px_per_hour), dur);
+                ghost.show(
+                    &task,
+                    model::move_start(start, dy, daygrid::live_px(px_per_hour)),
+                    dur,
+                );
             });
         }
         let moved = moved.clone();
@@ -184,7 +202,7 @@ fn block_widget(
                 return;
             }
             moved.set(true);
-            let to = model::move_start(start, dy, px_per_hour);
+            let to = model::move_start(start, dy, daygrid::live_px(px_per_hour));
             tx.emit(Msg::PlanSet(href.clone(), to, dur));
         });
         chip.add_controller(drag);
@@ -226,7 +244,7 @@ fn block_widget(
     wrap.set_focusable(true);
     wrap.add_css_class("plan-block-focus");
     wrap.append(&block_row(&chip, b.col, b.cols));
-    wrap.upcast()
+    (wrap.upcast(), chip, meta)
 }
 
 /// Start, duration and Take off the plan for one slot. Start speaks clock
@@ -400,11 +418,12 @@ impl Ghost {
         while let Some(c) = self.wrap.first_child() {
             self.wrap.remove(&c);
         }
-        let chip = block_chip(&b, None, self.px_per_hour);
+        let px = daygrid::live_px(self.px_per_hour);
+        let (chip, _meta) = block_chip(&b, None, px);
         chip.add_css_class("ghost");
         let row = block_row(&chip, b.col, b.cols);
         self.wrap.append(&row);
-        self.wrap.set_margin_top(block_top(&b, self.px_per_hour));
+        self.wrap.set_margin_top(block_top(&b, px));
         self.wrap.set_visible(true);
     }
 
@@ -438,13 +457,15 @@ pub fn ghost_off() {
 }
 
 /// Plan's blocks and drop target on the right lane. The ghost goes last so
-/// it draws over what it previews against.
+/// it draws over what it previews against. Blocks register with `reflow`
+/// so a zoom slides and resizes them without a rebuild.
 pub fn fill_lane(
     p: &DayPlan,
     tx: &Tx,
     rows: &mut Vec<(String, gtk::Widget)>,
     px_per_hour: f64,
     overlay: &gtk::Overlay,
+    reflow: &daygrid::Reflow,
 ) {
     let ghost = Ghost::new(p, px_per_hour);
     for b in &p.blocks {
@@ -452,11 +473,18 @@ pub fn fill_lane(
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
         wrap.set_hexpand(true);
-        wrap.set_margin_top(block_top(b, px_per_hour));
-        let row = block_widget(b, p.now_min, &ghost, tx, px_per_hour);
+        let (row, chip, meta) = block_widget(b, p.now_min, &ghost, tx, px_per_hour);
         rows.push((b.task.href.clone(), row.clone()));
         wrap.append(&row);
         overlay.add_overlay(&wrap);
+        let span = daygrid::Span {
+            start_min: f64::from(b.start),
+            end_min: f64::from(b.start + b.duration),
+            min_h: f64::from(min_block_h(b)),
+            title_at: 0.0,
+            meta_at: 36.0,
+        };
+        reflow.place(&wrap, &chip, span, None::<&gtk::Label>, meta.as_ref());
     }
     ghost.attach(overlay);
 
@@ -474,7 +502,7 @@ pub fn fill_lane(
                 Some(task) => {
                     ghost.show(
                         &task,
-                        model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
+                        model::minutes_at(y, daygrid::HOUR_START, daygrid::live_px(px_per_hour)),
                         PLAN_DEFAULT_DURATION,
                     );
                 }
@@ -500,7 +528,7 @@ pub fn fill_lane(
             };
             tx.emit(Msg::PlanSet(
                 href.to_string(),
-                model::minutes_at(y, daygrid::HOUR_START, px_per_hour),
+                model::minutes_at(y, daygrid::HOUR_START, daygrid::live_px(px_per_hour)),
                 PLAN_DEFAULT_DURATION,
             ));
             true

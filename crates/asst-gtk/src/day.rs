@@ -3,10 +3,55 @@
 //! day header, scroller, zoom) is `daygrid`. The tray of tasks to place sits
 //! in a third column beside the grid so it never steals the time axis.
 
-use relm4::gtk::{self, prelude::*};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use asst_core::api::BlockView;
+use chrono::NaiveDate;
+use chrono_tz::Tz;
+use relm4::gtk::{self, glib, prelude::*};
 
 use crate::daygrid::{self, DayStep};
 use crate::{content, plan, row, time};
+
+/// The tracked lane once built: enough to draw it again at another zoom
+/// level or for new data, in place.
+struct TimeLane {
+    lane: Option<glib::WeakRef<gtk::Overlay>>,
+    reflow: daygrid::Reflow,
+    day: NaiveDate,
+    zone: Tz,
+    blocks: RefCell<Vec<BlockView>>,
+    chips: RefCell<Vec<gtk::Widget>>,
+    shown: Cell<time::Detail>,
+}
+
+impl TimeLane {
+    /// Draw the chips again for `px`. The old ones go and the new ones
+    /// arrive inside one frame, so nothing of the last zoom is left behind
+    /// (a dissolve left them hanging at their old places, not following the
+    /// grid) and a block growing by a minute is not seen at all.
+    fn redraw(&self, px: f64) {
+        let Some(lane) = self.lane.as_ref().and_then(|l| l.upgrade()) else {
+            return;
+        };
+        self.shown.set(time::detail_from(self.shown.get(), px));
+        let old = self.chips.take();
+        self.reflow.forget(&old);
+        for w in &old {
+            lane.remove_overlay(w);
+        }
+        let fresh = time::fill_lane(
+            &self.blocks.borrow(),
+            self.day,
+            self.zone,
+            &lane,
+            self.shown.get(),
+            &self.reflow,
+        );
+        *self.chips.borrow_mut() = fresh;
+    }
+}
 
 /// The Day column: header, two-lane grid, and the tray.
 pub fn build_column(
@@ -28,12 +73,22 @@ pub fn build_column(
 
     let today = o.now.date_naive();
     let day = p.day;
-    let note = format!(
-        "{} planned · {} to place · {}",
-        p.blocks.len(),
-        p.tray.len(),
-        time::day_note(o.blocks)
-    );
+    // Plan and actual stay two lanes; the note is the only place they
+    // meet, so a day reads "3h planned · 2.5h tracked · −30m".
+    let planned_secs: f64 = p.blocks.iter().map(|b| f64::from(b.duration) * 60.0).sum();
+    let (to_place, placed) = (p.tray.len(), p.blocks.len());
+    let note_for = move |blocks: &[asst_core::api::BlockView]| {
+        format!(
+            "{} · {to_place} to place · {}",
+            time::day_note(blocks, planned_secs),
+            if placed == 0 {
+                "nothing placed".to_string()
+            } else {
+                format!("{placed} placed")
+            }
+        )
+    };
+    let note = note_for(o.blocks);
     // Unfinished work on this day can be carried to the next: one button,
     // there only while there is something to carry.
     let carry = (!p.blocks.is_empty()).then(|| {
@@ -51,15 +106,11 @@ pub fn build_column(
         button.connect_clicked(move |_| tx.emit(crate::window::Msg::PlanCarry));
         button
     });
-    root.append(&daygrid::day_header(
-        "Day",
-        day,
-        &note,
-        today,
-        DayStep::Day,
-        carry,
-        tx,
-    ));
+    let header = daygrid::day_header("Day", day, &note, today, DayStep::Day, carry, tx);
+    // The header's last child is the note line: it follows the tracked
+    // total without the column being rebuilt.
+    let note_label = header.last_child().and_downcast::<gtk::Label>();
+    root.append(&header);
 
     if o.adding.is_some() {
         root.append(&content::card(o, add_card));
@@ -90,10 +141,57 @@ pub fn build_column(
     scroll.add_css_class("day-scroll");
     let zone = o.now.timezone();
     let (blocks, plan, px, tday) = (o.blocks, p, o.px_per_hour, day);
-    scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, |lanes| {
-        time::fill_lane(blocks, tday, zone, &lanes.time, px);
-        plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan);
+    // One reflow for the whole grid: a zoom moves the hour rows, the
+    // now-line and every chip through it without rebuilding the tree.
+    let reflow = daygrid::Reflow::default();
+    let mut time_lane: Option<gtk::Overlay> = None;
+    let mut chips: Vec<gtk::Widget> = Vec::new();
+    scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, &reflow, |lanes| {
+        chips = time::fill_lane(
+            blocks,
+            tday,
+            zone,
+            &lanes.time,
+            time::detail_for(px),
+            &reflow,
+        );
+        time_lane = Some(lanes.time.clone());
+        plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
     })));
+    // What the grid redraws without a rebuild of the column: the tracked
+    // chips when the zoom crosses into another level (a dissolve) or when
+    // fresh data arrives (a plain swap, in one frame), the header note, and
+    // the now-line.
+    let lane = Rc::new(TimeLane {
+        lane: time_lane.map(|l| l.downgrade()),
+        reflow: reflow.clone(),
+        day: tday,
+        zone,
+        blocks: RefCell::new(o.blocks.to_vec()),
+        chips: RefCell::new(chips),
+        shown: Cell::new(time::detail_for(px)),
+    });
+    let refill: Rc<dyn Fn(f64)> = {
+        let lane = lane.clone();
+        Rc::new(move |px| {
+            if time::detail_from(lane.shown.get(), px) != lane.shown.get() {
+                lane.redraw(px);
+            }
+        })
+    };
+    let refresh: daygrid::Refresh = {
+        let note_label = note_label.map(|l| l.downgrade());
+        Rc::new(move |blocks, tracked_changed, now| {
+            if tracked_changed {
+                *lane.blocks.borrow_mut() = blocks.to_vec();
+                lane.redraw(lane.reflow.px());
+                if let Some(l) = note_label.as_ref().and_then(|l| l.upgrade()) {
+                    l.set_text(&note_for(blocks));
+                }
+            }
+            lane.reflow.set_now(daygrid::now_minutes(now));
+        })
+    };
     cols.append(&scroll);
     cols.append(&plan::tray(p, o, tx, &mut rows));
     root.append(&cols);
@@ -121,10 +219,10 @@ pub fn build_column(
             now_min,
             first_min,
             fresh_view: o.fresh.view,
-            hold: o.hold,
             px_per_hour: px,
         },
     );
+    daygrid::live(&reflow, &scroll, Some(refill), Some(refresh));
     daygrid::attach_zoom(&scroll, tx, px);
 
     content::Built { root, rows }

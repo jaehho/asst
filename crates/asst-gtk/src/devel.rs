@@ -25,6 +25,12 @@ use serde::Serialize;
 use crate::model::{Counts, DayPlan, Kind, Nav, Section};
 use crate::window::{Msg, Tx};
 
+/// Rebuilds of the content column (`Window::render`), for `dump`.
+pub static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// In-place updates of the Day grid (tracked time, the clock), for `dump`.
+pub static REFRESHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn enabled() -> bool {
     std::env::var_os("ASST_DEVEL").is_some()
 }
@@ -285,6 +291,20 @@ pub struct Dump {
     /// The keyboard cursor's task.
     pub cursor: Option<String>,
     pub counts: DumpCounts,
+    /// Times the content column was rebuilt since the window opened. A zoom
+    /// inside one detail level must not add to it.
+    pub builds: u64,
+    /// Which parts of the view key moved at the last rebuild.
+    pub rebuilt_for: String,
+    /// Times the Day grid took new tracked time or the clock in place.
+    pub refreshes: u64,
+    /// The Day scroller: its allocated height and its viewport page size.
+    pub scroller_h: Option<i32>,
+    pub page_size: Option<f64>,
+    /// How tall the scrollable content is; the grid is 24 × `px_per_hour`.
+    pub scroll_upper: Option<f64>,
+    /// The zoom the grid itself is drawn at (reflow), as against `px_per_hour`.
+    pub grid_px: Option<f64>,
 }
 
 /// The sidebar's badges, before `show_counts` hides the numbers.
@@ -402,6 +422,13 @@ pub fn build_dump(
         toast: toast.map(str::to_string),
         cursor: cursor.map(str::to_string),
         counts,
+        builds: BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+        rebuilt_for: String::new(),
+        refreshes: REFRESHES.load(std::sync::atomic::Ordering::Relaxed),
+        scroller_h: None,
+        page_size: None,
+        scroll_upper: None,
+        grid_px: None,
     }
 }
 
