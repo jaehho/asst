@@ -414,7 +414,7 @@ pub fn scroll_top_minute(step: DayStep, px_per_hour: f64) -> Option<(f64, f64)> 
 /// phase: GTK otherwise hands the event to the overlay packing and the
 /// zoom never sees it.
 pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
-    let make = || {
+    let make_scroll = || {
         let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
@@ -438,11 +438,44 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
         }
         ctrl
     };
+    // Touchpad pinch (and some driver two-finger zooms) arrive as a
+    // zoom gesture, not as Ctrl+scroll.
+    let make_pinch = || {
+        let pinch = gtk::GestureZoom::new();
+        pinch.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let (scroll, tx) = (scroll.clone(), tx.clone());
+            let last = std::rc::Rc::new(std::cell::Cell::new(1.0f64));
+            {
+                let last = last.clone();
+                pinch.connect_scale_changed(move |g, scale| {
+                    let prev = last.get();
+                    last.set(scale);
+                    if prev <= 0.0 || (scale - prev).abs() < 0.01 {
+                        return;
+                    }
+                    let factor = scale / prev;
+                    let y_in_view = g
+                        .bounding_box_center()
+                        .map(|(_, y)| y)
+                        .unwrap_or_else(|| scroll.vadjustment().page_size() / 3.0);
+                    let hold = minute_under(&scroll, y_in_view, px_per_hour);
+                    tx.emit(Msg::ZoomBy(factor, hold));
+                });
+            }
+            pinch.connect_end(move |_g, _seq| {
+                last.set(1.0);
+            });
+        }
+        pinch
+    };
     // Scroller and the grid overlay both: one of them usually wins the
     // event, and it was never the zoom.
-    scroll.add_controller(make());
+    scroll.add_controller(make_scroll());
+    scroll.add_controller(make_pinch());
     if let Some(child) = scroll.child() {
-        child.add_controller(make());
+        child.add_controller(make_scroll());
+        child.add_controller(make_pinch());
     }
 }
 

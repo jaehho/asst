@@ -1216,16 +1216,19 @@ impl Component for Window {
             }
             Msg::Zoom(px, hold) => {
                 self.prefs.day_zoom = model::clamp_px_per_hour(px);
-                self.prefs.save();
                 self.zoom_hold = hold;
-                self.shown = 0;
+                self.dirty = true;
+                // Rebuild once the gesture settles, not every scroll tick.
+                self.hold(&sender, Duration::from_millis(140));
+                return;
             }
             Msg::ZoomBy(factor, hold) => {
                 let px = self.prefs.day_zoom * factor;
                 self.prefs.day_zoom = model::clamp_px_per_hour(px);
-                self.prefs.save();
                 self.zoom_hold = hold;
-                self.shown = 0;
+                self.dirty = true;
+                self.hold(&sender, Duration::from_millis(140));
+                return;
             }
             Msg::Navigate(nav) => {
                 let nav = model::canonical_nav(nav, &self.lists);
@@ -1258,13 +1261,15 @@ impl Component for Window {
             Msg::ToggleSidebar => w.outer.set_show_sidebar(!w.outer.shows_sidebar()),
             Msg::Refresh => self.reload(&sender),
             // The now-line and the tracked lane both follow the clock.
-            // Without this a Day left on screen never sees later activity
-            // (or a moved now) until something else reloads the window.
+            // Rebuild only when the clock or the blocks actually moved:
+            // tearing the Day column down every minute is the flash.
             Msg::Tick => {
                 if self.nav == Nav::Day {
-                    self.shown = 0;
                     let day = self.day_day;
                     self.reload_blocks(&sender, day);
+                    // shown is left alone here; the hash below includes
+                    // now_min and blocks, so a real change still rebuilds
+                    // once — and a quiet minute rebuilds nothing.
                 }
             }
             Msg::Focused => {
@@ -2191,6 +2196,11 @@ impl Component for Window {
                 });
             }
             Msg::Resume => {
+                self.prefs.save();
+                // The settle is over: a rebuild must not see it as still
+                // running (the timer and the deadline can tie) or the
+                // zoom stops one frame short and never paints.
+                self.settle_until = None;
                 if !self.dirty {
                     return;
                 }

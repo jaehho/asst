@@ -91,9 +91,171 @@ pub fn first_min(blocks: &[BlockView], day: NaiveDate, zone: Tz) -> Option<f64> 
         })
 }
 
+/// How much of the timeline to show at this zoom.
+///
+/// Far out, a day is a few project bars. Closer in, sessions and their
+/// titles. Closest, the composition line. Concurrent chips only get
+/// side-by-side columns when there is room for them to be readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// Project bars only: one column, name only.
+    Day,
+    /// One chip per session, title on it, at most two columns.
+    Session,
+    /// Full chips with times and composition, up to four columns.
+    Fine,
+}
+
+pub fn detail_for(px_per_hour: f64) -> Detail {
+    if px_per_hour < 36.0 {
+        Detail::Day
+    } else if px_per_hour < 72.0 {
+        Detail::Session
+    } else {
+        Detail::Fine
+    }
+}
+
+/// A chip to draw: already merged for this zoom, in minutes from midnight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplaySpan {
+    pub start_min: f64,
+    pub end_min: f64,
+    pub label: String,
+    pub title: String,
+    pub meta: Option<String>,
+}
+
+/// Merge tracked blocks into what this zoom can actually show.
+///
+/// One primary chip owns each minute (the longest span covering it).
+/// Concurrent work is named on that chip's meta line, never a second
+/// overlapping box. At `Day` the title is just the project; `Session`
+/// adds the time range; `Fine` adds composition.
+pub fn display_spans(
+    blocks: &[BlockView],
+    day: NaiveDate,
+    zone: Tz,
+    detail: Detail,
+) -> Vec<DisplaySpan> {
+    let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
+    for b in blocks {
+        if b.planned {
+            continue;
+        }
+        let s = daygrid::minutes_from_midnight(b.start, day, zone);
+        let e = daygrid::minutes_from_midnight(b.end, day, zone).max(s);
+        if e - s < 0.5 {
+            continue;
+        }
+        placed.push((s, e, b));
+    }
+    if placed.is_empty() {
+        return Vec::new();
+    }
+    // Minute-resolution primary track: at each slice the longest block
+    // wins. Adjacent slices with the same winner become one chip.
+    let mut edges: Vec<f64> = Vec::new();
+    for (s, e, _) in &placed {
+        edges.push(*s);
+        edges.push(*e);
+    }
+    edges.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    edges.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    let mut runs: Vec<(f64, f64, &BlockView, Vec<String>)> = Vec::new();
+    for w in edges.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if b - a < 0.05 {
+            continue;
+        }
+        let mut cover: Vec<(f64, &BlockView)> = Vec::new();
+        for (s, e, blk) in &placed {
+            if *s < b && a < *e {
+                let ov = e.min(b) - s.max(a);
+                cover.push((ov, blk));
+            }
+        }
+        cover.sort_by(|x, y| {
+            y.0.partial_cmp(&x.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.1.start.cmp(&y.1.start))
+        });
+        let Some((_, win)) = cover.first() else {
+            continue;
+        };
+        let losers: Vec<String> = cover
+            .iter()
+            .skip(1)
+            .filter_map(|(_, blk)| {
+                let lab = blk.label.as_deref().unwrap_or("untagged");
+                if lab == win.label.as_deref().unwrap_or("untagged") {
+                    None
+                } else {
+                    Some(lab.to_string())
+                }
+            })
+            .collect();
+        match runs.last_mut() {
+            Some(last) if last.2.label == win.label && a <= last.1 => {
+                last.1 = last.1.max(b);
+                for l in losers {
+                    if !last.3.contains(&l) {
+                        last.3.push(l);
+                    }
+                }
+            }
+            _ => runs.push((a, b, *win, losers)),
+        }
+    }
+
+    let mut out: Vec<DisplaySpan> = Vec::new();
+    for (s, e, b, losers) in runs {
+        let label = b.label.as_deref().unwrap_or("untagged").to_string();
+        let title = match detail {
+            Detail::Day => label.clone(),
+            _ => b
+                .detail
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .unwrap_or(&label)
+                .to_string(),
+        };
+        let start_s = asst_core::fmt::time_label(local_of(b.start, zone).time());
+        let end_s = asst_core::fmt::time_label(local_of(b.end, zone).time());
+        let dur = dur_label(duration(b));
+        let mut extras: Vec<String> = losers;
+        if detail == Detail::Fine
+            && let Some(c) = b.composition.as_deref().filter(|c| !c.is_empty())
+        {
+            extras.push(c.to_string());
+        }
+        let meta = match detail {
+            Detail::Day => None,
+            _ => {
+                let extra = if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", extras.join(" · "))
+                };
+                Some(format!("{start_s} – {end_s} · {dur}{extra}"))
+            }
+        };
+        out.push(DisplaySpan {
+            start_min: s,
+            end_min: e,
+            label,
+            title,
+            meta,
+        });
+    }
+    out
+}
+
 /// Tracked chips over the rules in the time lane. Each chip is its own
 /// overlay (the Plan blocks' pattern) so a sibling overlay like the
-/// now-line still measures. Overlaps stack in columns inside the lane.
+/// now-line still measures. What is drawn, and how much of it, follows
+/// `detail_for(px_per_hour)`.
 pub fn fill_lane(
     blocks: &[BlockView],
     day: NaiveDate,
@@ -101,62 +263,42 @@ pub fn fill_lane(
     overlay: &gtk::Overlay,
     px_per_hour: f64,
 ) {
-    let mut placed: Vec<(f64, f64, &BlockView)> = Vec::new();
-    for b in blocks {
-        if b.planned {
-            continue;
-        }
-        let s = daygrid::minutes_from_midnight(b.start, day, zone);
-        // Real end for packing: inflating short spans stacked a rainbow of
-        // overlapping lanes. Height gets a floor below.
-        let e = daygrid::minutes_from_midnight(b.end, day, zone).max(s);
-        placed.push((s, e, b));
-    }
-    placed.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    let spans: Vec<(f64, f64)> = placed.iter().map(|(s, e, _)| (*s, *e)).collect();
-    let cols = model::span_columns(&spans);
+    let detail = detail_for(px_per_hour);
+    let spans = display_spans(blocks, day, zone, detail);
+    // One column always at Day; at Session at most two; Fine packs a
+    // real overlap group into up to four. Past that the text is a lie.
+    let max_cols = match detail {
+        Detail::Day => 1,
+        Detail::Session => 2,
+        Detail::Fine => 4,
+    };
+    let boxes: Vec<(f64, f64)> = spans.iter().map(|d| (d.start_min, d.end_min)).collect();
+    let cols = model::span_columns(&boxes);
 
-    for (i, (s, e, b)) in placed.iter().enumerate() {
-        let (col, ncol) = cols[i];
-        let top = s / 60.0 * px_per_hour;
-        let height_px = ((e - s) / 60.0 * px_per_hour).max(18.0);
-        let label = b.label.as_deref().unwrap_or("untagged");
-        // Prefer the human name (page title, Claude session) on the chip;
-        // `label` stays the project tint and the rollup key.
-        let title_text = b
-            .detail
-            .as_deref()
-            .filter(|d| !d.is_empty())
-            .unwrap_or(label);
-        let start_s = asst_core::fmt::time_label(local_of(b.start, zone).time());
-        let end_s = asst_core::fmt::time_label(local_of(b.end, zone).time());
-        let dur = dur_label(duration(b));
+    for (i, d) in spans.iter().enumerate() {
+        let (mut col, ncol) = cols[i];
+        let ncol = ncol.min(max_cols).max(1);
+        col = col.min(ncol - 1);
+        let top = d.start_min / 60.0 * px_per_hour;
+        let height_px = ((d.end_min - d.start_min) / 60.0 * px_per_hour).max(18.0);
 
         let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
         chip.add_css_class("time-block");
-        chip.add_css_class(tint_for(label));
+        chip.add_css_class(tint_for(&d.label));
         chip.set_hexpand(true);
         chip.set_height_request(height_px as i32);
         chip.set_margin_start(4);
         chip.set_margin_end(4);
 
-        let title = gtk::Label::new(Some(title_text));
+        let title = gtk::Label::new(Some(&d.title));
         title.add_css_class("time-block-title");
         title.set_xalign(0.0);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&title);
-        if height_px >= 34.0 {
-            let meta_text = match &b.composition {
-                Some(c) if !c.is_empty() => {
-                    format!("{start_s} – {end_s} · {dur} · {c}")
-                }
-                _ => format!("{start_s} – {end_s} · {dur}"),
-            };
-            let meta = gtk::Label::new(Some(&meta_text));
+        if let Some(meta_text) = &d.meta
+            && height_px >= 34.0
+        {
+            let meta = gtk::Label::new(Some(meta_text));
             meta.add_css_class("time-block-meta");
             meta.set_xalign(0.0);
             meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -166,7 +308,7 @@ pub fn fill_lane(
         // Equal-expand spacers put the chip in its overlap column.
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         row.set_hexpand(true);
-        for c in 0..ncol.max(1) {
+        for c in 0..ncol {
             if c == col {
                 row.append(&chip);
             } else {
@@ -189,6 +331,40 @@ pub fn fill_lane(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detail_follows_zoom() {
+        assert_eq!(detail_for(20.0), Detail::Day);
+        assert_eq!(detail_for(52.0), Detail::Session);
+        assert_eq!(detail_for(90.0), Detail::Fine);
+    }
+
+    #[test]
+    fn day_zoom_shows_one_bar_per_project_not_a_collage() {
+        // block() builds September 2026 timestamps.
+        let day = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let lab = block((20, 14, 0), (20, 15, 0));
+        let mut mail = block((20, 14, 15), (20, 14, 45));
+        mail.label = Some("email".into());
+        mail.detail = Some("Inbox".into());
+        let mut lab2 = block((20, 15, 0), (20, 16, 0));
+        lab2.label = Some("lab".into());
+        lab2.detail = Some("lc_pathways.py".into());
+
+        let day_z = display_spans(
+            &[lab.clone(), mail.clone(), lab2.clone()],
+            day,
+            ny(),
+            Detail::Day,
+        );
+        // One primary track: email does not get a second overlapping box.
+        assert!(day_z.len() <= 2, "day_z: {day_z:?}");
+        assert!(day_z.iter().all(|d| d.meta.is_none()));
+
+        let fine = display_spans(&[lab, mail, lab2], day, ny(), Detail::Fine);
+        assert!(!fine.is_empty(), "fine");
+        assert!(fine.iter().any(|d| d.meta.is_some()), "fine: {fine:?}");
+    }
+
     #[test]
     fn day_note_compares_plan_to_tracked() {
         let b = block((15, 13, 0), (15, 15, 0));
