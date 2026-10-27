@@ -438,8 +438,9 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
         }
         ctrl
     };
-    // Touchpad pinch (and some driver two-finger zooms) arrive as a
-    // zoom gesture, not as Ctrl+scroll.
+    // Touchpad pinch is a zoom gesture, not Ctrl+scroll. Attached in the
+    // capture phase on the scroller and its child so the overlay cannot
+    // swallow it.
     let make_pinch = || {
         let pinch = gtk::GestureZoom::new();
         pinch.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -469,8 +470,6 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
         }
         pinch
     };
-    // Scroller and the grid overlay both: one of them usually wins the
-    // event, and it was never the zoom.
     scroll.add_controller(make_scroll());
     scroll.add_controller(make_pinch());
     if let Some(child) = scroll.child() {

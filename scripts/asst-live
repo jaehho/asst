@@ -73,6 +73,22 @@ rebuild_later() {
 }
 
 if [ -x "$bin" ]; then
+  # Sources newer than the binary: build here so this launch is the tree,
+  # not last week's. Background rebuild alone meant Ctrl+Q + reopen always
+  # ran the old window and only then compiled the new one.
+  stale=no
+  if [ -z "${ASST_NO_REBUILD:-}" ]; then
+    if find "$ROOT/crates" "$ROOT/Cargo.toml" -newer "$bin" \
+        \( -name '*.rs' -o -name Cargo.toml \) 2>/dev/null | head -1 | grep -q .; then
+      stale=yes
+    fi
+  fi
+  if [ "$stale" = yes ]; then
+    if ! build >"$log" 2>&1; then
+      fail "build failed; see $log"
+    fi
+    exec "$bin" "$@"
+  fi
   [ -n "${ASST_NO_REBUILD:-}" ] || rebuild_later
   exec "$bin" "$@"
 fi
