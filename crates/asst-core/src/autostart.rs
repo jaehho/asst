@@ -1,9 +1,10 @@
 //! Starting at login, as something the user turns on, the way steno does it:
-//! one XDG autostart entry, written when "Start at login" is switched on and
-//! removed when it is switched off. Hyprland, sway and niri don't run those
-//! unless the session was started through systemd (uwsm), so a line in the
-//! compositor's own config that starts `asst-gtk --background` counts as on
-//! and is left for the user to remove.
+//! one XDG autostart entry, written when "Start at login" (Preferences, or
+//! `asst autostart on`) is switched on and removed when it is switched off.
+//! Hyprland, sway and niri don't run those unless the session was started
+//! through systemd (uwsm), so a line in the compositor's own config that
+//! starts `asst-gtk --background` counts as on and is left for the user to
+//! remove. Files only, no GTK, so the window and the CLI share it.
 
 use std::path::{Path, PathBuf};
 
@@ -62,23 +63,29 @@ fn starts_asst(config: &str) -> bool {
     })
 }
 
+/// The autostart entry, named for the window's app ID.
 pub fn entry() -> PathBuf {
     config_home()
         .join("autostart")
-        .join(format!("{}.desktop", crate::devel::app_id()))
+        .join(format!("{}.desktop", crate::config::gui_app_id()))
 }
 
 /// An absolute path when there is one: a session's startup commands often
-/// run without `~/.local/bin` on PATH.
+/// run without `~/.local/bin` on PATH. The installed command comes first,
+/// then the `asst-gtk` beside the running binary (the window itself, or
+/// the CLI's neighbour in the same build).
 fn command() -> String {
     let installed = [
         home().join(".local/bin/asst-gtk"),
         "/usr/bin/asst-gtk".into(),
     ];
+    let beside = std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_file_name("asst-gtk"));
     let exe = installed
         .into_iter()
+        .chain(beside)
         .find(|p| p.is_file())
-        .or_else(|| std::env::current_exe().ok())
         .map_or_else(|| "asst-gtk".to_string(), |p| quote(&p));
     format!("{exe} --background")
 }
@@ -105,14 +112,13 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 ",
         command(),
-        asst_core::config::APP_ID
+        crate::config::APP_ID
     )
 }
 
-pub fn is_enabled() -> bool {
-    if started_by_compositor().is_some() {
-        return true;
-    }
+/// Whether the autostart entry is there and not switched off with
+/// `Hidden=true`. The compositor's line is apart: `is_enabled` counts both.
+pub fn entry_is_on() -> bool {
     std::fs::read_to_string(entry()).is_ok_and(|text| {
         !text
             .lines()
@@ -120,6 +126,12 @@ pub fn is_enabled() -> bool {
     })
 }
 
+pub fn is_enabled() -> bool {
+    started_by_compositor().is_some() || entry_is_on()
+}
+
+/// Writes or removes the autostart entry. The compositor's line is never
+/// touched: it stays the user's to remove.
 pub fn set(on: bool) -> std::io::Result<()> {
     let path = entry();
     if on {
@@ -137,21 +149,21 @@ pub fn set(on: bool) -> std::io::Result<()> {
 
 /// Whether this session runs autostart entries. False means "not sure".
 pub fn session_reads_autostart() -> bool {
+    let desktop_reads = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .any(|d| READS_AUTOSTART.contains(&d));
     // A session started through systemd runs them through this target.
-    let by_systemd = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "is-active",
-            "--quiet",
-            "xdg-desktop-autostart.target",
-        ])
-        .status()
-        .is_ok_and(|s| s.success());
-    by_systemd
-        || std::env::var("XDG_CURRENT_DESKTOP")
-            .unwrap_or_default()
-            .split(':')
-            .any(|d| READS_AUTOSTART.contains(&d))
+    desktop_reads
+        || std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "is-active",
+                "--quiet",
+                "xdg-desktop-autostart.target",
+            ])
+            .status()
+            .is_ok_and(|s| s.success())
 }
 
 /// `~/…` for a path in the home folder.
@@ -175,5 +187,14 @@ mod tests {
         assert!(!starts_asst("-- hl.exec_cmd(\"asst-gtk --background\")\n"));
         assert!(!starts_asst("# exec-once = asst-gtk --background\n"));
         assert!(!starts_asst("hl.exec_cmd(\"asst-gtk\")\n"));
+    }
+
+    #[test]
+    fn a_path_with_a_space_is_quoted_for_exec() {
+        assert_eq!(quote(Path::new("/opt/asst/asst-gtk")), "/opt/asst/asst-gtk");
+        assert_eq!(
+            quote(Path::new("/home/me/my apps/asst-gtk")),
+            "\"/home/me/my apps/asst-gtk\""
+        );
     }
 }
