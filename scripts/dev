@@ -323,7 +323,7 @@ CONF
     cat > "$DEV/data/dbus-1/services/dev.jaeho.Asst.Devel.service" <<SERVICE
 [D-BUS Service]
 Name=dev.jaeho.Asst.Devel
-Exec=/usr/bin/env -u XDG_DATA_HOME XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_HOME=$DEV/config XDG_STATE_HOME=$DEV/state PATH=$DEV/bin:/usr/local/bin:/usr/bin ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals $BIN/asst-gtk --gapplication-service
+Exec=/usr/bin/env -u XDG_DATA_HOME XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_HOME=$DEV/config XDG_STATE_HOME=$DEV/state PATH=$DEV/bin:$PATH ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals $BIN/asst-gtk --gapplication-service
 SERVICE
     hide_window
     # A bus that only starts this instance's services. Pointing
