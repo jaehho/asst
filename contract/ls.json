@@ -1,0 +1,22 @@
+[
+  {
+    "id": "5f3a",
+    "href": "/remote.php/dav/calendars/user/thesis-ff3300/5f3a91c2-7d4e-4b8a-9c1d-2e6f0a8b3c47.ics",
+    "list": "/remote.php/dav/calendars/user/thesis-ff3300/",
+    "list_name": "thesis",
+    "pending": false,
+    "issue": {
+      "number": 12,
+      "url": "https://github.com/jaehho/thesis/issues/12"
+    },
+    "origin": "steno",
+    "uid": "5f3a91c2-7d4e-4b8a-9c1d-2e6f0a8b3c47",
+    "summary": "Send the usage figures to Alice",
+    "status": "needs-action",
+    "priority": 0,
+    "source": "steno:20261012-100000/send the usage figures to alice",
+    "sort_order": 814169979,
+    "created": "2026-10-12T15:42:10Z",
+    "modified": "2026-10-12T15:42:10Z"
+  }
+]

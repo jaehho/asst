@@ -1,0 +1,20 @@
+[
+  {
+    "href": "/remote.php/dav/calendars/user/inbox-0082c9/",
+    "name": "Inbox",
+    "color": "#0082c9",
+    "writable": true,
+    "inbox": true,
+    "open": 4,
+    "done": 31
+  },
+  {
+    "href": "/remote.php/dav/calendars/user/thesis-ff3300/",
+    "name": "thesis",
+    "color": "#ff3300",
+    "writable": true,
+    "inbox": false,
+    "open": 9,
+    "done": 52
+  }
+]

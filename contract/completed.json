@@ -1,0 +1,19 @@
+[
+  {
+    "id": "a1d0",
+    "href": "/remote.php/dav/calendars/user/inbox-0082c9/a1d07e55-3b9f-4c2e-8d61-7f4a2c9e0b18.ics",
+    "list": "/remote.php/dav/calendars/user/inbox-0082c9/",
+    "list_name": "Inbox",
+    "pending": false,
+    "origin": "steno",
+    "uid": "a1d07e55-3b9f-4c2e-8d61-7f4a2c9e0b18",
+    "summary": "Book the room for the review",
+    "description": "Two hours, with a projector.",
+    "status": "completed",
+    "completed": "2026-10-14T09:05:31Z",
+    "priority": 5,
+    "source": "steno:20261012-100000/book the room for the review",
+    "created": "2026-10-12T15:42:11Z",
+    "modified": "2026-10-14T09:05:31Z"
+  }
+]

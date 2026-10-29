@@ -1,0 +1,16 @@
+{
+  "id": "5f3a",
+  "href": "/remote.php/dav/calendars/user/thesis-ff3300/5f3a91c2-7d4e-4b8a-9c1d-2e6f0a8b3c47.ics",
+  "list": "/remote.php/dav/calendars/user/thesis-ff3300/",
+  "list_name": "thesis",
+  "pending": true,
+  "origin": "steno",
+  "uid": "5f3a91c2-7d4e-4b8a-9c1d-2e6f0a8b3c47",
+  "summary": "Send the usage figures to Alice",
+  "status": "needs-action",
+  "priority": 0,
+  "source": "steno:20261012-100000/send the usage figures to alice",
+  "created": "2026-10-12T15:42:10Z",
+  "modified": "2026-10-12T15:42:10Z",
+  "existed": false
+}
