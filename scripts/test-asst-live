@@ -15,6 +15,12 @@ cat >"$tmp/bin/cargo" <<'EOF'
 exit 1
 EOF
 chmod +x "$tmp/bin/cargo"
+# A notify-send that records instead of reaching the desktop.
+cat >"$tmp/bin/notify-send" <<'EOF'
+#!/bin/sh
+echo "notified:$*" >>"$NOTIFIED"
+EOF
+chmod +x "$tmp/bin/notify-send"
 # A binary that would leave a mark if anyone ran it.
 cat >"$tmp/src/target/release/asst" <<'EOF'
 #!/bin/sh
@@ -27,6 +33,10 @@ touch "$tmp/src/Cargo.toml"
 ln -s "$here/asst-live" "$tmp/bin/asst"
 
 export MARKER="$tmp/marker"
+export NOTIFIED="$tmp/notified"
+# No bus: a background rebuild that fails after $tmp is gone would find
+# the real notify-send next on PATH.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$tmp/no-bus"
 export ASST_SRC="$tmp/src"
 export PATH="$tmp/bin:$PATH"
 export XDG_STATE_HOME="$tmp/state"
@@ -48,6 +58,10 @@ case $out in
     exit 1
     ;;
 esac
+grep -q '^notified:.*build failed' "$NOTIFIED" || {
+  echo "FAIL: no desktop notification for the failed build" >&2
+  exit 1
+}
 
 # Wrong name: refuse, and do not build.
 cat >"$tmp/bin/cargo" <<'EOF'
