@@ -1,0 +1,26 @@
+{
+  "steno": {
+    "code": "steno/src/steno/asstlink.py",
+    "calls": [
+      ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--list", "thesis", "--", "Send the usage figures to Alice"],
+      ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--", "Send the usage figures to Alice"],
+      ["--json", "ls"],
+      ["--json", "completed", "-n", "9999"],
+      ["--json", "show", "5f3a"],
+      ["--json", "done", "5f3a"],
+      ["--json", "reopen", "5f3a"],
+      ["--json", "edit", "5f3a", "--list", "thesis"],
+      ["--json", "edit", "5f3a", "--title=Send the final figures to Alice"],
+      ["--json", "rm", "5f3a"],
+      ["--json", "lists"],
+      ["open", "5f3a"]
+    ],
+    "reads": {
+      "add.json": ["id"],
+      "show.json": ["status"],
+      "ls.json": ["id", "source", "status", "list_name"],
+      "completed.json": ["id", "source", "status", "completed", "list_name"],
+      "lists.json": ["name"]
+    }
+  }
+}
