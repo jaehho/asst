@@ -13,8 +13,9 @@ help:            ## this list
 
 # The real asstd, config and lists are never touched: scripts/dev keeps its
 # own in ~/.cache/asst-dev/<ASST_DEV_NAME, else gui>. The window opens
-# unfocused on the Hyprland workspace asstdev; scripts/dev down stops it all.
-run:             ## the window cut off from the real asst: a private bus, a dev asstd and a local Radicale (scripts/dev up, then window)
+# unfocused on the Hyprland workspace asstdev. scripts/dev down stops this
+# instance; the Radicale all instances share stops only with down --all.
+run:             ## the window cut off from the real asst, unfocused on the asstdev workspace: a private bus, a dev asstd and a local Radicale (scripts/dev up, then window)
 	scripts/dev up
 	scripts/dev window
 
