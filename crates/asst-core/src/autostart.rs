@@ -162,6 +162,10 @@ pub fn session_reads_autostart() -> bool {
                 "--quiet",
                 "xdg-desktop-autostart.target",
             ])
+            // Without a user manager to ask it says so on stderr, which
+            // is "not sure" here, not news for the CLI's reader.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
 }
