@@ -1783,12 +1783,9 @@ impl Component for Window {
                 sender.command(move |out, shutdown| {
                     shutdown
                         .register(async move {
-                            let said = out.clone();
-                            let starting =
-                                move || said.emit(Cmd::Toast(Ok("Starting Steno…".into())));
                             // Ok: what steno answers is no reason to read
                             // the tasks again, as asstd's errors are.
-                            if let Err(why) = crate::steno::open(&session, token, starting).await {
+                            if let Err(why) = crate::steno::open(&session, token).await {
                                 out.emit(Cmd::Toast(Ok(why)));
                             }
                         })

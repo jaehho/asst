@@ -10,8 +10,8 @@
 #   scripts/dev window [ARGS...]   build, then the window on a hidden Hyprland workspace, unfocused
 #   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
 #   scripts/dev steno              a stand-in steno on the bus (scripts/steno-host.py), printing what
-#                                  Open meeting asks for to steno.log. The window's `steno` is always
-#                                  this stand-in, so Open meeting starts it when it is not up
+#                                  Open meeting asks for to steno.log. Without it, Open meeting says
+#                                  Steno is not running
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
 #   scripts/dev keys [MOD+]KEY...  real key presses to this instance's window, unfocused (Hyprland
@@ -211,9 +211,9 @@ stop_on_bus() {
   for _ in $(seq 40); do kill -0 "$pid" 2> /dev/null || return 0; sleep 0.1; done
 }
 
-# The dev window's `steno`, first on its PATH: the stand-in, so Open meeting
-# can never start the installed steno, which would listen and write the real
-# meetings from a window on this bus.
+# The dev window's `steno`, first on its PATH: the stand-in `scripts/dev
+# steno` starts, so the window offers Open meeting whether or not steno is
+# installed.
 steno_shim() {
   mkdir -p "$DEV/bin"
   cat > "$DEV/bin/steno" <<SHIM

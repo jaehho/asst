@@ -3,9 +3,7 @@
 org.freedesktop.Application on /dev/jaeho/Steno as steno's GApplication
 does, and prints each call as one JSON line, so a check can read what
 Open meeting asked for (the action, its argument, the activation token).
-`scripts/dev` makes it the dev window's `steno`, so the window starts this
-one when nothing owns the name, never the installed steno; `scripts/dev
-steno` starts it up front."""
+`scripts/dev steno` starts it, as the dev window's `steno`."""
 
 import json
 import sys
