@@ -548,7 +548,8 @@ impl Editor {
         }
     }
 
-    /// Duplicate, copy, save, delete, and when it was made and changed.
+    /// Where it came from, duplicate, copy, save, delete, and when it was
+    /// made and changed.
     fn task_menu(&self, t: &TaskView) -> gtk::Popover {
         let tx = self.tx.clone();
         let mut items: Vec<gtk::Widget> = Vec::new();
@@ -571,6 +572,11 @@ impl Editor {
                 .build(move || tx2.emit(Msg::OpenUrl(url.clone())))
                 .upcast(),
             );
+        }
+        if let Some(session) = model::meeting_of(t, crate::steno::here()) {
+            items.push(crate::row::meeting_item(session, &tx));
+        }
+        if !items.is_empty() {
             items.push(ui::separator());
         }
         items.extend::<Vec<gtk::Widget>>(vec![

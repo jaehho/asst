@@ -302,6 +302,15 @@ pub fn origin_of(source: Option<&str>, has_issue: bool) -> &'static str {
     "phone"
 }
 
+/// The steno meeting a source stamp names, as steno's `open-session`
+/// action takes it: `steno:<session>/<key>` gives `<session>`, the part
+/// before the first `/`. None for another kind of stamp, or no name.
+pub fn steno_session(source: &str) -> Option<&str> {
+    let rest = source.strip_prefix("steno:")?;
+    let session = rest.split('/').next().unwrap_or(rest);
+    (!session.is_empty() && session != "." && session != "..").then_some(session)
+}
+
 /// Stamp for a task created in asst itself. Unique, so two native adds are
 /// two tasks, while `--source` from a tool stays idempotent.
 pub fn local_source() -> String {
@@ -505,8 +514,22 @@ async fn activate_in_window(
     href: &str,
     token: Option<String>,
 ) -> zbus::Result<()> {
+    activate_action(conn, crate::config::gui_app_id(), action, href, token).await
+}
+
+/// One string-taking GApplication action of the app `app` (an app ID),
+/// through `org.freedesktop.Application.ActivateAction`: how one app
+/// opens another's object (`~/dotfiles/docs/app-contract.md`). The
+/// activation token, when there is one, lets the app's window take
+/// focus. The bus starts the app first if it has a service file.
+pub async fn activate_action(
+    conn: &zbus::Connection,
+    app: &str,
+    action: &str,
+    arg: &str,
+    token: Option<String>,
+) -> zbus::Result<()> {
     use zbus::zvariant::Value;
-    let app = crate::config::gui_app_id();
     let path = format!("/{}", app.replace('.', "/"));
     let mut platform: std::collections::HashMap<&str, Value<'_>> = std::collections::HashMap::new();
     if let Some(t) = token {
@@ -517,7 +540,7 @@ async fn activate_in_window(
         path.as_str(),
         Some("org.freedesktop.Application"),
         "ActivateAction",
-        &(action, vec![Value::from(href)], platform),
+        &(action, vec![Value::from(arg)], platform),
     )
     .await
     .map(|_| ())
@@ -655,6 +678,38 @@ mod tests {
         assert_eq!(origin_of(Some("asst:abc123"), true), "asst");
         assert_eq!(origin_of(Some("gh:7"), false), "github");
         assert_eq!(origin_of(Some("mail:1"), false), "other");
+    }
+
+    #[test]
+    fn a_steno_stamp_names_its_meeting() {
+        assert_eq!(
+            steno_session("steno:20261012-100000/send-notes"),
+            Some("20261012-100000")
+        );
+        // Only the first slash ends the name; a stamp with no key is the
+        // whole meeting.
+        assert_eq!(steno_session("steno:dev/notes/more"), Some("dev"));
+        assert_eq!(
+            steno_session("steno:20261012-100000"),
+            Some("20261012-100000")
+        );
+    }
+
+    #[test]
+    fn other_stamps_name_no_meeting() {
+        for source in [
+            "gh:7",
+            "asst:abc123",
+            "mail:1",
+            "steno",
+            "steno:",
+            "steno:/key",
+            "steno:./key",
+            "steno:../key",
+            "xsteno:a/b",
+        ] {
+            assert_eq!(steno_session(source), None, "{source}");
+        }
     }
 
     #[test]
