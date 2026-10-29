@@ -1125,6 +1125,13 @@ fn autostart_run(state: Option<OnOff>, as_json: bool) -> anyhow::Result<()> {
             autostart::COMMAND
         );
     }
+    // Preferences greys its switch out in this state; here the entry is
+    // the person's call, but they hear what it will do.
+    if on && !asst_core::config::background_in_window() {
+        println!(
+            "“Run in background” is off in Preferences, so the window opens at login, not the tray."
+        );
+    }
     Ok(())
 }
 

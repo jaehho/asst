@@ -105,6 +105,26 @@ fn a_session_that_may_not_run_entries_is_told_what_to_do() {
 }
 
 #[test]
+fn on_without_run_in_background_says_the_window_opens() {
+    let home = Home::new("background");
+    let window = home.config().join("asst/window.toml");
+    std::fs::create_dir_all(window.parent().unwrap()).unwrap();
+    std::fs::write(&window, "width = 1080\nbackground = false\n").unwrap();
+    assert_eq!(
+        home.asst("GNOME", &["autostart", "on"]),
+        "Start at login: on\n\
+         “Run in background” is off in Preferences, \
+         so the window opens at login, not the tray.\n"
+    );
+    assert!(home.entry().exists());
+    // Off says nothing about it: nothing opens at login then.
+    assert_eq!(
+        home.asst("GNOME", &["autostart", "off"]),
+        "Start at login: off\n"
+    );
+}
+
+#[test]
 fn a_compositor_line_counts_as_on_and_is_left_alone() {
     let home = Home::new("compositor");
     let lua = home.config().join("hypr/hyprland.lua");
