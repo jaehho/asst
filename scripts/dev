@@ -9,6 +9,9 @@
 #   scripts/dev asst ARGS...       the dev CLI on it
 #   scripts/dev window [ARGS...]   build, then the window on a hidden Hyprland workspace, unfocused
 #   scripts/dev tray               a stand-in tray on the bus (scripts/sni-host.py), before window
+#   scripts/dev steno              a stand-in steno on the bus (scripts/steno-host.py), printing what
+#                                  Open meeting asks for to steno.log. Without it, Open meeting says
+#                                  Steno is not running
 #   scripts/dev click ID ACTION    click a notification the stand-in server showed (notify.log)
 #   scripts/dev drive COMMAND      a scripted click or key (Window::drive)
 #   scripts/dev keys [MOD+]KEY...  real key presses to this instance's window, unfocused (Hyprland
@@ -159,7 +162,7 @@ print(json.dumps(slots))
 # Files older harness versions left in the instance dir. The live set is
 # the bus file, the logs and session.conf, plus config/ state/ data/.
 clear_stale() {
-  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|config|state|data)$'
+  local keep='^(bus|asstd\.log|window\.log|notify\.log|tray\.log|steno\.log|session\.log|session\.conf|dump\.json|texts\.json|up\.lock|bin|config|state|data)$'
   local f base
   for f in "$DEV"/* "$DEV"/.*; do
     [ -e "$f" ] || continue
@@ -206,6 +209,18 @@ stop_on_bus() {
   [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid")" = "$2" ] || return 0
   kill "$pid" 2> /dev/null || return 0
   for _ in $(seq 40); do kill -0 "$pid" 2> /dev/null || return 0; sleep 0.1; done
+}
+
+# The dev window's `steno`, first on its PATH: the stand-in `scripts/dev
+# steno` starts, so the window offers Open meeting whether or not steno is
+# installed.
+steno_shim() {
+  mkdir -p "$DEV/bin"
+  cat > "$DEV/bin/steno" <<SHIM
+#!/bin/sh
+exec /usr/bin/python3 "$REPO/scripts/steno-host.py" "\$@" >> "$DEV/steno.log" 2>&1
+SHIM
+  chmod +x "$DEV/bin/steno"
 }
 
 radicale_up() {
@@ -302,12 +317,13 @@ home = "/$(basename "$DEV")/"
 CONF
     fi
     rm -f "$DEV/bus"
+    steno_shim
     # What a click on a reminder starts when the dev window isn't running.
     mkdir -p "$DEV/data/dbus-1/services"
     cat > "$DEV/data/dbus-1/services/dev.jaeho.Asst.Devel.service" <<SERVICE
 [D-BUS Service]
 Name=dev.jaeho.Asst.Devel
-Exec=/usr/bin/env -u XDG_DATA_HOME XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_HOME=$DEV/config XDG_STATE_HOME=$DEV/state ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals $BIN/asst-gtk --gapplication-service
+Exec=/usr/bin/env -u XDG_DATA_HOME XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_HOME=$DEV/config XDG_STATE_HOME=$DEV/state PATH=$DEV/bin:$PATH ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals $BIN/asst-gtk --gapplication-service
 SERVICE
     hide_window
     # A bus that only starts this instance's services. Pointing
@@ -348,8 +364,9 @@ CONF
     # Only this instance's old window: a pattern would take the others'.
     stop_on_bus dev.jaeho.Asst.Devel asst-gtk
     hide_window
+    steno_shim
     # Popovers stay open without keyboard focus (ASST_NO_AUTOHIDE).
-    (env ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals \
+    (env ASST_DEVEL=1 ASST_NO_AUTOHIDE=1 GTK_A11Y=none GDK_DEBUG=no-portals PATH="$DEV/bin:$PATH" \
       setsid "$BIN/asst-gtk" "$@" > "$DEV/window.log" 2>&1 &)
     for _ in $(seq 60); do has_name dev.jaeho.Asst.Devel && { sleep 1; exit 0; }; sleep 0.25; done
     echo "the window did not come up; see $DEV/window.log" >&2
@@ -361,6 +378,15 @@ CONF
     (setsid /usr/bin/python3 "$REPO/scripts/sni-host.py" > "$DEV/tray.log" 2>&1 &)
     for _ in $(seq 40); do has_name org.kde.StatusNotifierWatcher && exit 0; sleep 0.1; done
     echo "the stand-in tray did not come up; see $DEV/tray.log" >&2
+    exit 1
+    ;;
+  steno)
+    on_bus
+    has_name dev.jaeho.Steno && exit 0
+    steno_shim
+    (setsid "$DEV/bin/steno" gui --background > /dev/null 2>&1 &)
+    for _ in $(seq 40); do has_name dev.jaeho.Steno && exit 0; sleep 0.1; done
+    echo "the stand-in steno did not come up; see $DEV/steno.log" >&2
     exit 1
     ;;
   drive) action drive "$2" ;;
@@ -430,6 +456,7 @@ CONF
     # worktree's, copy of the same binary. Asstd goes last: it and the
     # notification stand-in are what keep the bus up.
     stop_on_bus dev.jaeho.Asst.Devel asst-gtk
+    stop_on_bus dev.jaeho.Steno python3
     stop_on_bus org.kde.StatusNotifierWatcher python3
     stop_on_bus org.freedesktop.Notifications python3
     stop_on_bus dev.jaeho.Asst.Daemon asstd
@@ -442,10 +469,10 @@ CONF
       pkill -f "$BIN/asstd" 2>/dev/null || true
       pkill -f "target/debug/asst-gtk" 2>/dev/null || true
       pkill -f "target/debug/asstd" 2>/dev/null || true
-      pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify)-host.py$" 2>/dev/null || true
+      pkill -f "^/usr/bin/python3 $REPO/scripts/(sni|notify|steno)-host.py( |$)" 2>/dev/null || true
       pkill -f "$RADICALE/config" 2>/dev/null || true
     fi
     rm -f "$DEV/bus"
     ;;
-  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -209,6 +209,8 @@ pub enum Msg {
     StartWork(String),
     /// A link, in the browser.
     OpenUrl(String),
+    /// The steno meeting a task came from, by its name, in steno.
+    OpenMeeting(String),
     /// A list made from a picker that found none by that name, and what
     /// to do with it once it exists.
     MakeList(String, Then),
@@ -1773,6 +1775,22 @@ impl Component for Window {
                     None::<&gio::Cancellable>,
                     |_| {},
                 );
+            }
+            Msg::OpenMeeting(session) => {
+                // Asked for here, on the GTK thread, while the click that
+                // asked is this window's latest input.
+                let token = crate::steno::activation_token(&w.window);
+                sender.command(move |out, shutdown| {
+                    shutdown
+                        .register(async move {
+                            // Ok: what steno answers is no reason to read
+                            // the tasks again, as asstd's errors are.
+                            if let Err(why) = crate::steno::open(&session, token).await {
+                                out.emit(Cmd::Toast(Ok(why)));
+                            }
+                        })
+                        .drop_on_shutdown()
+                });
             }
             Msg::StartWork(href) => {
                 let Some(issue) = self.find(&href).and_then(|t| t.issue.clone()) else {

@@ -549,6 +549,8 @@ pub fn task_menu(
                 .upcast(),
         );
     }
+    // Where the task came from, in the app that has it.
+    let elsewhere = items.len();
     if let Some(issue) = &t.issue {
         let (start, h) = (send.clone(), href.clone());
         items.push(
@@ -568,6 +570,11 @@ pub fn task_menu(
             .build(move || open(Msg::OpenUrl(url.clone())))
             .upcast(),
         );
+    }
+    if let Some(session) = model::meeting_of(t, crate::steno::here()) {
+        items.push(meeting_item(session, tx));
+    }
+    if items.len() > elsewhere {
         items.push(ui::separator());
     }
     {
@@ -600,6 +607,15 @@ pub fn task_menu(
     let p = ui::menu(&items);
     p.set_width_request(260);
     p
+}
+
+/// Open meeting: the steno meeting `session`, in steno. The same item in
+/// the row's menu and the open card's.
+pub fn meeting_item(session: String, tx: &Tx) -> gtk::Widget {
+    let tx = tx.clone();
+    Item::new(Some("external-link-symbolic"), "Open meeting")
+        .build(move || tx.emit(Msg::OpenMeeting(session.clone())))
+        .upcast()
 }
 
 #[cfg(test)]

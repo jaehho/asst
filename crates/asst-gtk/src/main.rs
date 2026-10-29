@@ -21,6 +21,7 @@ mod row;
 mod settings;
 mod sidebar;
 mod snooze;
+mod steno;
 mod time;
 mod tray;
 mod ui;

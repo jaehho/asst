@@ -1576,6 +1576,16 @@ pub fn sync_state(s: &StatusView, now: DateTime<Tz>) -> String {
     state
 }
 
+/// The steno meeting a task's menus offer to open (#28): the one its
+/// stamp names, for a task steno filed, while steno is on this machine.
+pub fn meeting_of(t: &TaskView, steno_here: bool) -> Option<String> {
+    if !steno_here || t.origin != "steno" {
+        return None;
+    }
+    let source = t.task.source.as_deref()?;
+    asst_core::api::steno_session(source).map(str::to_string)
+}
+
 /// `owner/repo` of an issue's URL.
 pub fn issue_repo(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://github.com/")?;
@@ -2603,6 +2613,45 @@ mod tests {
         assert_eq!(ago(at(7300), now()), "2 hours ago");
         assert_eq!(ago(at(3 * 86400), now()), "on Sep 11");
         assert_eq!(ago(at(400 * 86400), now()), "on Aug 10, 2025");
+    }
+
+    /// A task with this origin and source stamp, as the daemon sends it.
+    fn stamped(origin: &str, source: Option<&str>) -> TaskView {
+        let mut t = task("a", "/a/", None);
+        t.origin = origin.into();
+        t.task.source = source.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn a_task_steno_filed_opens_its_meeting_while_steno_is_here() {
+        let t = stamped("steno", Some("steno:20261012-100000/send-notes"));
+        assert_eq!(meeting_of(&t, true).as_deref(), Some("20261012-100000"));
+        // Done tasks too: the meeting is still worth reading.
+        let mut done = t.clone();
+        done.task.status = Status::Completed;
+        assert_eq!(meeting_of(&done, true).as_deref(), Some("20261012-100000"));
+    }
+
+    #[test]
+    fn no_meeting_without_steno_or_a_stamp_that_names_one() {
+        let filed = stamped("steno", Some("steno:20261012-100000/send-notes"));
+        assert_eq!(meeting_of(&filed, false), None, "steno not on this machine");
+        for (origin, source) in [
+            ("github", Some("gh:7")),
+            ("asst", Some("asst:abc123")),
+            ("phone", None),
+            ("other", Some("mail:1")),
+            // A stamp of steno's kind that names no meeting.
+            ("steno", Some("steno")),
+            ("steno", Some("steno:/send-notes")),
+        ] {
+            assert_eq!(
+                meeting_of(&stamped(origin, source), true),
+                None,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]
