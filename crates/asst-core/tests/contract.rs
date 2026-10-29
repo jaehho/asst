@@ -19,8 +19,7 @@ fn dir() -> PathBuf {
 
 fn load(name: &str) -> Value {
     let path = dir().join(name);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 

@@ -1302,4 +1302,29 @@ mod tests {
             assert!(!code.contains(word), "projects.rs names {word}");
         }
     }
+
+    /// Every call another program makes (`contract/consumers.json`) still
+    /// parses: a renamed command or flag fails here, not in steno.
+    #[test]
+    fn every_consumer_call_still_parses() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contract/consumers.json");
+        let consumers: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut seen = 0;
+        for (who, c) in consumers.as_object().unwrap() {
+            for call in c["calls"].as_array().unwrap() {
+                let argv: Vec<&str> = std::iter::once("asst")
+                    .chain(call.as_array().unwrap().iter().map(|a| a.as_str().unwrap()))
+                    .collect();
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    panic!(
+                        "{who} calls `{}`, which asst no longer takes:\n{e}",
+                        argv.join(" ")
+                    );
+                }
+                seen += 1;
+            }
+        }
+        assert!(seen >= 10, "the calls were found ({seen})");
+    }
 }
