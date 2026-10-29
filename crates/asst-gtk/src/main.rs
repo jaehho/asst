@@ -2,7 +2,6 @@
 //! `quick-add`, both clients of asstd.
 
 mod addcard;
-mod autostart;
 mod client;
 mod content;
 mod day;

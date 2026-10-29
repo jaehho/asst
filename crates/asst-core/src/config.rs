@@ -159,6 +159,26 @@ pub fn archived_lists(text: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The window's "Run in background", for `asst autostart`: with it off, a
+/// start at login opens the window instead of the tray. A missing or
+/// unreadable file reads as the window's own default, on.
+pub fn background_in_window() -> bool {
+    std::fs::read_to_string(window_path()).map_or(true, |text| background_on(&text))
+}
+
+/// The `background` key of `window.toml`, on when absent.
+pub fn background_on(text: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Window {
+        #[serde(default = "on")]
+        background: bool,
+    }
+    fn on() -> bool {
+        true
+    }
+    toml::from_str::<Window>(text).map_or(true, |w| w.background)
+}
+
 /// systemd's StateDirectory= when run as the service, else the XDG path.
 pub fn state_dir() -> PathBuf {
     std::env::var_os("STATE_DIRECTORY")
@@ -286,6 +306,16 @@ mod tests {
         // A file that does not parse puts nothing away, and nothing fails
         assert!(archived_lists("archived = [").is_empty());
         assert!(archived_lists("archived = 3\n").is_empty());
+    }
+
+    #[test]
+    fn the_windows_background_is_on_unless_it_says_off() {
+        assert!(!background_on("width = 1080\nbackground = false\n"));
+        assert!(background_on("background = true\n"));
+        assert!(background_on(""));
+        assert!(background_on("width = 1080\n"));
+        // As the window reads a file it cannot parse: its defaults
+        assert!(background_on("background = ["));
     }
 
     #[test]

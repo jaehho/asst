@@ -5094,6 +5094,9 @@ fn digit_index(key: gdk::Key) -> Option<usize> {
 fn chord(key: gdk::Key, state: gdk::ModifierType) -> Option<Key> {
     if state.contains(gdk::ModifierType::CONTROL_MASK) {
         return match key {
+            // GDK reports the shifted keyval, `question`, with Shift held
+            // where the layout needs it; `?` alone is typed in a field.
+            gdk::Key::question => Some(Key::Shortcuts),
             gdk::Key::f => Some(Key::Find),
             gdk::Key::i => Some(Key::Go(Nav0::Inbox)),
             gdk::Key::t => Some(Key::Go(Nav0::Today)),
@@ -5316,6 +5319,25 @@ mod tests {
             vim_key(K::braceright),
             Some(Key::Step(Walk::Lists, 1))
         ));
+    }
+
+    #[test]
+    fn ctrl_question_shows_the_shortcuts_from_a_field_too() {
+        use gdk::Key as K;
+        let (ctrl, shift) = (
+            gdk::ModifierType::CONTROL_MASK,
+            gdk::ModifierType::SHIFT_MASK,
+        );
+        // `?` is Shift+/ on most layouts, and GDK reports `question` with
+        // Shift still in the state; the chord takes it either way.
+        for state in [ctrl, ctrl | shift] {
+            assert!(matches!(chord(K::question, state), Some(Key::Shortcuts)));
+        }
+        // `?` and F1 alone stay the task column's: in a field `?` is typed.
+        assert!(chord(K::question, shift).is_none());
+        assert!(chord(K::F1, gdk::ModifierType::empty()).is_none());
+        assert!(matches!(vim_key(K::question), Some(Key::Shortcuts)));
+        assert!(matches!(vim_key(K::F1), Some(Key::Shortcuts)));
     }
 
     #[test]

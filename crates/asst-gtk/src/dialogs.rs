@@ -367,7 +367,7 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
                 ("New list", "p"),
                 ("Sync now", "s"),
                 ("Preferences", "<Control>comma"),
-                ("Keyboard shortcuts", "question"),
+                ("Keyboard shortcuts", "<Control>question question"),
                 ("Close the window", "<Control>w"),
                 ("Quit", "<Control>q"),
             ],

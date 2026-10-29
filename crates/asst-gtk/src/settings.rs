@@ -8,14 +8,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use asst_core::api::{Settings, SettingsChange, StatusView, SyncState};
+use asst_core::autostart;
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk::{self, gio, glib};
 
 use crate::model;
+use crate::pickers;
 use crate::prefs::{PrefPatch, Prefs};
 use crate::window::{Msg, Tx};
-use crate::{autostart, pickers};
 
 pub struct Ctx {
     /// The daemon's settings as just fetched, else the window's last copy;

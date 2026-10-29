@@ -1,4 +1,5 @@
 pub mod api;
+pub mod autostart;
 pub mod caldav;
 pub mod config;
 pub mod fmt;

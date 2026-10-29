@@ -1,7 +1,7 @@
 # asst: CalDAV tasks. asstd syncs and reminds; asst, the bar, the window and
 # quick add all talk to it.
 
-.PHONY: help dev daemon window quick-add test test-live nextcloud-test lint fmt build install uninstall package srcinfo clean
+.PHONY: help run dev daemon window quick-add test test-live nextcloud-test lint fmt build install uninstall package srcinfo clean
 
 PREFIX  ?= $(HOME)/.local
 DATADIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)
@@ -11,14 +11,20 @@ DBUSDIR ?= $(DATADIR)/dbus-1/services
 help:            ## this list
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | expand -t18
 
-dev:             ## an isolated asst on a private bus and a local Radicale (scripts/dev up, then window)
+# The real asstd, config and lists are never touched: scripts/dev keeps its
+# own in ~/.cache/asst-dev/<ASST_DEV_NAME, else gui>. The window opens
+# unfocused on the Hyprland workspace asstdev. scripts/dev down stops this
+# instance; the Radicale all instances share stops only with down --all.
+run:             ## the window cut off from the real asst, unfocused on the asstdev workspace: a private bus, a dev asstd and a local Radicale (scripts/dev up, then window)
 	scripts/dev up
 	scripts/dev window
+
+dev: run         ## the same as run
 
 daemon:          ## asstd in the foreground (stop the service first)
 	cargo run -p asstd
 
-window:          ## the window, from the source tree
+window:          ## the window from the source tree, against the real asstd and lists
 	cargo run -p asst-gtk
 
 quick-add:       ## the quick-add popup, from the source tree

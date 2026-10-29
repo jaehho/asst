@@ -223,6 +223,18 @@ enum Cmd {
     },
     /// A waybar module: prints a JSON line whenever tasks change
     Bar,
+    /// Start asst in the tray at login (per user); no argument shows the setting
+    Autostart {
+        #[arg(value_enum)]
+        state: Option<OnOff>,
+    },
+}
+
+/// `asst autostart`'s two words.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -351,6 +363,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     if let Some(Cmd::Track { cmd }) = cli.command {
         return track_run(cmd, cli.json);
+    }
+    if let Some(Cmd::Autostart { state }) = cli.command {
+        return autostart_run(state, cli.json);
     }
     let conn = zbus::Connection::session()
         .await
@@ -1009,6 +1024,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Bar => unreachable!("handled above"),
         Cmd::Track { .. } => unreachable!("handled above"),
+        Cmd::Autostart { .. } => unreachable!("handled above"),
     }
     Ok(())
 }
@@ -1061,6 +1077,62 @@ fn print_status(style: &Style, s: &StatusView) {
             if s.pending == 1 { "" } else { "s" }
         );
     }
+}
+
+/// `asst autostart`: the entry Preferences' Start at login writes, with no
+/// daemon. A compositor line that starts asst counts as on and is reported,
+/// never edited; `on` writes no entry beside it, as Preferences shows no
+/// switch then.
+fn autostart_run(state: Option<OnOff>, as_json: bool) -> anyhow::Result<()> {
+    use asst_core::autostart;
+    let compositor = autostart::started_by_compositor();
+    let change = match state {
+        Some(OnOff::On) => compositor.is_none().then_some(true),
+        Some(OnOff::Off) => Some(false),
+        None => None,
+    };
+    if let Some(on) = change {
+        autostart::set(on)
+            .with_context(|| format!("changing {}", autostart::tilde(&autostart::entry())))?;
+    }
+    let entry = autostart::entry_is_on().then(autostart::entry);
+    let on = compositor.is_some() || entry.is_some();
+    if as_json {
+        let path = |p: &std::path::Path| p.display().to_string();
+        let v = serde_json::json!({
+            "on": on,
+            "entry": entry.as_deref().map(path),
+            "compositor": compositor.as_deref().map(path),
+        });
+        if Style::detect().is_terminal() {
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        } else {
+            println!("{v}");
+        }
+        return Ok(());
+    }
+    println!("Start at login: {}", if on { "on" } else { "off" });
+    if let Some(config) = &compositor {
+        let config = autostart::tilde(config);
+        if state == Some(OnOff::Off) {
+            println!("Still started by {config}; remove that line to stop it.");
+        } else {
+            println!("Started by {config}");
+        }
+    } else if on && !autostart::session_reads_autostart() {
+        println!(
+            "This session may not run autostart entries: start `{}` from its config.",
+            autostart::COMMAND
+        );
+    }
+    // Preferences greys its switch out in this state; here the entry is
+    // the person's call, but they hear what it will do.
+    if on && !asst_core::config::background_in_window() {
+        println!(
+            "“Run in background” is off in Preferences, so the window opens at login, not the tray."
+        );
+    }
+    Ok(())
 }
 
 /// `asst track` talks to aw-server and SQLite directly: a batch tool, not
