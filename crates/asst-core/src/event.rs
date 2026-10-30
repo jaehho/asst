@@ -15,7 +15,7 @@ use crate::time::{When, parse_duration, resolve};
 
 /// One occurrence on a day, as the window draws it. Times are epoch
 /// milliseconds, unclipped: an event from yesterday starts yesterday.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EventView {
     pub href: String,
     pub calendar: String,
