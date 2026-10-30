@@ -612,7 +612,12 @@ impl GitHub {
             .map_err(|e| RemoteError::Protocol(e.to_string()))?;
         #[cfg(any(test, feature = "testing"))]
         if let Some(limit) = self.timeout {
-            return tokio::time::timeout(limit, caldav::send(req))
+            // Built before the clock starts: reading the system certificates
+            // can use up a short limit on a busy machine, and then no request
+            // is ever sent (#30).
+            let client = caldav::https_client()?;
+            let sent = caldav::send_on(&client, req, caldav::USER_AGENT_VALUE);
+            return tokio::time::timeout(limit, sent)
                 .await
                 .map_err(|_| RemoteError::Network("timed out".into()))?;
         }
@@ -1552,13 +1557,16 @@ mod repo_tests {
         fake.reply("GET", "/repositories/1379104005", Reply::hang());
         let gh = GitHub::with_base("tok", &fake.base())
             .unwrap()
-            .with_timeout(Duration::from_millis(150));
+            .with_timeout(Duration::from_secs(1));
         let err = gh.repo(Target::Id(LAB_ID), None).await.unwrap_err();
         assert!(
             matches!(&err, RemoteError::Network(m) if m == "timed out"),
             "{err:?}"
         );
-        assert_eq!(fake.count("/repositories/1379104005"), 1);
+        let listed = fake
+            .count_within("/repositories/1379104005", 1, Duration::from_secs(10))
+            .await;
+        assert_eq!(listed, 1);
     }
 
     #[test]
