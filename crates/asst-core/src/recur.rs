@@ -1,8 +1,9 @@
-//! Recurrence: where a repeating task goes when it is completed.
+//! Recurrence: where a repeating task goes when it is completed, and when
+//! a repeating event falls.
 
 use chrono::{DateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use rrule::{RRule, Unvalidated};
+use rrule::{RRule, RRuleSet, Unvalidated};
 
 use crate::time::{When, resolve, resolve_tzid};
 
@@ -21,6 +22,37 @@ pub fn next(
     after: DateTime<Utc>,
     local: Tz,
 ) -> Result<Option<When>, String> {
+    let (set, zone) = series(rule, anchor, local)?;
+    Ok(set
+        .into_iter()
+        .take(100_000)
+        .map(|occurrence| occurrence.with_timezone(&Utc))
+        .find(|at| *at > after)
+        .map(|at| anchor.with_instant(at, zone)))
+}
+
+/// Every occurrence from `from` up to but not including `to`, for a series
+/// anchored at `anchor`, in the same form as the anchor.
+pub fn between(
+    rule: &str,
+    anchor: &When,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    local: Tz,
+) -> Result<Vec<When>, String> {
+    let (set, zone) = series(rule, anchor, local)?;
+    Ok(set
+        .into_iter()
+        .take(100_000)
+        .map(|occurrence| occurrence.with_timezone(&Utc))
+        .skip_while(|at| *at < from)
+        .take_while(|at| *at < to)
+        .map(|at| anchor.with_instant(at, zone))
+        .collect())
+}
+
+/// The rule built on its anchor, and the zone its occurrences keep.
+fn series(rule: &str, anchor: &When, local: Tz) -> Result<(RRuleSet, Tz), String> {
     let zone = match anchor {
         When::Utc { .. } => Tz::UTC,
         When::Zoned { tzid, .. } => resolve_tzid(tzid).unwrap_or(local),
@@ -35,13 +67,7 @@ pub fn next(
         .parse()
         .map_err(|e: rrule::RRuleError| e.to_string())?;
     let set = parsed.build(start).map_err(|e| e.to_string())?;
-
-    Ok(set
-        .into_iter()
-        .take(100_000)
-        .map(|occurrence| occurrence.with_timezone(&Utc))
-        .find(|at| *at > after)
-        .map(|at| anchor.with_instant(at, zone)))
+    Ok((set, zone))
 }
 
 /// The rule with `n` fewer occurrences left, when it counts them.

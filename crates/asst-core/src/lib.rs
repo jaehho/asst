@@ -2,6 +2,7 @@ pub mod api;
 pub mod autostart;
 pub mod caldav;
 pub mod config;
+pub mod event;
 pub mod fmt;
 pub mod github;
 pub mod ical;

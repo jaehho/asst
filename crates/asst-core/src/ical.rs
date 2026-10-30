@@ -139,6 +139,14 @@ impl Ical {
             .components_mut()
             .find(|c| c.is("VTODO") && c.property("RECURRENCE-ID").is_none())
     }
+
+    /// The first VEVENT that is not an override of one occurrence: the
+    /// event, or the series.
+    pub fn event(&self) -> Option<&Component> {
+        self.calendar()?
+            .components()
+            .find(|c| c.is("VEVENT") && c.property("RECURRENCE-ID").is_none())
+    }
 }
 
 impl fmt::Display for Ical {

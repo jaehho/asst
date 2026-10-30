@@ -1,7 +1,8 @@
 //! The SQLite cache: lists and tasks as last seen on the server, plus the
 //! edits not yet sent. Every task keeps three things: `base` (the server's
 //! copy), `edits` (what asst changed since), and `ics` (the two combined,
-//! which is what gets shown and sent).
+//! which is what gets shown and sent). Events are read-only: one copy, the
+//! server's, kept as it came.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 
 use crate::caldav::RemoteList;
+use crate::event::{Event, EventView};
 use crate::github::Pair;
 use crate::ical::Ical;
 use crate::task::{self, Edit, EditError, Task};
@@ -281,6 +283,23 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 CREATE INDEX IF NOT EXISTS blocks_task ON blocks(task_uid);
 CREATE INDEX IF NOT EXISTS blocks_start ON blocks(start);
+CREATE TABLE IF NOT EXISTS calendars (
+  href TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  color TEXT,
+  sort INTEGER,
+  sync_token TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+  href TEXT PRIMARY KEY,
+  calendar TEXT NOT NULL REFERENCES calendars(href) ON DELETE CASCADE,
+  etag TEXT NOT NULL,
+  ics TEXT NOT NULL,
+  start_at INTEGER NOT NULL,
+  end_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS events_calendar ON events(calendar);
+CREATE INDEX IF NOT EXISTS events_start ON events(start_at);
 ";
 
 /// The columns a link gained for the repo's identity, in the order they
@@ -648,6 +667,170 @@ impl Store {
         write_derived(&tx, href, &task, self.zone)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    // -- events: read-only, the server's copy and nothing else ---------------
+
+    pub fn calendars(&self) -> Result<Vec<ListRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT href, name, color, sort, sync_token FROM calendars ORDER BY sort IS NULL, sort, name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ListRow {
+                href: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                order: r.get(3)?,
+                writable: false,
+                sync_token: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// `apply_lists` for calendars: the ones whose token moved, and whether
+    /// any appeared, went, or changed its name or color. A calendar gone from
+    /// the server takes its events.
+    pub fn apply_calendars(&mut self, remote: &[RemoteList]) -> Result<(Vec<ListRow>, bool)> {
+        let known = self.calendars()?;
+        let tx = self.conn.transaction()?;
+        let mut changed = false;
+        for c in remote {
+            changed |= !known
+                .iter()
+                .any(|k| k.href == c.href && k.name == c.name && k.color == c.color);
+            tx.execute(
+                "INSERT INTO calendars(href, name, color, sort) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(href) DO UPDATE SET name = excluded.name, color = excluded.color,
+                   sort = excluded.sort",
+                params![c.href, c.name, c.color, c.order],
+            )?;
+        }
+        for k in known
+            .iter()
+            .filter(|k| !remote.iter().any(|c| c.href == k.href))
+        {
+            tx.execute("DELETE FROM calendars WHERE href = ?1", [&k.href])?;
+            changed = true;
+        }
+        tx.commit()?;
+        let stale = self
+            .calendars()?
+            .into_iter()
+            .filter(|k| {
+                let server = remote
+                    .iter()
+                    .find(|c| c.href == k.href)
+                    .and_then(|c| c.sync_token.as_ref());
+                k.sync_token.is_none() || server.is_none() || server != k.sync_token.as_ref()
+            })
+            .collect();
+        Ok((stale, changed))
+    }
+
+    pub fn set_calendar_token(&self, calendar: &str, token: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE calendars SET sync_token = ?2 WHERE href = ?1",
+            params![calendar, token],
+        )?;
+        Ok(())
+    }
+
+    /// href → etag for the events of a calendar.
+    pub fn event_etags(&self, calendar: &str) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT href, etag FROM events WHERE calendar = ?1")?;
+        let rows = stmt.query_map([calendar], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Store the server's copy of a resource as it came. Returns false, and
+    /// keeps nothing, when it holds no event a day can show (a VTODO in a
+    /// collection of both). The times are kept only to find a day's events;
+    /// `end_at` is absent for a series.
+    pub fn put_event(&self, calendar: &str, href: &str, etag: &str, data: &str) -> Result<bool> {
+        let Some(event) = Event::from_ical(&Ical::parse(data)) else {
+            self.forget_event(href)?;
+            return Ok(false);
+        };
+        let (start_at, end_at) = event.bounds(self.zone);
+        self.conn.execute(
+            "INSERT INTO events(href, calendar, etag, ics, start_at, end_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(href) DO UPDATE SET calendar = excluded.calendar, etag = excluded.etag,
+               ics = excluded.ics, start_at = excluded.start_at, end_at = excluded.end_at",
+            params![href, calendar, etag, data, start_at, end_at],
+        )?;
+        Ok(true)
+    }
+
+    pub fn forget_event(&self, href: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM events WHERE href = ?1", [href])?;
+        Ok(())
+    }
+
+    /// The server's copy of an event, as it came.
+    pub fn event_ics(&self, href: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT ics FROM events WHERE href = ?1", [href], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// What is on a local day: all-day events first, then by start, one
+    /// entry per occurrence.
+    pub fn events_on(&self, day: NaiveDate) -> Result<Vec<EventView>> {
+        // A day of margin: the stored times of a date or a floating time
+        // were worked out in the zone of that moment. `Event::on` decides.
+        let start = crate::time::resolve(self.zone, day.and_time(chrono::NaiveTime::MIN));
+        let from = (start - chrono::Duration::days(2)).timestamp_millis();
+        let to = (start + chrono::Duration::days(3)).timestamp_millis();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.href, e.ics, c.href, c.name, c.color FROM events e
+             JOIN calendars c ON c.href = e.calendar
+             WHERE e.start_at < ?2 AND (e.end_at IS NULL OR e.end_at >= ?1)",
+        )?;
+        let rows = stmt.query_map(params![from, to], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                ListRow {
+                    href: r.get(2)?,
+                    name: r.get(3)?,
+                    color: r.get(4)?,
+                    order: None,
+                    writable: false,
+                    sync_token: None,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (href, ics, calendar) = row?;
+            let Some(event) = Event::from_ical(&Ical::parse(&ics)) else {
+                continue;
+            };
+            out.extend(event.on(day, self.zone).into_iter().map(|o| EventView {
+                href: href.clone(),
+                calendar: calendar.href.clone(),
+                calendar_name: calendar.name.clone(),
+                color: calendar.color.clone(),
+                summary: event.summary.clone(),
+                location: event.location.clone(),
+                all_day: o.all_day,
+                start: o.start,
+                end: o.end,
+            }));
+        }
+        out.sort_by(|a, b| {
+            (!a.all_day, a.start, &a.summary, &a.href)
+                .cmp(&(!b.all_day, b.start, &b.summary, &b.href))
+        });
+        Ok(out)
     }
 
     pub fn forget(&self, href: &str) -> Result<()> {

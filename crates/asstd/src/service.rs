@@ -47,6 +47,13 @@ impl Service {
         json(&self.daemon.blocks(r.start, r.end).map_err(failed)?)
     }
 
+    async fn events(&self, day: &str) -> fdo::Result<String> {
+        let day = day
+            .parse()
+            .map_err(|e| fdo::Error::InvalidArgs(format!("{day:?} is not a day: {e}")))?;
+        json(&self.daemon.events(day).map_err(failed)?)
+    }
+
     async fn track_ingest(&self, date: &str) -> fdo::Result<String> {
         json(&self.daemon.track_ingest(date).map_err(failed)?)
     }
