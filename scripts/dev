@@ -25,7 +25,8 @@
 #                                  labels, entries, buttons, icons, tooltips, and whether each takes input
 #                                  (default $DEV/texts.json)
 #   scripts/dev seed               deterministic fixture tasks (asst add --source dev:<key>), a finished
-#                                  list (Shipped) and an archived one (Parked)
+#                                  list (Shipped), an archived one (Parked) and a calendar of events
+#                                  (Personal), which asst only reads
 #   scripts/dev reset              wipe this instance's state, then up and seed
 #   scripts/dev down [--all]       stop this instance's window, tray, asstd and bus, found on its
 #                                  bus, so other instances keep running. --all is the broom for
@@ -157,6 +158,46 @@ print(json.dumps(slots))
     fi
   done < <(seed_list)
   place_slots <<<"$slots"
+}
+
+# A calendar of events, written straight to this instance's server the way
+# another client would, since asst only reads them: today, an overlap, a
+# series and a birthday, plus a property from the phone that must survive.
+seed_events() {
+  local base today
+  base="http://127.0.0.1:5232/$(basename "$DEV")/personal"
+  today="$(date +%Y%m%d)"
+  curl -s -o /dev/null -X MKCALENDAR -H 'Content-Type: application/xml' --data-binary \
+    '<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:A="http://apple.com/ns/ical/"><D:set><D:prop><D:displayname>Personal</D:displayname><A:calendar-color>#e5a50a</A:calendar-color><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set></D:prop></D:set></C:mkcalendar>' \
+    "$base/"
+  put_event dentist "SUMMARY:Dentist
+LOCATION:Main St 12
+X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC
+DTSTART:${today}T100000
+DTEND:${today}T110000"
+  put_event lunch "SUMMARY:Lunch with Sam
+DTSTART:${today}T120000
+DTEND:${today}T130000"
+  put_event review "SUMMARY:Design review
+DTSTART:${today}T123000
+DTEND:${today}T133000"
+  put_event sync "SUMMARY:Team sync
+DTSTART:$(date -d '14 days ago' +%Y%m%d)T150000
+DTEND:$(date -d '14 days ago' +%Y%m%d)T153000
+RRULE:FREQ=WEEKLY"
+  put_event birthday "SUMMARY:Sam's birthday
+DTSTART;VALUE=DATE:$(date -d '10 years ago' +%Y%m%d)
+DTEND;VALUE=DATE:$(date -d '10 years ago tomorrow' +%Y%m%d)
+RRULE:FREQ=YEARLY"
+}
+
+# One event, by file name and its lines: PUT over whatever a last seed left.
+put_event() {
+  { printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//asst dev seed//EN\r\nBEGIN:VEVENT\r\nUID:dev-%s\r\n' "$1"
+    sed 's/$/\r/' <<<"$2"
+    printf 'END:VEVENT\r\nEND:VCALENDAR\r\n'
+  } | curl -s -o /dev/null -X PUT -H 'Content-Type: text/calendar' --data-binary @- \
+    "http://127.0.0.1:5232/$(basename "$DEV")/personal/dev-$1.ics"
 }
 
 # Files older harness versions left in the instance dir. The live set is
@@ -435,6 +476,8 @@ CONF
     seed_lists
     seed_tasks
     archive_lists Parked
+    seed_events
+    "$BIN/asst" sync > /dev/null
     ;;
   reset)
     # Not `down --all`: Radicale and the other instances stay as they are.
