@@ -4,6 +4,10 @@
     "calls": [
       ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--list", "thesis", "--", "Send the usage figures to Alice"],
       ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--", "Send the usage figures to Alice"],
+      ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--list", "thesis", "--due", "2026-10-16", "--note", "From Vendor call, October 12, 2026.", "--", "Send the usage figures to Alice"],
+      ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--due", "2026-10-16", "--note", "From Vendor call, October 12, 2026.", "--", "Send the usage figures to Alice"],
+      ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--list", "thesis", "--note", "From Vendor call, October 12, 2026.", "--", "Send the usage figures to Alice"],
+      ["--json", "add", "--literal", "--source", "steno:20261012-100000/send the usage figures to alice", "--note", "From Vendor call, October 12, 2026.", "--", "Send the usage figures to Alice"],
       ["--json", "ls"],
       ["--json", "completed", "-n", "9999"],
       ["--json", "show", "5f3a"],
