@@ -18,8 +18,8 @@
     "reads": {
       "add.json": ["id"],
       "show.json": ["status"],
-      "ls.json": ["id", "source", "status", "list_name"],
-      "completed.json": ["id", "source", "status", "completed", "list_name"],
+      "ls.json": ["id", "source", "status", "list_name", "summary"],
+      "completed.json": ["id", "source", "status", "completed", "list_name", "summary"],
       "lists.json": ["name"]
     }
   }
