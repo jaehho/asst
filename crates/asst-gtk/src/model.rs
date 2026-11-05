@@ -1000,6 +1000,17 @@ pub struct PlanBlock {
     pub cols: usize,
 }
 
+/// A timed calendar event's place in the plan lane: its minutes on the
+/// day, clipped to it, and its overlap column among the blocks and events
+/// it shares the lane with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EventSpan {
+    pub start_min: f64,
+    pub end_min: f64,
+    pub col: usize,
+    pub cols: usize,
+}
+
 /// What the Day view draws: placed blocks, the tray, and the now-line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayPlan {
@@ -1016,6 +1027,29 @@ pub struct DayPlan {
     pub no_date: Vec<TaskView>,
     /// Minutes from midnight, only when `day` is the wall-clock today.
     pub now_min: Option<u32>,
+    /// The day's timed calendar events, in the order `beside_events` was
+    /// given them. They share the blocks' lane, so the blocks' columns are
+    /// laid out around them. Empty until `beside_events`.
+    pub events: Vec<EventSpan>,
+}
+
+impl DayPlan {
+    /// Put the day's timed events, `(start, end)` in minutes, in the
+    /// blocks' lane: one overlap layout over both, so a block at a
+    /// meeting's hour sits beside it rather than under it.
+    pub fn beside_events(&mut self, spans: &[(f64, f64)]) {
+        let cols = share_lane(&mut self.blocks, spans);
+        self.events = spans
+            .iter()
+            .zip(cols)
+            .map(|(&(start_min, end_min), (col, cols))| EventSpan {
+                start_min,
+                end_min,
+                col,
+                cols,
+            })
+            .collect();
+    }
 }
 
 /// A clock time in the app's one voice, `9am` or `5:30pm`: the hour rules,
@@ -1175,9 +1209,16 @@ pub fn scroll_keep_min(
 
 /// The block a drop of `task` at `start` for `duration` would create.
 /// `blocks` are the ones already on the grid; `task`'s own block among
-/// them is left out, so a move previews without the old home. The ghost
-/// wears the same start, duration and overlap column the drop would.
-pub fn ghost_block(blocks: &[PlanBlock], task: &TaskView, start: u32, duration: u32) -> PlanBlock {
+/// them is left out, so a move previews without the old home. `events`
+/// share the lane, so the ghost steps around them as the drop would. The
+/// ghost wears the same start, duration and overlap column the drop would.
+pub fn ghost_block(
+    blocks: &[PlanBlock],
+    events: &[EventSpan],
+    task: &TaskView,
+    start: u32,
+    duration: u32,
+) -> PlanBlock {
     let start = start.min(24 * 60 - 1);
     let duration = slot_duration(start, duration);
     let mut with: Vec<PlanBlock> = blocks
@@ -1193,7 +1234,8 @@ pub fn ghost_block(blocks: &[PlanBlock], task: &TaskView, start: u32, duration: 
         cols: 1,
     });
     with.sort_by_key(|b| (b.start, b.duration, b.task.task.uid.clone()));
-    layout(&mut with);
+    let spans: Vec<(f64, f64)> = events.iter().map(|e| (e.start_min, e.end_min)).collect();
+    share_lane(&mut with, &spans);
     with.into_iter()
         .find(|b| b.task.task.uid == task.task.uid)
         .expect("ghost is in the layout")
@@ -1304,7 +1346,8 @@ pub fn uncarry(slots: &mut Vec<PlanSlot>, carried: &Carried) {
 /// Overlaps sit side by side: each block takes the leftmost column that no
 /// overlapping block already holds, and a group of blocks linked by overlap
 /// shares one width (`cols` columns). A drop or a move only changes the
-/// slot; the layout is recomputed here every time.
+/// slot; the layout is recomputed here every time, and again by
+/// `beside_events` once the day's events are known.
 pub fn day_plan(
     open: &[TaskView],
     slots: &[PlanSlot],
@@ -1328,7 +1371,7 @@ pub fn day_plan(
         }
     }
     blocks.sort_by_key(|b| (b.start, b.duration, b.task.task.uid.clone()));
-    layout(&mut blocks);
+    share_lane(&mut blocks, &[]);
 
     let due = |t: &TaskView| t.task.due.as_ref().map(|d| d.local_date(zone));
     let unplaced = open
@@ -1356,57 +1399,44 @@ pub fn day_plan(
         now_min: (viewed == today)
             .then(|| now_on_grid(now, PLAN_HOUR_START, PLAN_HOUR_END))
             .flatten(),
+        events: Vec::new(),
     }
 }
 
-/// Greedy side-by-side columns, then each block's group width.
-fn layout(blocks: &mut [PlanBlock]) {
-    // Columns used by the blocks each one already overlaps.
-    let mut col_of: Vec<usize> = vec![0; blocks.len()];
-    for i in 0..blocks.len() {
-        let (s, e) = (blocks[i].start, blocks[i].start + blocks[i].duration);
-        let mut taken = HashSet::new();
-        for j in 0..i {
-            let (os, oe) = (blocks[j].start, blocks[j].start + blocks[j].duration);
-            if s < oe && os < e {
-                taken.insert(col_of[j]);
+/// Overlap columns for the blocks (in start order) and the event spans
+/// that share their lane, `(start, end)` in minutes. Each block's `col`
+/// and `cols` are rewritten; the events' columns come back in the order
+/// given. On a tie the event comes first, so a meeting keeps the left
+/// column and the block that starts with it goes beside it.
+fn share_lane(blocks: &mut [PlanBlock], events: &[(f64, f64)]) -> Vec<(usize, usize)> {
+    // (start, end, block index or None for an event, event index)
+    let mut spans: Vec<(f64, f64, Option<usize>, usize)> = events
+        .iter()
+        .enumerate()
+        .map(|(i, &(s, e))| (s, e, None, i))
+        .chain(blocks.iter().enumerate().map(|(i, b)| {
+            (
+                f64::from(b.start),
+                f64::from(b.start + b.duration),
+                Some(i),
+                0,
+            )
+        }))
+        .collect();
+    // Stable: blocks keep their own order, events stay ahead on a tie.
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let bounds: Vec<(f64, f64)> = spans.iter().map(|&(s, e, ..)| (s, e)).collect();
+    let mut out = vec![(0, 1); events.len()];
+    for (&(_, _, block, event), (col, cols)) in spans.iter().zip(span_columns(&bounds)) {
+        match block {
+            Some(i) => {
+                blocks[i].col = col;
+                blocks[i].cols = cols;
             }
-        }
-        let mut col = 0;
-        while taken.contains(&col) {
-            col += 1;
-        }
-        col_of[i] = col;
-    }
-    // Connected components of the overlap graph share one width.
-    let mut group = vec![usize::MAX; blocks.len()];
-    for i in 0..blocks.len() {
-        if group[i] != usize::MAX {
-            continue;
-        }
-        let mut stack = vec![i];
-        let mut members = Vec::new();
-        group[i] = i;
-        while let Some(k) = stack.pop() {
-            members.push(k);
-            let (s, e) = (blocks[k].start, blocks[k].start + blocks[k].duration);
-            for j in 0..blocks.len() {
-                if group[j] != usize::MAX {
-                    continue;
-                }
-                let (os, oe) = (blocks[j].start, blocks[j].start + blocks[j].duration);
-                if s < oe && os < e {
-                    group[j] = i;
-                    stack.push(j);
-                }
-            }
-        }
-        let cols = members.iter().map(|&m| col_of[m]).max().unwrap_or(0) + 1;
-        for m in members {
-            blocks[m].col = col_of[m];
-            blocks[m].cols = cols;
+            None => out[event] = (col, cols),
         }
     }
+    out
 }
 
 /// Overlap columns for half-open minute spans `(start, end)`, in input
@@ -1460,6 +1490,16 @@ pub fn span_columns(spans: &[(f64, f64)]) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// Left edge and width of column `col` of `cols` across `width` pixels.
+/// Edges are rounded once each, so neighbours meet without a gap or an
+/// overlap and the columns fill the width exactly.
+pub fn column_span(width: i32, col: usize, cols: usize) -> (i32, i32) {
+    let cols = cols.max(1);
+    let edge = |c: usize| (f64::from(width) * c as f64 / cols as f64).round() as i32;
+    let x = edge(col.min(cols - 1));
+    (x, edge(col.min(cols - 1) + 1) - x)
 }
 
 // -- counts -----------------------------------------------------------------
@@ -3541,14 +3581,14 @@ mod tests {
     fn ghost_at_each_hour_boundary() {
         let t = task("g", "/a/", on(date(9, 14)));
         for hour in PLAN_HOUR_START..PLAN_HOUR_END {
-            let g = ghost_block(&[], &t, hour * 60, PLAN_DEFAULT_DURATION);
+            let g = ghost_block(&[], &[], &t, hour * 60, PLAN_DEFAULT_DURATION);
             assert_eq!((g.start, g.duration, g.col, g.cols), (hour * 60, 30, 0, 1));
         }
         // The pointer path and the ghost agree at an hour.
         let z = PLAN_PX_PER_HOUR;
         let y = y_at(10.0 * 60.0, PLAN_HOUR_START, z);
         let start = minutes_at(y, PLAN_HOUR_START, z);
-        let g = ghost_block(&[], &t, start, PLAN_DEFAULT_DURATION);
+        let g = ghost_block(&[], &[], &t, start, PLAN_DEFAULT_DURATION);
         assert_eq!(g.start, 10 * 60);
     }
 
@@ -3562,25 +3602,70 @@ mod tests {
         let p = day_plan(&open, &slots, now(), date(9, 14));
         let t = task("g", "/a/", on(date(9, 14)));
         // Overlapping `a` joins its group in the free column.
-        let g = ghost_block(&p.blocks, &t, 9 * 60 + 30, 30);
+        let g = ghost_block(&p.blocks, &p.events, &t, 9 * 60 + 30, 30);
         assert_eq!(
             (g.start, g.duration, g.col, g.cols),
             (9 * 60 + 30, 30, 1, 2)
         );
         // Next to `a`, not on it: alone, full width.
-        let g = ghost_block(&p.blocks, &t, 10 * 60, 30);
+        let g = ghost_block(&p.blocks, &p.events, &t, 10 * 60, 30);
         assert_eq!((g.start, g.duration, g.col, g.cols), (10 * 60, 30, 0, 1));
         // A move: the old home is not in the layout, so the new one can
         // take column 0 even while the original still sits on the grid.
         let a = open[0].clone();
-        let g = ghost_block(&p.blocks, &a, 9 * 60 + 30, 60);
+        let g = ghost_block(&p.blocks, &p.events, &a, 9 * 60 + 30, 60);
         assert_eq!(
             (g.start, g.duration, g.col, g.cols),
             (9 * 60 + 30, 60, 0, 1)
         );
         // Durations clamp the same way a real drop would.
-        let g = ghost_block(&p.blocks, &t, 23 * 60 + 50, 30);
+        let g = ghost_block(&p.blocks, &p.events, &t, 23 * 60 + 50, 30);
         assert_eq!((g.start, g.duration), (23 * 60 + 50, 10));
+    }
+
+    #[test]
+    fn columns_fill_the_lane_without_gaps_or_overlaps() {
+        for (width, cols) in [(120, 1), (121, 2), (100, 3), (317, 7)] {
+            let spans: Vec<(i32, i32)> = (0..cols).map(|c| column_span(width, c, cols)).collect();
+            assert_eq!(spans[0].0, 0);
+            for pair in spans.windows(2) {
+                assert_eq!(pair[0].0 + pair[0].1, pair[1].0, "{width}px in {cols}");
+            }
+            let (x, w) = spans[cols - 1];
+            assert_eq!(x + w, width);
+        }
+        assert_eq!(column_span(100, 1, 2), (50, 50));
+    }
+
+    #[test]
+    fn events_share_the_plan_lane_with_the_blocks() {
+        let open = vec![
+            task("a", "/a/", on(date(9, 14))),
+            task("b", "/a/", on(date(9, 14))),
+            task("c", "/a/", on(date(9, 14))),
+        ];
+        // a starts with the 10am meeting, b sits clear of everything, c
+        // overlaps the lunch that overlaps the review.
+        let slots = vec![
+            slot("a", 10 * 60, 30),
+            slot("b", 15 * 60, 60),
+            slot("c", 13 * 60, 60),
+        ];
+        let mut p = day_plan(&open, &slots, now(), date(9, 14));
+        p.beside_events(&[(600.0, 660.0), (720.0, 780.0), (750.0, 810.0)]);
+        let events: Vec<(usize, usize)> = p.events.iter().map(|e| (e.col, e.cols)).collect();
+        // The meeting keeps the left column on a tie; lunch and review sit
+        // side by side and c takes lunch's column once lunch is over.
+        assert_eq!(events, [(0, 2), (0, 2), (1, 2)]);
+        assert_eq!(placed(&p, "a"), Some((600, 30, 1, 2)));
+        assert_eq!(placed(&p, "c"), Some((780, 60, 0, 2)));
+        assert_eq!(placed(&p, "b"), Some((900, 60, 0, 1)));
+        assert_eq!(p.events[2].start_min, 750.0);
+        // The ghost steps around the meeting the same way a drop would.
+        let g = ghost_block(&p.blocks, &p.events, &open[1], 10 * 60 + 15, 30);
+        assert_eq!((g.col, g.cols), (2, 3), "beside the meeting and a");
+        let g = ghost_block(&p.blocks, &p.events, &open[0], 10 * 60 + 15, 30);
+        assert_eq!((g.col, g.cols), (1, 2), "a moving keeps beside the meeting");
     }
 
     #[test]

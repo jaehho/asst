@@ -2838,6 +2838,16 @@ impl Window {
         });
     }
 
+    /// The plan of the day on view, its blocks laid out around the day's
+    /// timed events, which share their lane.
+    fn day_on_view(&self, open: &[TaskView], now: DateTime<Tz>) -> model::DayPlan {
+        let mut day = model::day_plan(open, &self.prefs.plan, now, self.day_day);
+        let timed =
+            crate::events::timed(self.events_on(self.day_day), self.day_day, now.timezone());
+        day.beside_events(&crate::events::spans(&timed));
+        day
+    }
+
     /// The events to draw on `day`: none while that day's are on their way.
     fn events_on(&self, day: chrono::NaiveDate) -> &[asst_core::api::EventView] {
         if self.events_day == Some(day) {
@@ -3587,7 +3597,7 @@ impl Window {
             sunday_first: self.prefs.sunday_first,
         };
         let counts = Counts::new(&data, &self.prefs.plan, now);
-        let day = model::day_plan(&open, &self.prefs.plan, now, self.day_day);
+        let day = self.day_on_view(&open, now);
         if let Some(tray) = &w.tray {
             tray.set(tray::State {
                 overdue: counts.overdue,
@@ -4029,7 +4039,7 @@ impl Window {
         };
         let now = self.now();
         let sections = model::plan(&self.nav, &data, &self.prefs.view_opts(&self.nav), now);
-        let day = model::day_plan(&open, &self.prefs.plan, now, self.day_day);
+        let day = self.day_on_view(&open, now);
         let top =
             crate::daygrid::scroll_top_minute(crate::daygrid::DayStep::Day, self.prefs.day_zoom)
                 .map(|(min, _)| min.clamp(0.0, 24.0 * 60.0) as u32);
@@ -4605,7 +4615,20 @@ impl Window {
                 if let (Some(x), Some(y)) = (it.next(), it.next())
                     && let Some(target) = w.window.pick(x, y, gtk::PickFlags::DEFAULT)
                 {
-                    eprintln!("click: {}", target.type_().name());
+                    // What the pointer lands on and the three widgets
+                    // above it, by type and style classes: which overlay
+                    // child takes a press.
+                    let mut path = Vec::new();
+                    let mut at = Some(target.clone());
+                    while let Some(w) = at.take().filter(|_| path.len() < 4) {
+                        let tip = w
+                            .tooltip_text()
+                            .map(|t| format!(" {t:?}"))
+                            .unwrap_or_default();
+                        path.push(format!("{}{:?}{tip}", w.type_().name(), w.css_classes()));
+                        at = w.parent();
+                    }
+                    eprintln!("click: {}", path.join(" < "));
                     if target.is_ancestor(&w.clamp) && on_background(&target) {
                         sender.input(Msg::CloseEditor);
                     }
