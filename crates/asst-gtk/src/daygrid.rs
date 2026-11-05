@@ -532,6 +532,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The day scroller's page height when it last laid out: what the next
+    /// one, built for a rebuild of the same window, will get.
+    static PAGE: Cell<f64> = const { Cell::new(0.0) };
+}
+
 fn scroll_slot(step: DayStep) -> (f64, Option<NaiveDate>) {
     SCROLL.with(|s| {
         s.borrow()
@@ -911,46 +917,54 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
         fresh_view,
         px_per_hour: px,
     } = rest;
-    let recenter = fresh_view || scroll_slot(step).1 != Some(day);
-    let placed = std::rc::Rc::new(std::cell::Cell::new(false));
-    let place = {
-        let (scroll, placed) = (scroll.clone(), placed.clone());
-        move || {
-            if placed.get() {
-                return;
-            }
-            let vadj = scroll.vadjustment();
-            let view_h = vadj.page_size();
-            // A recenter needs the real page; restoring does too, so
-            // that the value lands in the same coordinate space.
-            if view_h <= 0.0 {
-                return;
-            }
-            let y = if recenter && day == today {
-                now_min.map_or(0.0, |m| {
-                    scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
-                })
-            } else if recenter {
-                let top = model::day_rest_min(first_min);
-                model::scroll_keep_min(top, HOUR_START, HOUR_END, view_h, 0.0, px)
-            } else {
-                let kept = scroll_slot(step).0;
-                if kept.is_finite() { kept } else { 0.0 }
-            };
-            vadj.set_value(y);
-            scroll_set(step, y, Some(day));
-            placed.set(true);
+    let (kept, kept_day) = scroll_slot(step);
+    let recenter = fresh_view || kept_day != Some(day);
+    // Where the scroller rests in a viewport `view_h` tall.
+    let rest_y = move |view_h: f64| {
+        if recenter && day == today {
+            now_min.map_or(0.0, |m| {
+                scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
+            })
+        } else if recenter {
+            let top = model::day_rest_min(first_min);
+            model::scroll_keep_min(top, HOUR_START, HOUR_END, view_h, 0.0, px)
+        } else if kept.is_finite() {
+            kept
+        } else {
+            0.0
         }
     };
-    {
-        let place = place.clone();
-        scroll.vadjustment().connect_upper_notify(move |_| place());
+    let vadj = scroll.vadjustment();
+    // The viewport draws the grid at whatever value the adjustment holds
+    // when it first lays out, so the value goes in now, against the page
+    // the last scroller had. Set later, from a notify the viewport sends
+    // during that layout, it moved the scrollbar but not the grid: GTK
+    // drops a re-layout asked for mid-layout, so the grid sat at the top
+    // until the next scroll jumped it to the kept place.
+    let page = PAGE.with(Cell::get);
+    if page > 0.0 {
+        let y = rest_y(page);
+        // Upper first, or the value is clamped to an empty scroller's 0.
+        vadj.set_upper(model::grid_height(HOUR_START, HOUR_END, px).max(y + page));
+        vadj.set_value(y);
+        scroll_set(step, y, Some(day));
+    } else {
+        // No day scroller has been laid out yet: take this one's page,
+        // then move once its layout is over, so the move is laid out too.
+        let placed = Rc::new(Cell::new(false));
+        vadj.connect_page_size_notify(move |a| {
+            if placed.get() || a.page_size() <= 0.0 {
+                return;
+            }
+            placed.set(true);
+            let (a, y) = (a.clone(), rest_y(a.page_size()));
+            glib::idle_add_local_once(move || {
+                a.set_value(y);
+                scroll_set(step, y, Some(day));
+            });
+        });
     }
-    {
-        let place = place.clone();
-        scroll.connect_map(move |_| place());
-    }
-    glib::idle_add_local_once(place);
+    vadj.connect_page_size_notify(|a| PAGE.with(|p| p.set(a.page_size())));
     scroll.vadjustment().connect_value_changed(move |a| {
         scroll_set(step, a.value(), Some(day));
     });
