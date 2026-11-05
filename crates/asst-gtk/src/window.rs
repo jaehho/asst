@@ -4708,6 +4708,18 @@ impl Window {
                 }
             }
             // Scroll what the open dialog (or else the view) shows to a place.
+            // The Day scroller: `dayscroll Y` scrolls it to Y; either way it
+            // prints the adjustment next to where the grid is drawn, which
+            // differ when a value never reached the layout.
+            "dayscroll" => {
+                if let Ok(y) = arg.trim().parse::<f64>() {
+                    crate::daygrid::scroll_day_to(y);
+                }
+                match crate::daygrid::scroll_probe() {
+                    Some(p) => eprintln!("dayscroll: {p}"),
+                    None => eprintln!("dayscroll: no day grid"),
+                }
+            }
             "scroll" => {
                 let root: gtk::Widget = w
                     .window

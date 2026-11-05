@@ -636,6 +636,33 @@ pub fn viewport() -> Option<(i32, f64, f64)> {
     Some((scroll.height(), vadj.page_size(), vadj.upper()))
 }
 
+/// Scroll the day grid on view to `y`, as a wheel would.
+pub fn scroll_day_to(y: f64) {
+    if let Some(scroll) = live_now().and_then(|l| l.scroll.upgrade()) {
+        scroll.vadjustment().set_value(y);
+    }
+}
+
+/// The day scroller's value, upper and page, the y it keeps for a rebuild,
+/// and how far up the grid is drawn: `-drawn` equals `value` when the
+/// layout has caught up with the adjustment.
+pub fn scroll_probe() -> Option<String> {
+    let scroll = live_now()?.scroll.upgrade()?;
+    let vadj = scroll.vadjustment();
+    let grid = scroll.child()?.first_child()?;
+    let drawn = grid
+        .compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
+        .map_or(f32::NAN, |p| p.y());
+    Some(format!(
+        "value {:.0} upper {:.0} page {:.0} kept {:.0} drawn {:.0}",
+        vadj.value(),
+        vadj.upper(),
+        vadj.page_size(),
+        scroll_slot(DayStep::Day).0,
+        drawn
+    ))
+}
+
 /// Minutes from midnight on `now`'s own day, seconds as a fraction.
 pub fn now_minutes(now: chrono::DateTime<Tz>) -> f64 {
     f64::from(now.time().hour()) * 60.0
