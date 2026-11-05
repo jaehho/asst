@@ -1,50 +1,39 @@
 //! Calendar events on the Day view: all-day chips above the grid, timed ones
-//! as fixed blocks in a lane of their own beside the plan. They are the
-//! server's, so there is nothing to drag, resize or open here.
+//! as fixed blocks in the plan's lane, beside any block at the same hour.
+//! They are the server's, so there is nothing to drag, resize or open here.
 
 use asst_core::api::EventView;
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use relm4::gtk::{self, prelude::*};
 
-use crate::model::{clock_label, span_columns};
+use crate::model::{EventSpan, clock_label};
 use crate::{daygrid, ui};
 
-/// A timed event, clipped to the day on view, with its overlap column.
+/// A timed event, clipped to the day on view.
 pub struct Timed<'a> {
     pub event: &'a EventView,
     pub start_min: f64,
     pub end_min: f64,
-    col: usize,
-    cols: usize,
 }
 
-/// Timed events on the grid, and where each sits. An event that runs on past
+/// Timed events on the grid, in the order given. An event that runs on past
 /// midnight is clipped to `day` (`minutes_from_midnight`).
 pub fn timed(events: &[EventView], day: NaiveDate, zone: Tz) -> Vec<Timed<'_>> {
-    let spans: Vec<(&EventView, f64, f64)> = events
+    events
         .iter()
         .filter(|e| !e.all_day)
-        .map(|e| {
-            (
-                e,
-                daygrid::minutes_from_midnight(e.start, day, zone),
-                daygrid::minutes_from_midnight(e.end, day, zone),
-            )
-        })
-        .collect();
-    let boxes: Vec<(f64, f64)> = spans.iter().map(|(_, s, e)| (*s, *e)).collect();
-    spans
-        .iter()
-        .zip(span_columns(&boxes))
-        .map(|((event, start_min, end_min), (col, cols))| Timed {
+        .map(|event| Timed {
             event,
-            start_min: *start_min,
-            end_min: *end_min,
-            col,
-            cols,
+            start_min: daygrid::minutes_from_midnight(event.start, day, zone),
+            end_min: daygrid::minutes_from_midnight(event.end, day, zone),
         })
         .collect()
+}
+
+/// The spans `DayPlan::beside_events` lays out with the blocks.
+pub fn spans(events: &[Timed<'_>]) -> Vec<(f64, f64)> {
+    events.iter().map(|e| (e.start_min, e.end_min)).collect()
 }
 
 /// The words a chip's second line and tooltip share.
@@ -67,8 +56,17 @@ fn tinted(widget: &impl IsA<gtk::Widget>, event: &EventView) {
     }
 }
 
-pub fn fill_lane(events: &[Timed<'_>], overlay: &gtk::Overlay, reflow: &daygrid::Reflow) {
-    for e in events {
+/// The timed events on the plan's lane, each in the column `places` gives
+/// it (`DayPlan::events`, laid out from these same events in this order).
+pub fn fill_lane(
+    events: &[Timed<'_>],
+    places: &[EventSpan],
+    overlay: &gtk::Overlay,
+    columns: &daygrid::Columns,
+    reflow: &daygrid::Reflow,
+) {
+    debug_assert_eq!(events.len(), places.len(), "one place per event");
+    for (e, place) in events.iter().zip(places) {
         let chip = gtk::Box::new(gtk::Orientation::Vertical, 0);
         chip.add_css_class("event-block");
         tinted(&chip, e.event);
@@ -92,27 +90,13 @@ pub fn fill_lane(events: &[Timed<'_>], overlay: &gtk::Overlay, reflow: &daygrid:
         meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&meta);
 
-        // Spacers put the chip in its overlap column. Homogeneous, or a long
-        // title would widen its column over the next.
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row.set_hexpand(true);
-        row.set_homogeneous(true);
-        for c in 0..e.cols.max(1) {
-            if c == e.col {
-                row.append(&chip);
-            } else {
-                let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-                spacer.set_hexpand(true);
-                row.append(&spacer);
-            }
-        }
-
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
         wrap.set_hexpand(true);
-        wrap.append(&row);
+        wrap.append(&chip);
         overlay.add_overlay(&wrap);
+        columns.set(&wrap, place.col, place.cols);
         let span = daygrid::Span {
             start_min: e.start_min,
             end_min: e.end_min,
@@ -186,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_events_are_clipped_to_the_day_and_share_width_when_they_overlap() {
+    fn timed_events_are_clipped_to_the_day() {
         let day = NaiveDate::from_ymd_opt(2026, 9, 14).unwrap();
         let events = [
             event(true, 0, 24),
@@ -195,17 +179,9 @@ mod tests {
             event(false, 23, 26),
         ];
         let timed = timed(&events, day, ny());
-        let at: Vec<(f64, f64, usize, usize)> = timed
-            .iter()
-            .map(|t| (t.start_min, t.end_min, t.col, t.cols))
-            .collect();
         assert_eq!(
-            at,
-            [
-                (540.0, 600.0, 0, 2),
-                (540.0, 660.0, 1, 2),
-                (1380.0, 1440.0, 0, 1),
-            ]
+            spans(&timed),
+            [(540.0, 600.0), (540.0, 660.0), (1380.0, 1440.0)]
         );
     }
 

@@ -147,13 +147,66 @@ fn center_at(grid: &gtk::Overlay, child: &gtk::Widget, y: f64, nominal: f64) {
 }
 
 /// Two content lanes on one time axis: tracked time on the left, the plan
-/// on the right. Each is its own Overlay so chips and blocks stack only
-/// within their half.
+/// and the day's calendar events on the right. Each is its own Overlay so
+/// chips and blocks stack only within their half.
 pub struct Lanes {
     pub time: gtk::Overlay,
-    /// Beside the plan, on a day with timed events.
-    pub events: Option<gtk::Overlay>,
     pub plan: gtk::Overlay,
+}
+
+/// Overlap columns in a lane. Each child set here gets its column's share
+/// of the lane's width whenever the lane lays out, so a chip beside another
+/// is as wide as its column and takes the pointer only there. A full-width
+/// child padded with spacers took it across the lane, over the chip beside
+/// it, whose hover and press went nowhere. Nothing here asks for a size,
+/// so the lane still narrows with the window.
+#[derive(Clone, Default)]
+pub struct Columns(Rc<RefCell<Vec<Column>>>);
+
+/// A lane child and its `col` of `cols`.
+type Column = (glib::WeakRef<gtk::Widget>, usize, usize);
+
+impl Columns {
+    /// Place `lane`'s children that are given a column; the rest keep the
+    /// overlay's own placement.
+    pub fn on(lane: &gtk::Overlay) -> Self {
+        let columns = Self::default();
+        let placed = columns.clone();
+        lane.connect_get_child_position(move |lane, child| {
+            let (col, cols) = placed.of(child)?;
+            let (min, nat) = child.preferred_size();
+            let (x, width) = model::column_span(lane.width(), col, cols);
+            // The overlay's own rule for a top-aligned child: its natural
+            // height, at least its minimum; the top margin sets its time.
+            let height = min.height().max(lane.height().min(nat.height()));
+            Some(gtk::gdk::Rectangle::new(
+                x,
+                0,
+                width.max(min.width()),
+                height,
+            ))
+        });
+        columns
+    }
+
+    /// Put `child`, an overlay child of the lane, in `col` of `cols`.
+    pub fn set(&self, child: &impl IsA<gtk::Widget>, col: usize, cols: usize) {
+        let child = child.upcast_ref::<gtk::Widget>();
+        {
+            let mut all = self.0.borrow_mut();
+            all.retain(|(w, ..)| w.upgrade().is_some_and(|w| &w != child));
+            all.push((child.downgrade(), col, cols));
+        }
+        child.queue_resize();
+    }
+
+    fn of(&self, child: &gtk::Widget) -> Option<(usize, usize)> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|(w, ..)| w.upgrade().as_ref() == Some(child))
+            .map(|&(_, col, cols)| (col, cols))
+    }
 }
 
 /// A chip on the grid, remembered so a zoom can move it without rebuilding
@@ -384,7 +437,6 @@ pub fn day_grid(
     now: chrono::DateTime<Tz>,
     px_per_hour: f64,
     reflow: &Reflow,
-    with_events: bool,
     content: impl FnOnce(&Lanes),
 ) -> gtk::Widget {
     reflow.apply(px_per_hour);
@@ -393,20 +445,16 @@ pub fn day_grid(
     // the now-line share one extent.
     let rules = rules(reflow.px(), reflow);
 
-    // Time on the left, plan on the right: one axis, two lanes, and events
-    // in a third between them on a day that has any.
+    // Time on the left, the plan and the day's events on the right: one
+    // axis, two lanes.
     let lanes = Lanes {
         time: lane(),
-        events: with_events.then(lane),
         plan: lane(),
     };
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("day-lanes");
     row.set_hexpand(true);
     row.append(&lanes.time);
-    if let Some(events) = &lanes.events {
-        row.append(events);
-    }
     row.append(&lanes.plan);
     content(&lanes);
 

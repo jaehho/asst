@@ -637,6 +637,7 @@ mod tests {
             tray: vec![task("cc33", "Call bank")],
             no_date: vec![task("dd44", "Gym")],
             now_min: Some(10 * 60),
+            events: Vec::new(),
         };
         let d = build_dump(
             &Nav::Today,
@@ -697,6 +698,7 @@ mod tests {
             tray: vec![task("cc33", "Call bank")],
             no_date: vec![task("dd44", "Gym")],
             now_min: None,
+            events: Vec::new(),
         };
         let d = build_dump(
             &Nav::Day,
@@ -746,6 +748,7 @@ mod tests {
             tray: Vec::new(),
             no_date: Vec::new(),
             now_min: None,
+            events: Vec::new(),
         };
         let d = build_dump(
             &Nav::Today,

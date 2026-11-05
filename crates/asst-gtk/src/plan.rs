@@ -108,21 +108,14 @@ fn block_chip(
     }
 }
 
-/// Equal-expand spacers put `chip` in `col` of `cols` across the grid.
-fn block_row(chip: &gtk::Box, col: usize, cols: usize) -> gtk::Box {
+/// The row a block's chip fills. The lane's `Columns` set its width, so the
+/// chip takes all of it.
+fn block_row(chip: &gtk::Box) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("plan-block-row");
     row.set_hexpand(true);
-    let cols = cols.max(1);
-    for i in 0..cols {
-        if i == col {
-            row.append(chip);
-        } else {
-            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            spacer.set_hexpand(true);
-            row.append(&spacer);
-        }
-    }
+    chip.set_hexpand(true);
+    row.append(chip);
     row
 }
 
@@ -243,7 +236,7 @@ fn block_widget(
     wrap.set_widget_name(&b.task.href);
     wrap.set_focusable(true);
     wrap.add_css_class("plan-block-focus");
-    wrap.append(&block_row(&chip, b.col, b.cols));
+    wrap.append(&block_row(&chip));
     (wrap.upcast(), chip, meta)
 }
 
@@ -372,6 +365,10 @@ struct Ghost {
     wrap: gtk::Box,
     /// Blocks on the grid when this column was built, for overlap columns.
     blocks: Vec<PlanBlock>,
+    /// The day's events in the same lane, which the ghost steps around too.
+    events: Vec<model::EventSpan>,
+    /// The lane's columns, which give the ghost its width and place.
+    columns: daygrid::Columns,
     /// Tray and placed tasks by href, for what a tray drag carries.
     tasks: HashMap<String, TaskView>,
     px_per_hour: f64,
@@ -385,7 +382,7 @@ thread_local! {
 impl Ghost {
     /// Build the preview host. `attach` puts it on the grid last, so it
     /// draws over the blocks it previews against.
-    fn new(p: &DayPlan, px_per_hour: f64) -> Self {
+    fn new(p: &DayPlan, px_per_hour: f64, columns: &daygrid::Columns) -> Self {
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
         wrap.set_valign(gtk::Align::Start);
@@ -402,6 +399,8 @@ impl Ghost {
         let g = Ghost {
             wrap,
             blocks: p.blocks.clone(),
+            events: p.events.clone(),
+            columns: columns.clone(),
             tasks,
             px_per_hour,
         };
@@ -414,15 +413,15 @@ impl Ghost {
     }
 
     fn show(&self, task: &TaskView, start: u32, duration: u32) {
-        let b = model::ghost_block(&self.blocks, task, start, duration);
+        let b = model::ghost_block(&self.blocks, &self.events, task, start, duration);
         while let Some(c) = self.wrap.first_child() {
             self.wrap.remove(&c);
         }
         let px = daygrid::live_px(self.px_per_hour);
         let (chip, _meta) = block_chip(&b, None, px);
         chip.add_css_class("ghost");
-        let row = block_row(&chip, b.col, b.cols);
-        self.wrap.append(&row);
+        self.wrap.append(&block_row(&chip));
+        self.columns.set(&self.wrap, b.col, b.cols);
         self.wrap.set_margin_top(block_top(&b, px));
         self.wrap.set_visible(true);
     }
@@ -465,9 +464,10 @@ pub fn fill_lane(
     rows: &mut Vec<(String, gtk::Widget)>,
     px_per_hour: f64,
     overlay: &gtk::Overlay,
+    columns: &daygrid::Columns,
     reflow: &daygrid::Reflow,
 ) {
-    let ghost = Ghost::new(p, px_per_hour);
+    let ghost = Ghost::new(p, px_per_hour, columns);
     for b in &p.blocks {
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.set_halign(gtk::Align::Fill);
@@ -477,6 +477,7 @@ pub fn fill_lane(
         rows.push((b.task.href.clone(), row.clone()));
         wrap.append(&row);
         overlay.add_overlay(&wrap);
+        columns.set(&wrap, b.col, b.cols);
         let span = daygrid::Span {
             start_min: f64::from(b.start),
             end_min: f64::from(b.start + b.duration),

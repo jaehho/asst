@@ -151,28 +151,22 @@ pub fn build_column(
     let mut time_lane: Option<gtk::Overlay> = None;
     let mut chips: Vec<gtk::Widget> = Vec::new();
     let timed = events::timed(o.events, day, zone);
-    scroll.set_child(Some(&daygrid::day_grid(
-        day,
-        o.now,
-        px,
-        &reflow,
-        !timed.is_empty(),
-        |lanes| {
-            chips = time::fill_lane(
-                blocks,
-                tday,
-                zone,
-                &lanes.time,
-                time::detail_for(px),
-                &reflow,
-            );
-            time_lane = Some(lanes.time.clone());
-            if let Some(lane) = &lanes.events {
-                events::fill_lane(&timed, lane, &reflow);
-            }
-            plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
-        },
-    )));
+    scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, &reflow, |lanes| {
+        chips = time::fill_lane(
+            blocks,
+            tday,
+            zone,
+            &lanes.time,
+            time::detail_for(px),
+            &reflow,
+        );
+        time_lane = Some(lanes.time.clone());
+        // Events and planned blocks share the plan lane, side by side
+        // where they overlap (`DayPlan::beside_events`).
+        let columns = daygrid::Columns::on(&lanes.plan);
+        events::fill_lane(&timed, &plan.events, &lanes.plan, &columns, &reflow);
+        plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &columns, &reflow);
+    })));
     // What the grid redraws without a rebuild of the column: the tracked
     // chips when the zoom crosses into another level (a dissolve) or when
     // fresh data arrives (a plain swap, in one frame), the header note, and
