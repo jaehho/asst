@@ -136,7 +136,14 @@ fn block_widget(
     let edge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     edge.add_css_class("plan-block-edge");
     edge.set_height_request(if b.duration < 30 { 3 } else { 6 });
+    // The chip is a vertical box taller than its words, and a box hands
+    // its spare height only to a child that expands. Without vexpand the
+    // edge sat right under the time, mid-block; with it, the spare height
+    // is the edge's and End draws the edge on the chip's bottom. The chip
+    // says it does not expand, so this stays inside it.
+    edge.set_vexpand(true);
     edge.set_valign(gtk::Align::End);
+    chip.set_vexpand(false);
     edge.set_cursor_from_name(Some("ns-resize"));
     {
         let drag = gtk::GestureDrag::new();
