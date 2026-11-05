@@ -4615,7 +4615,20 @@ impl Window {
                 if let (Some(x), Some(y)) = (it.next(), it.next())
                     && let Some(target) = w.window.pick(x, y, gtk::PickFlags::DEFAULT)
                 {
-                    eprintln!("click: {}", target.type_().name());
+                    // What the pointer lands on and the three widgets
+                    // above it, by type and style classes: which overlay
+                    // child takes a press.
+                    let mut path = Vec::new();
+                    let mut at = Some(target.clone());
+                    while let Some(w) = at.take().filter(|_| path.len() < 4) {
+                        let tip = w
+                            .tooltip_text()
+                            .map(|t| format!(" {t:?}"))
+                            .unwrap_or_default();
+                        path.push(format!("{}{:?}{tip}", w.type_().name(), w.css_classes()));
+                        at = w.parent();
+                    }
+                    eprintln!("click: {}", path.join(" < "));
                     if target.is_ancestor(&w.clamp) && on_background(&target) {
                         sender.input(Msg::CloseEditor);
                     }
