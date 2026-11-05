@@ -110,8 +110,9 @@ fn rules(px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
 /// The now-line: a red rule on a drawn dot. Both centers sit on the same
 /// minute's line center, so the dot's bottom edge is not what the rule
 /// rides. Only when `now` falls on `day`. The dot is a sized circle, not a
-/// glyph: a Label's box is not its ink. Sized Fixed children: a 2px box
-/// measures to zero here.
+/// glyph: a Label's box is not its ink. Sized: a 2px box measures to zero.
+/// The line is as wide as the grid, the dot sits at its left end, and both
+/// hang from the top, where `center_at` sets their margin.
 fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk::Box, f64)> {
     if now.date_naive() != day {
         return None;
@@ -122,32 +123,27 @@ fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk:
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     line.add_css_class("time-now");
     line.set_size_request(MIN_GRID_W, LINE_H as i32);
+    line.set_valign(gtk::Align::Start);
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("time-now-dot");
     dot.set_size_request(DOT_SIZE as i32, DOT_SIZE as i32);
+    dot.set_halign(gtk::Align::Start);
+    dot.set_valign(gtk::Align::Start);
     Some((line, dot, mins))
 }
 
-/// Place `child` so its vertical center is `y`, using its measured size
-/// when it has one and `nominal` before allocation. Adds the child the
-/// first time; later calls only move it, and a child that has left the
-/// Fixed (a rebuild) is left alone.
-fn center_at(fixed: &gtk::Fixed, child: &gtk::Widget, y: f64, nominal: f64) {
+/// Place `child` on `grid` so its vertical center is `y`, using its
+/// measured size when it has one and `nominal` before allocation. Adds the
+/// child the first time; later calls only move it, and a child that has
+/// gone elsewhere is left alone. A margin cannot be negative, so in the
+/// day's first minute the line sits flush with the top.
+fn center_at(grid: &gtk::Overlay, child: &gtk::Widget, y: f64, nominal: f64) {
     let h = child.height();
     let h = if h > 0 { h as f64 } else { nominal };
-    let at = y - h / 2.0;
-    if child.parent().as_ref() == Some(fixed.upcast_ref()) {
-        fixed.move_(child, 0.0, at);
-    } else {
-        fixed.put(child, 0.0, at);
+    child.set_margin_top((y - h / 2.0).round().max(0.0) as i32);
+    if child.parent().is_none() {
+        grid.add_overlay(child);
     }
-}
-
-/// One width for the rules and the now-line, so they cannot drift apart.
-/// Full grid width, gutter included. After allocation that is the Fixed's
-/// width; before it, the minimum.
-fn grid_width(fixed: &gtk::Fixed) -> f64 {
-    f64::from(fixed.width().max(MIN_GRID_W))
 }
 
 /// Two content lanes on one time axis: tracked time on the left, the plan
@@ -174,7 +170,7 @@ pub struct Placed {
 
 /// The now-line, its dot and the minute they ride.
 struct NowLine {
-    fixed: glib::WeakRef<gtk::Fixed>,
+    grid: glib::WeakRef<gtk::Overlay>,
     line: glib::WeakRef<gtk::Widget>,
     dot: glib::WeakRef<gtk::Widget>,
     mins: f64,
@@ -234,16 +230,16 @@ impl Reflow {
     /// The now-line and its dot, centered on `mins` minutes from midnight.
     pub fn now_line(
         &self,
-        fixed: &gtk::Fixed,
+        grid: &gtk::Overlay,
         line: &impl IsA<gtk::Widget>,
         dot: &impl IsA<gtk::Widget>,
         mins: f64,
     ) {
         let y = y_at(mins, self.0.px());
-        center_at(fixed, line.as_ref(), y, LINE_H);
-        center_at(fixed, dot.as_ref(), y, DOT_SIZE);
+        center_at(grid, line.as_ref(), y, LINE_H);
+        center_at(grid, dot.as_ref(), y, DOT_SIZE);
         *self.0.now_line.borrow_mut() = Some(NowLine {
-            fixed: fixed.downgrade(),
+            grid: grid.downgrade(),
             line: line.as_ref().downgrade(),
             dot: dot.as_ref().downgrade(),
             mins,
@@ -288,12 +284,12 @@ impl Reflow {
             }
         }
         if let Some(n) = self.0.now_line.borrow().as_ref()
-            && let (Some(fixed), Some(line), Some(dot)) =
-                (n.fixed.upgrade(), n.line.upgrade(), n.dot.upgrade())
+            && let (Some(grid), Some(line), Some(dot)) =
+                (n.grid.upgrade(), n.line.upgrade(), n.dot.upgrade())
         {
             let y = y_at(n.mins, self.0.px());
-            center_at(&fixed, &line, y, LINE_H);
-            center_at(&fixed, &dot, y, DOT_SIZE);
+            center_at(&grid, &line, y, LINE_H);
+            center_at(&grid, &dot, y, DOT_SIZE);
         }
         for p in self.0.placed.borrow().iter() {
             p.apply(self.0.px());
@@ -370,11 +366,15 @@ fn lane() -> gtk::Overlay {
 
 /// The hour grid, now-line, and whatever the view draws on its two lanes.
 /// Rules sit under the view's overlays and span the full width (gutter
-/// included, the calendar convention); the now-line is a Fixed child
-/// beside the column so it always paints over those overlays at a real y.
-/// Both take their width from `grid_width`. Placement is reapplied after
-/// allocation: the first build's put lands, a rebuild's does not until the
-/// Fixed has been sized once.
+/// included, the calendar convention); the now-line is added after the
+/// column so it always paints over those overlays at a real y.
+///
+/// One Overlay holds them all and stretches each to its own width, so
+/// rules, lanes and line cannot drift apart and nothing sets a width from
+/// an allocation. That is what a Fixed needed, and a width taken from the
+/// last allocation only ever grew: a window made narrower again kept the
+/// grid wide and cut off the tray. The rules and the column are measured,
+/// so the grid is never narrower than either needs.
 ///
 /// Everything this builds registers with `reflow`, so a zoom can move the
 /// hour rows, the sized containers and the now-line without tearing the
@@ -416,60 +416,19 @@ pub fn day_grid(
     column.append(&gutter(reflow.px(), reflow));
     column.append(&row);
 
-    let fixed = gtk::Fixed::new();
-    fixed.put(&rules, 0.0, 0.0);
-    fixed.put(&column, 0.0, 0.0);
+    let grid = gtk::Overlay::new();
+    grid.set_hexpand(true);
+    grid.set_child(Some(&rules));
+    grid.add_overlay(&column);
+    grid.set_measure_overlay(&column, true);
     reflow.sized(&rules);
     reflow.sized(&column);
-    reflow.sized(&fixed);
-    let line_dot = now_line(now, day);
-    if let Some((line, dot, mins)) = &line_dot {
+    reflow.sized(&grid);
+    if let Some((line, dot, mins)) = now_line(now, day) {
         // Both centers on the same y: the rule's and the dot's midpoints meet.
-        reflow.now_line(&fixed, line, dot, *mins);
+        reflow.now_line(&grid, &line, &dot, mins);
     }
-    let place = {
-        let (weak, rules, column) = (fixed.downgrade(), rules.clone(), column.clone());
-        let (line_dot, reflow) = (line_dot.clone(), reflow.clone());
-        move || {
-            let Some(fixed) = weak.upgrade() else { return };
-            // One width for rules, line, and the lane row: they cannot
-            // drift apart, and the lanes fill the same extent. Heights are
-            // the reflow's job; only the width is settled here.
-            let w = grid_width(&fixed) as i32;
-            rules.set_width_request(w);
-            column.set_width_request(w);
-            if let Some((line, dot, _)) = &line_dot {
-                line.set_size_request(w, LINE_H as i32);
-                // Re-centers the line and dot on the reflow's current minute.
-                reflow.apply(reflow.px());
-                line.queue_draw();
-                dot.queue_draw();
-            }
-        }
-    };
-    glib::timeout_add_local_once(std::time::Duration::from_millis(50), {
-        let place = place.clone();
-        move || place()
-    });
-    // Map and the 50 ms timer can both come before the window has handed
-    // the Fixed a width (a view shown at startup): the lanes would stay at
-    // the minimum. Place again whenever the allocated width changes.
-    let applied = std::rc::Rc::new(std::cell::Cell::new(0));
-    {
-        let (place, applied) = (place.clone(), applied.clone());
-        fixed.add_tick_callback(move |f, _| {
-            let w = f.width();
-            if w > 0 && w != applied.get() {
-                applied.set(w);
-                place();
-            }
-            glib::ControlFlow::Continue
-        });
-    }
-    // Map runs after the first real allocation, so a rebuild of an
-    // already-sized Fixed still re-centers.
-    fixed.connect_map(move |_| place());
-    fixed.upcast()
+    grid.upcast()
 }
 
 /// The one day cursor the header steps.
@@ -571,6 +530,12 @@ pub fn day_header(
 thread_local! {
     static SCROLL: std::cell::RefCell<Vec<(DayStep, f64, Option<NaiveDate>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// The day scroller's page height when it last laid out: what the next
+    /// one, built for a rebuild of the same window, will get.
+    static PAGE: Cell<f64> = const { Cell::new(0.0) };
 }
 
 fn scroll_slot(step: DayStep) -> (f64, Option<NaiveDate>) {
@@ -675,6 +640,33 @@ pub fn viewport() -> Option<(i32, f64, f64)> {
     let scroll = live_now()?.scroll.upgrade()?;
     let vadj = scroll.vadjustment();
     Some((scroll.height(), vadj.page_size(), vadj.upper()))
+}
+
+/// Scroll the day grid on view to `y`, as a wheel would.
+pub fn scroll_day_to(y: f64) {
+    if let Some(scroll) = live_now().and_then(|l| l.scroll.upgrade()) {
+        scroll.vadjustment().set_value(y);
+    }
+}
+
+/// The day scroller's value, upper and page, the y it keeps for a rebuild,
+/// and how far up the grid is drawn: `-drawn` equals `value` when the
+/// layout has caught up with the adjustment.
+pub fn scroll_probe() -> Option<String> {
+    let scroll = live_now()?.scroll.upgrade()?;
+    let vadj = scroll.vadjustment();
+    let grid = scroll.child()?.first_child()?;
+    let drawn = grid
+        .compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
+        .map_or(f32::NAN, |p| p.y());
+    Some(format!(
+        "value {:.0} upper {:.0} page {:.0} kept {:.0} drawn {:.0}",
+        vadj.value(),
+        vadj.upper(),
+        vadj.page_size(),
+        scroll_slot(DayStep::Day).0,
+        drawn
+    ))
 }
 
 /// Minutes from midnight on `now`'s own day, seconds as a fraction.
@@ -925,46 +917,54 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
         fresh_view,
         px_per_hour: px,
     } = rest;
-    let recenter = fresh_view || scroll_slot(step).1 != Some(day);
-    let placed = std::rc::Rc::new(std::cell::Cell::new(false));
-    let place = {
-        let (scroll, placed) = (scroll.clone(), placed.clone());
-        move || {
-            if placed.get() {
-                return;
-            }
-            let vadj = scroll.vadjustment();
-            let view_h = vadj.page_size();
-            // A recenter needs the real page; restoring does too, so
-            // that the value lands in the same coordinate space.
-            if view_h <= 0.0 {
-                return;
-            }
-            let y = if recenter && day == today {
-                now_min.map_or(0.0, |m| {
-                    scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
-                })
-            } else if recenter {
-                let top = model::day_rest_min(first_min);
-                model::scroll_keep_min(top, HOUR_START, HOUR_END, view_h, 0.0, px)
-            } else {
-                let kept = scroll_slot(step).0;
-                if kept.is_finite() { kept } else { 0.0 }
-            };
-            vadj.set_value(y);
-            scroll_set(step, y, Some(day));
-            placed.set(true);
+    let (kept, kept_day) = scroll_slot(step);
+    let recenter = fresh_view || kept_day != Some(day);
+    // Where the scroller rests in a viewport `view_h` tall.
+    let rest_y = move |view_h: f64| {
+        if recenter && day == today {
+            now_min.map_or(0.0, |m| {
+                scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
+            })
+        } else if recenter {
+            let top = model::day_rest_min(first_min);
+            model::scroll_keep_min(top, HOUR_START, HOUR_END, view_h, 0.0, px)
+        } else if kept.is_finite() {
+            kept
+        } else {
+            0.0
         }
     };
-    {
-        let place = place.clone();
-        scroll.vadjustment().connect_upper_notify(move |_| place());
+    let vadj = scroll.vadjustment();
+    // The viewport draws the grid at whatever value the adjustment holds
+    // when it first lays out, so the value goes in now, against the page
+    // the last scroller had. Set later, from a notify the viewport sends
+    // during that layout, it moved the scrollbar but not the grid: GTK
+    // drops a re-layout asked for mid-layout, so the grid sat at the top
+    // until the next scroll jumped it to the kept place.
+    let page = PAGE.with(Cell::get);
+    if page > 0.0 {
+        let y = rest_y(page);
+        // Upper first, or the value is clamped to an empty scroller's 0.
+        vadj.set_upper(model::grid_height(HOUR_START, HOUR_END, px).max(y + page));
+        vadj.set_value(y);
+        scroll_set(step, y, Some(day));
+    } else {
+        // No day scroller has been laid out yet: take this one's page,
+        // then move once its layout is over, so the move is laid out too.
+        let placed = Rc::new(Cell::new(false));
+        vadj.connect_page_size_notify(move |a| {
+            if placed.get() || a.page_size() <= 0.0 {
+                return;
+            }
+            placed.set(true);
+            let (a, y) = (a.clone(), rest_y(a.page_size()));
+            glib::idle_add_local_once(move || {
+                a.set_value(y);
+                scroll_set(step, y, Some(day));
+            });
+        });
     }
-    {
-        let place = place.clone();
-        scroll.connect_map(move |_| place());
-    }
-    glib::idle_add_local_once(place);
+    vadj.connect_page_size_notify(|a| PAGE.with(|p| p.set(a.page_size())));
     scroll.vadjustment().connect_value_changed(move |a| {
         scroll_set(step, a.value(), Some(day));
     });
