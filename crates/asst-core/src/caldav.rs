@@ -114,9 +114,9 @@ fn chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-type HttpsClient = Client<HttpsConnector<HttpConnector>, String>;
+pub(crate) type HttpsClient = Client<HttpsConnector<HttpConnector>, String>;
 
-fn https_client() -> Result<HttpsClient, RemoteError> {
+pub(crate) fn https_client() -> Result<HttpsClient, RemoteError> {
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
         .map_err(|e| RemoteError::Network(format!("loading system certificates: {e}")))?
@@ -148,11 +148,19 @@ pub async fn send(
 
 /// The same, with another user agent: Nominatim asks for one that names us.
 pub async fn send_as(
+    req: Request<String>,
+    agent: &'static str,
+) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
+    send_on(&https_client()?, req, agent).await
+}
+
+/// The same, on a client already built.
+pub(crate) async fn send_on(
+    client: &HttpsClient,
     mut req: Request<String>,
     agent: &'static str,
 ) -> Result<(StatusCode, http::HeaderMap, Vec<u8>), RemoteError> {
     use http_body_util::BodyExt;
-    let client = https_client()?;
     req.headers_mut()
         .insert(USER_AGENT, HeaderValue::from_static(agent));
     let resp = tokio::time::timeout(TIMEOUT, client.request(req))

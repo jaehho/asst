@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -210,6 +211,18 @@ impl FakeGitHub {
     /// How many requests named `path` (query ignored), with any method.
     pub fn count(&self, path: &str) -> usize {
         self.seen().iter().filter(|r| r.path() == path).count()
+    }
+
+    /// `count`, once it reaches `want` or `within` has passed. A client that
+    /// gave up did not wait for this fake to read what it sent, and the read
+    /// only happens when the fake's task next runs: a test that asserts what
+    /// was sent right after a timeout asks here, not `count`.
+    pub async fn count_within(&self, path: &str, want: usize, within: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
+        while self.count(path) < want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.count(path)
     }
 }
 
