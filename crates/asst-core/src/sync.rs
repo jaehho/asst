@@ -7,12 +7,12 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::caldav::{CalDav, Changes, Fetched, RemoteError, RemoteList};
+use crate::caldav::{CalDav, Changes, Fetched, Home, RemoteError};
 use crate::store::{ListRow, Op, Pending, Store, StoreError};
 
 /// The server operations sync needs; `CalDav` in the app, a fake in tests.
 pub trait Remote: Send + Sync {
-    fn lists(&self) -> impl Future<Output = Result<Vec<RemoteList>, RemoteError>> + Send;
+    fn collections(&self) -> impl Future<Output = Result<Home, RemoteError>> + Send;
     fn changes(
         &self,
         list: &str,
@@ -42,8 +42,8 @@ pub trait Remote: Send + Sync {
 }
 
 impl Remote for CalDav {
-    fn lists(&self) -> impl Future<Output = Result<Vec<RemoteList>, RemoteError>> + Send {
-        CalDav::lists(self)
+    fn collections(&self) -> impl Future<Output = Result<Home, RemoteError>> + Send {
+        CalDav::collections(self)
     }
     fn changes(
         &self,
@@ -210,14 +210,25 @@ pub async fn pull<R: Remote>(
     remote: &R,
     report: &mut Report,
 ) -> Result<(), SyncError> {
-    let lists = remote.lists().await?;
-    let (stale, changed) = lock(store).apply_lists(&lists)?;
+    let home = remote.collections().await?;
+    let (stale, changed) = lock(store).apply_lists(&home.lists)?;
     report.lists_changed |= changed;
     for list in stale {
         match pull_list(store, remote, &list, report).await {
             Ok(()) => {}
             Err(SyncError::Remote(e)) if e.is_fatal() => return Err(e.into()),
             Err(e) => report.problems.push(format!("reading {}: {e}", list.name)),
+        }
+    }
+    let (stale, changed) = lock(store).apply_calendars(&home.calendars)?;
+    report.lists_changed |= changed;
+    for calendar in stale {
+        match pull_calendar(store, remote, &calendar, report).await {
+            Ok(()) => {}
+            Err(SyncError::Remote(e)) if e.is_fatal() => return Err(e.into()),
+            Err(e) => report
+                .problems
+                .push(format!("reading {}: {e}", calendar.name)),
         }
     }
     Ok(())
@@ -235,27 +246,7 @@ async fn pull_list<R: Remote>(
     report: &mut Report,
 ) -> Result<(), SyncError> {
     let full_key = format!("full-sync:{}", list.href);
-    let last_full = lock(store)
-        .meta(&full_key)?
-        .and_then(|t| t.parse::<i64>().ok())
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0));
-    let token = list
-        .sync_token
-        .as_ref()
-        .filter(|_| last_full.is_some_and(|t| Utc::now() - t < FULL_EVERY));
-    let changes = match token {
-        Some(token) => match remote.changes(&list.href, Some(token)).await {
-            Err(RemoteError::InvalidToken) => {
-                log::info!(
-                    "sync token for {} expired; reading the whole list",
-                    list.name
-                );
-                remote.changes(&list.href, None).await?
-            }
-            other => other?,
-        },
-        None => remote.changes(&list.href, None).await?,
-    };
+    let changes = read_changes(store, remote, list, &full_key).await?;
     let known = lock(store).etags(&list.href)?;
     let wanted: Vec<String> = changes
         .changed
@@ -294,6 +285,84 @@ async fn pull_list<R: Remote>(
     Ok(())
 }
 
+/// What changed in a collection since its token, or all of it when the last
+/// full listing (kept under `full_key`) is too old or the token is refused.
+async fn read_changes<R: Remote>(
+    store: &Mutex<Store>,
+    remote: &R,
+    list: &ListRow,
+    full_key: &str,
+) -> Result<Changes, SyncError> {
+    let last_full = lock(store)
+        .meta(full_key)?
+        .and_then(|t| t.parse::<i64>().ok())
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0));
+    let token = list
+        .sync_token
+        .as_ref()
+        .filter(|_| last_full.is_some_and(|t| Utc::now() - t < FULL_EVERY));
+    Ok(match token {
+        Some(token) => match remote.changes(&list.href, Some(token)).await {
+            Err(RemoteError::InvalidToken) => {
+                log::info!(
+                    "sync token for {} expired; reading the whole list",
+                    list.name
+                );
+                remote.changes(&list.href, None).await?
+            }
+            other => other?,
+        },
+        None => remote.changes(&list.href, None).await?,
+    })
+}
+
+/// `pull_list` for events. Read-only: what the server holds is stored as it
+/// is, there are no edits to rebase, and nothing here writes back.
+async fn pull_calendar<R: Remote>(
+    store: &Mutex<Store>,
+    remote: &R,
+    calendar: &ListRow,
+    report: &mut Report,
+) -> Result<(), SyncError> {
+    let full_key = format!("full-sync-events:{}", calendar.href);
+    let changes = read_changes(store, remote, calendar, &full_key).await?;
+    let known = lock(store).event_etags(&calendar.href)?;
+    let wanted: Vec<String> = changes
+        .changed
+        .iter()
+        .filter(|(href, etag)| known.get(href) != Some(etag))
+        .map(|(href, _)| href.clone())
+        .collect();
+    if !wanted.is_empty() {
+        let fetched = remote.fetch(&calendar.href, &wanted).await?;
+        let s = lock(store);
+        for f in &fetched {
+            if s.put_event(&calendar.href, &f.href, &f.etag, &f.data)? {
+                report.fetched += 1;
+            }
+        }
+    }
+    let s = lock(store);
+    for href in &changes.removed {
+        if known.contains_key(href) {
+            s.forget_event(href)?;
+            report.removed += 1;
+        }
+    }
+    if changes.complete {
+        let present: HashSet<&String> = changes.changed.iter().map(|(h, _)| h).collect();
+        for href in known.keys().filter(|h| !present.contains(h)) {
+            s.forget_event(href)?;
+            report.removed += 1;
+        }
+    }
+    s.set_calendar_token(&calendar.href, changes.token.as_deref())?;
+    if changes.complete {
+        s.set_meta(&full_key, &Utc::now().timestamp().to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod fake {
     //! A CalDAV server in memory, with sync tokens and ETags that behave
@@ -303,6 +372,7 @@ pub(crate) mod fake {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::caldav::RemoteList;
 
     #[derive(Default)]
     struct Collection {
@@ -316,6 +386,8 @@ pub(crate) mod fake {
     #[derive(Default)]
     pub struct Server {
         lists: Mutex<BTreeMap<String, Collection>>,
+        /// Hrefs of the collections that hold events, not tasks.
+        calendars: Mutex<Vec<String>>,
         etag_counter: Mutex<u64>,
         /// Apply the next write but report a network failure.
         pub lose_next_response: Mutex<bool>,
@@ -334,6 +406,25 @@ pub(crate) mod fake {
                 },
             );
             s
+        }
+
+        /// A calendar beside the lists: it holds events, so no list shows it.
+        pub fn add_calendar(&self, href: &str, name: &str) {
+            self.lists.lock().unwrap().insert(
+                href.into(),
+                Collection {
+                    name: name.into(),
+                    token: 1,
+                    ..Default::default()
+                },
+            );
+            self.calendars.lock().unwrap().push(href.into());
+        }
+
+        /// The calendar is gone from the home, as a delete elsewhere leaves it.
+        pub fn remove_calendar(&self, href: &str) {
+            self.lists.lock().unwrap().remove(href);
+            self.calendars.lock().unwrap().retain(|c| c != href);
         }
 
         fn list_of(href: &str) -> String {
@@ -383,9 +474,10 @@ pub(crate) mod fake {
     }
 
     impl Remote for Server {
-        fn lists(&self) -> impl Future<Output = Result<Vec<RemoteList>, RemoteError>> + Send {
+        fn collections(&self) -> impl Future<Output = Result<Home, RemoteError>> + Send {
             self.log("PROPFIND home".into());
-            let lists = self
+            let calendars = self.calendars.lock().unwrap().clone();
+            let (events, tasks): (Vec<RemoteList>, Vec<RemoteList>) = self
                 .lists
                 .lock()
                 .unwrap()
@@ -399,8 +491,13 @@ pub(crate) mod fake {
                     ctag: None,
                     writable: true,
                 })
-                .collect();
-            async move { Ok(lists) }
+                .partition(|l| calendars.contains(&l.href));
+            async move {
+                Ok(Home {
+                    lists: tasks,
+                    calendars: events,
+                })
+            }
         }
 
         fn changes(
@@ -739,6 +836,152 @@ SUMMARY:{summary}\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER:7\r\nEND:VTOD
                 .get("/cal/inbox/B.ics")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    const CALENDAR: &str = "/cal/personal/";
+    const MEETING: &str = "/cal/personal/M.ics";
+
+    fn phone_event(summary: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Apple Inc.//iOS 18.6//EN\r\nBEGIN:VEVENT\r\nUID:M\r\n\
+DTSTART:20260914T140000Z\r\nDTEND:20260914T150000Z\r\nSUMMARY:{summary}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    fn sept(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, day).unwrap()
+    }
+
+    fn summaries(store: &Mutex<Store>, day: NaiveDate) -> Vec<String> {
+        let events = store.lock().unwrap().events_on(day).unwrap();
+        events.into_iter().map(|e| e.summary).collect()
+    }
+
+    #[tokio::test]
+    async fn events_come_down_their_own_path_and_nothing_goes_back() {
+        let (store, server) = setup();
+        server.add_calendar(CALENDAR, "Personal");
+        server.put_external(MEETING, &phone_event("Dentist"));
+
+        let r = sync(&store, &server).await.unwrap();
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!(r.fetched, 2, "the task and the event");
+        assert_eq!(summaries(&store, sept(14)), ["Dentist"]);
+        assert!(summaries(&store, sept(15)).is_empty());
+        // Task lists stay VTODO: the calendar is no list, its event no task.
+        let lists = store.lock().unwrap().lists().unwrap();
+        assert_eq!(lists.len(), 1);
+        assert!(store.lock().unwrap().get(MEETING).unwrap().is_none());
+
+        // The stored copy is the server's, byte for byte.
+        assert_eq!(
+            store.lock().unwrap().event_ics(MEETING).unwrap().as_deref(),
+            server.data(MEETING).as_deref()
+        );
+
+        // Idle costs the one PROPFIND it always did.
+        server.requests.lock().unwrap().clear();
+        let r = sync(&store, &server).await.unwrap();
+        assert!(!r.changed());
+        assert_eq!(*server.requests.lock().unwrap(), ["PROPFIND home"]);
+
+        // A change on the phone arrives; a removal leaves.
+        server.put_external(MEETING, &phone_event("Dentist moved"));
+        assert_eq!(sync(&store, &server).await.unwrap().fetched, 1);
+        assert_eq!(summaries(&store, sept(14)), ["Dentist moved"]);
+        server.remove_external(MEETING);
+        assert_eq!(sync(&store, &server).await.unwrap().removed, 1);
+        assert!(summaries(&store, sept(14)).is_empty());
+
+        let writes = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("PUT") || r.starts_with("DELETE"))
+            .count();
+        assert_eq!(writes, 0, "events are only read");
+    }
+
+    #[tokio::test]
+    async fn a_calendar_gone_from_the_server_takes_its_events() {
+        let (store, server) = setup();
+        server.add_calendar(CALENDAR, "Personal");
+        server.put_external(MEETING, &phone_event("Dentist"));
+        sync(&store, &server).await.unwrap();
+        assert_eq!(summaries(&store, sept(14)).len(), 1);
+
+        server.remove_calendar(CALENDAR);
+        let r = sync(&store, &server).await.unwrap();
+        assert!(r.lists_changed);
+        assert!(summaries(&store, sept(14)).is_empty());
+        assert_eq!(row(&store, "/cal/inbox/A.ics").task.uid, "A", "tasks stay");
+    }
+
+    #[tokio::test]
+    async fn a_collection_of_both_keeps_tasks_and_events_apart() {
+        let store =
+            Mutex::new(Store::in_memory("America/New_York".parse::<Tz>().unwrap()).unwrap());
+        let server = Server::with_list(LIST, "Both");
+        server.put_external("/cal/inbox/A.ics", &phone_task("A", "A task"));
+        server.put_external("/cal/inbox/M.ics", &phone_event("A meeting"));
+        // Listed twice, as a home with no component set is.
+        struct Twice(Server);
+        impl Remote for Twice {
+            async fn collections(&self) -> Result<Home, RemoteError> {
+                let mut home = self.0.collections().await?;
+                home.calendars = home.lists.clone();
+                Ok(home)
+            }
+            async fn changes(&self, l: &str, t: Option<&str>) -> Result<Changes, RemoteError> {
+                self.0.changes(l, t).await
+            }
+            async fn fetch(&self, l: &str, h: &[String]) -> Result<Vec<Fetched>, RemoteError> {
+                self.0.fetch(l, h).await
+            }
+            async fn create(&self, h: &str, i: &str) -> Result<Option<String>, RemoteError> {
+                self.0.create(h, i).await
+            }
+            async fn update(
+                &self,
+                h: &str,
+                i: &str,
+                e: &str,
+            ) -> Result<Option<String>, RemoteError> {
+                self.0.update(h, i, e).await
+            }
+            async fn delete(&self, h: &str, e: &str) -> Result<(), RemoteError> {
+                self.0.delete(h, e).await
+            }
+        }
+        let r = sync(&store, &Twice(server)).await.unwrap();
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!(summaries(&store, sept(14)), ["A meeting"]);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get("/cal/inbox/M.ics")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get("/cal/inbox/A.ics")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .event_ics("/cal/inbox/A.ics")
+                .unwrap()
+                .is_none()
         );
     }
 }

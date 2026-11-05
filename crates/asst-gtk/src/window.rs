@@ -391,6 +391,12 @@ pub enum Cmd {
     CompletedLoaded(u64, client::Result<Vec<TaskView>>),
     /// Tracked blocks for the Day view.
     BlocksLoaded(u64, client::Result<Vec<asst_core::api::BlockView>>),
+    /// Calendar events on a day, for the Day view.
+    EventsLoaded(
+        u64,
+        chrono::NaiveDate,
+        client::Result<Vec<asst_core::api::EventView>>,
+    ),
     Changed,
     Status(StatusView),
     LoginDone(bool, String),
@@ -464,6 +470,10 @@ pub struct Window {
     nav: Nav,
     /// Tracked blocks for the Day view.
     blocks: Vec<asst_core::api::BlockView>,
+    /// Calendar events, and the day they were asked for: a step to another
+    /// day draws none until that day's arrive.
+    events: Vec<asst_core::api::EventView>,
+    events_day: Option<chrono::NaiveDate>,
     /// Which local day the Day view shows. Tracked blocks and plan slots
     /// both follow this cursor; slots are keyed by date, so this is just
     /// the day the grid is looking at.
@@ -1110,6 +1120,8 @@ impl Component for Window {
             open: Vec::new(),
             completed: None,
             blocks: Vec::new(),
+            events: Vec::new(),
+            events_day: None,
             day_day: chrono::Local::now().date_naive(),
             no_date_open: false,
             status: None,
@@ -2351,6 +2363,20 @@ impl Component for Window {
                     Err(e) => toast(w, &e),
                 }
             }
+            Cmd::EventsLoaded(generation, day, result) => {
+                if generation != self.blocks_generation {
+                    return;
+                }
+                // Not a toast: an asstd older than this window has no such
+                // method until it is restarted (#23), and the day still works.
+                match result {
+                    Ok(events) => {
+                        self.events = events;
+                        self.events_day = Some(day);
+                    }
+                    Err(e) => eprintln!("asst-gtk: events on {day}: {e}"),
+                }
+            }
             Cmd::Changed => {
                 self.reload(&sender);
                 return;
@@ -2812,6 +2838,15 @@ impl Window {
         });
     }
 
+    /// The events to draw on `day`: none while that day's are on their way.
+    fn events_on(&self, day: chrono::NaiveDate) -> &[asst_core::api::EventView] {
+        if self.events_day == Some(day) {
+            &self.events
+        } else {
+            &[]
+        }
+    }
+
     /// Pull the day from ActivityWatch, then load `blocks` for the Day view.
     fn reload_blocks(&mut self, sender: &ComponentSender<Self>, day: chrono::NaiveDate) {
         use asst_core::api::BlockRange;
@@ -2820,6 +2855,9 @@ impl Window {
         self.day_day = day;
         self.blocks_generation += 1;
         let generation = self.blocks_generation;
+        sender.oneshot_command(async move {
+            Cmd::EventsLoaded(generation, day, client::events(day).await)
+        });
         sender.oneshot_command(async move {
             // Best effort: the window still shows whatever is already stored.
             if let Err(e) = client::track_ingest(&day.to_string()).await {
@@ -3715,6 +3753,14 @@ impl Window {
                     }),
                 ));
                 parts.push((
+                    "events",
+                    part(|h| {
+                        for e in self.events_on(day.day) {
+                            e.hash(h);
+                        }
+                    }),
+                ));
+                parts.push((
                     "slots",
                     part(|h| {
                         for s in &self.prefs.plan {
@@ -3867,6 +3913,7 @@ impl Window {
                     nav: &self.nav,
                     lists: &pickable,
                     blocks: &self.blocks,
+                    events: self.events_on(day.day),
                     plan: &day,
                     no_date_open: self.no_date_open,
                     px_per_hour: self.prefs.day_zoom,

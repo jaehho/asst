@@ -28,6 +28,8 @@ pub trait Asst {
     fn tasks(&self, query: &str) -> zbus::Result<String>;
     /// `BlockRange` → `[Block]`: tracked (and later planned) time.
     fn blocks(&self, range: &str) -> zbus::Result<String>;
+    /// A local day (`YYYY-MM-DD`) → `[EventView]`: calendar events on it.
+    fn events(&self, day: &str) -> zbus::Result<String>;
     /// Pull one local day from ActivityWatch into `blocks` → `BlockRange` written.
     fn track_ingest(&self, date: &str) -> zbus::Result<String>;
     /// id → `TaskView`
@@ -241,6 +243,7 @@ pub struct TrackIngested {
 
 /// A tracked or planned span, as the window draws it.
 pub type BlockView = Block;
+pub use crate::event::EventView;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskView {

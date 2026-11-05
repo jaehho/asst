@@ -49,7 +49,7 @@ impl RemoteError {
     }
 }
 
-/// A calendar collection that can hold tasks.
+/// A calendar collection: one that can hold tasks, or events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteList {
     pub href: String,
@@ -59,6 +59,14 @@ pub struct RemoteList {
     pub sync_token: Option<String>,
     pub ctag: Option<String>,
     pub writable: bool,
+}
+
+/// The calendar home, sorted by what each collection can hold. A collection
+/// that takes both components is in both, and each path keeps its own token.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Home {
+    pub lists: Vec<RemoteList>,
+    pub calendars: Vec<RemoteList>,
 }
 
 /// What changed in a list since a token.
@@ -335,6 +343,11 @@ impl CalDav {
     }
 
     pub async fn lists(&self) -> Result<Vec<RemoteList>, RemoteError> {
+        Ok(self.collections().await?.lists)
+    }
+
+    /// One PROPFIND on the home: the task lists and the event calendars.
+    pub async fn collections(&self) -> Result<Home, RemoteError> {
         self.client
             .request(ListCalendars { home: &self.home })
             .await
@@ -541,7 +554,7 @@ struct ListCalendars<'a> {
 }
 
 impl DavRequest for ListCalendars<'_> {
-    type Response = Vec<RemoteList>;
+    type Response = Home;
     type ParseError = ParseResponseError;
     type Error<E> = WebDavError<E>;
 
@@ -568,11 +581,11 @@ impl DavRequest for ListCalendars<'_> {
         &self,
         parts: &http::response::Parts,
         body: &[u8],
-    ) -> Result<Vec<RemoteList>, ParseResponseError> {
+    ) -> Result<Home, ParseResponseError> {
         if !parts.status.is_success() {
             return Err(ParseResponseError::BadStatusCode(parts.status));
         }
-        parse_lists(std::str::from_utf8(body)?)
+        parse_home(std::str::from_utf8(body)?)
     }
 }
 
@@ -590,9 +603,9 @@ fn text_of(node: Option<roxmltree::Node>) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-fn parse_lists(body: &str) -> Result<Vec<RemoteList>, ParseResponseError> {
+fn parse_home(body: &str) -> Result<Home, ParseResponseError> {
     let doc = roxmltree::Document::parse(body)?;
-    let mut lists = Vec::new();
+    let mut home = Home::default();
     for response in doc
         .root_element()
         .children()
@@ -617,7 +630,7 @@ fn parse_lists(body: &str) -> Result<Vec<RemoteList>, ParseResponseError> {
             .children()
             .any(|c| c.has_tag_name((NS_CALDAV, "calendar")));
         // Nextcloud lists calendars in its trash bin, and Deck boards when
-        // Deck is installed; neither is a task list.
+        // Deck is installed; neither is a task list or a calendar.
         let in_trash = rt
             .children()
             .any(|c| c.tag_name().name() == "deleted-calendar");
@@ -625,15 +638,17 @@ fn parse_lists(body: &str) -> Result<Vec<RemoteList>, ParseResponseError> {
             continue;
         }
         // Absent means every component type is allowed (RFC 4791 5.2.3).
-        let holds_tasks = match child(prop, NS_CALDAV, "supported-calendar-component-set") {
-            Some(set) => set.children().any(|c| {
-                c.has_tag_name((NS_CALDAV, "comp"))
-                    && c.attribute("name")
-                        .is_some_and(|n| n.eq_ignore_ascii_case("VTODO"))
-            }),
-            None => true,
-        };
-        if !holds_tasks {
+        let holds =
+            |component: &str| match child(prop, NS_CALDAV, "supported-calendar-component-set") {
+                Some(set) => set.children().any(|c| {
+                    c.has_tag_name((NS_CALDAV, "comp"))
+                        && c.attribute("name")
+                            .is_some_and(|n| n.eq_ignore_ascii_case(component))
+                }),
+                None => true,
+            };
+        let (holds_tasks, holds_events) = (holds("VTODO"), holds("VEVENT"));
+        if !holds_tasks && !holds_events {
             continue;
         }
         let writable = match child(prop, NS_DAV, "current-user-privilege-set") {
@@ -652,7 +667,7 @@ fn parse_lists(body: &str) -> Result<Vec<RemoteList>, ParseResponseError> {
                 .unwrap_or("")
                 .to_string()
         });
-        lists.push(RemoteList {
+        let collection = RemoteList {
             href,
             name,
             // Apple writes #RRGGBBAA; the alpha is noise.
@@ -667,9 +682,15 @@ fn parse_lists(body: &str) -> Result<Vec<RemoteList>, ParseResponseError> {
             sync_token: text_of(child(prop, NS_DAV, "sync-token")),
             ctag: text_of(child(prop, NS_CS, "getctag")),
             writable,
-        });
+        };
+        if holds_events {
+            home.calendars.push(collection.clone());
+        }
+        if holds_tasks {
+            home.lists.push(collection);
+        }
     }
-    Ok(lists)
+    Ok(home)
 }
 
 // ---------------------------------------------------------------------------
@@ -868,7 +889,8 @@ mod tests {
    <d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
  </d:response>
 </d:multistatus>"##;
-        let lists = parse_lists(body).unwrap();
+        let home = parse_home(body).unwrap();
+        let lists = home.lists;
         assert_eq!(lists.len(), 2);
         assert_eq!(
             lists[0],
@@ -885,6 +907,9 @@ mod tests {
         );
         assert_eq!(lists[1].name, "Family");
         assert!(!lists[1].writable);
+        // VEVENT only, and a collection that names no set, which takes both.
+        let names: Vec<&str> = home.calendars.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Personal", "Family"]);
     }
 
     #[test]

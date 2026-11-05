@@ -23,6 +23,8 @@ pub struct Opts<'a> {
     pub lists: &'a [ListView],
     /// Tracked blocks for the Day view's time lane.
     pub blocks: &'a [asst_core::api::BlockView],
+    /// Calendar events on the day on view.
+    pub events: &'a [asst_core::api::EventView],
     /// Placed slots, the tray and the now-line, for the Day view.
     pub plan: &'a DayPlan,
     /// The tray's No date section is unfolded.

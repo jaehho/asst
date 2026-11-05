@@ -68,7 +68,7 @@ fn list_icon(href: &str) -> Option<String> {
 }
 
 /// The CSS class that sets `color` to `hex` (`#rrggbb`), made on first use.
-fn tint(hex: &str) -> Option<String> {
+pub fn tint(hex: &str) -> Option<String> {
     let digits = hex.strip_prefix('#')?.to_lowercase();
     if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;

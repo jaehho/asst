@@ -2,8 +2,8 @@
 //! the GTK thread as command outputs.
 
 use asst_core::api::{
-    AddSpec, Added, AsstProxy, BlockRange, BlockView, Change, LinkView, ListChange, ListSpec,
-    ListView, Settings, SettingsChange, StatusView, TaskView, TrackIngested,
+    AddSpec, Added, AsstProxy, BlockRange, BlockView, Change, EventView, LinkView, ListChange,
+    ListSpec, ListView, Settings, SettingsChange, StatusView, TaskView, TrackIngested,
 };
 use asst_core::store::Query;
 
@@ -105,6 +105,10 @@ pub async fn blocks(range: BlockRange) -> Result<Vec<BlockView>> {
             .blocks(&serde_json::to_string(&range).expect("range serializes"))
             .await,
     )
+}
+
+pub async fn events(day: chrono::NaiveDate) -> Result<Vec<EventView>> {
+    json(proxy().await?.events(&day.to_string()).await)
 }
 
 pub async fn track_ingest(date: &str) -> Result<TrackIngested> {

@@ -1008,6 +1008,35 @@ button.pill {
   opacity: 0.9;
 }
 
+/* Calendar events: server truth, not plan. The calendar's color is the chip's
+   `color` (ui::tint), so the words set their own to stay readable on it. */
+.event-block,
+.event-all-day {
+  border-radius: 6px;
+  padding: 2px 6px;
+  border-left: 3px solid currentColor;
+  background: alpha(currentColor, 0.2);
+}
+
+.event-block-title,
+.event-block-meta {
+  color: @window_fg_color;
+  font-size: 12px;
+}
+
+.event-block-title {
+  font-weight: 600;
+}
+
+.event-block-meta {
+  font-size: 10px;
+  opacity: 0.9;
+}
+
+.event-strip {
+  margin: 4px 0 6px 0;
+}
+
 /* Day view: two lanes on one time axis, and the unscheduled tray. */
 .day-columns {
   min-height: 320px;

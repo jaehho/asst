@@ -12,7 +12,7 @@ use chrono_tz::Tz;
 use relm4::gtk::{self, glib, prelude::*};
 
 use crate::daygrid::{self, DayStep};
-use crate::{content, plan, row, time};
+use crate::{content, events, plan, row, time};
 
 /// The tracked lane once built: enough to draw it again at another zoom
 /// level or for new data, in place.
@@ -116,6 +116,10 @@ pub fn build_column(
         root.append(&content::card(o, add_card));
     }
 
+    if let Some(strip) = events::all_day_strip(o.events) {
+        root.append(&strip);
+    }
+
     let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
     if let Some(href) = o.editing {
         let list = gtk::ListBox::new();
@@ -146,18 +150,29 @@ pub fn build_column(
     let reflow = daygrid::Reflow::default();
     let mut time_lane: Option<gtk::Overlay> = None;
     let mut chips: Vec<gtk::Widget> = Vec::new();
-    scroll.set_child(Some(&daygrid::day_grid(day, o.now, px, &reflow, |lanes| {
-        chips = time::fill_lane(
-            blocks,
-            tday,
-            zone,
-            &lanes.time,
-            time::detail_for(px),
-            &reflow,
-        );
-        time_lane = Some(lanes.time.clone());
-        plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
-    })));
+    let timed = events::timed(o.events, day, zone);
+    scroll.set_child(Some(&daygrid::day_grid(
+        day,
+        o.now,
+        px,
+        &reflow,
+        !timed.is_empty(),
+        |lanes| {
+            chips = time::fill_lane(
+                blocks,
+                tday,
+                zone,
+                &lanes.time,
+                time::detail_for(px),
+                &reflow,
+            );
+            time_lane = Some(lanes.time.clone());
+            if let Some(lane) = &lanes.events {
+                events::fill_lane(&timed, lane, &reflow);
+            }
+            plan::fill_lane(plan, tx, &mut rows, px, &lanes.plan, &reflow);
+        },
+    )));
     // What the grid redraws without a rebuild of the column: the tracked
     // chips when the zoom crosses into another level (a dissolve) or when
     // fresh data arrives (a plain swap, in one frame), the header note, and
@@ -207,6 +222,7 @@ pub fn build_column(
         .iter()
         .map(|b| f64::from(b.start))
         .chain(time::first_min(o.blocks, day, zone))
+        .chain(timed.iter().map(|e| e.start_min))
         .fold(None, |acc: Option<f64>, m| {
             Some(acc.map_or(m, |a| a.min(m)))
         });

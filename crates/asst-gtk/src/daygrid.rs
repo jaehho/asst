@@ -155,6 +155,8 @@ fn grid_width(fixed: &gtk::Fixed) -> f64 {
 /// within their half.
 pub struct Lanes {
     pub time: gtk::Overlay,
+    /// Beside the plan, on a day with timed events.
+    pub events: Option<gtk::Overlay>,
     pub plan: gtk::Overlay,
 }
 
@@ -382,6 +384,7 @@ pub fn day_grid(
     now: chrono::DateTime<Tz>,
     px_per_hour: f64,
     reflow: &Reflow,
+    with_events: bool,
     content: impl FnOnce(&Lanes),
 ) -> gtk::Widget {
     reflow.apply(px_per_hour);
@@ -390,15 +393,20 @@ pub fn day_grid(
     // the now-line share one extent.
     let rules = rules(reflow.px(), reflow);
 
-    // Time on the left, plan on the right: one axis, two lanes.
+    // Time on the left, plan on the right: one axis, two lanes, and events
+    // in a third between them on a day that has any.
     let lanes = Lanes {
         time: lane(),
+        events: with_events.then(lane),
         plan: lane(),
     };
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("day-lanes");
     row.set_hexpand(true);
     row.append(&lanes.time);
+    if let Some(events) = &lanes.events {
+        row.append(events);
+    }
     row.append(&lanes.plan);
     content(&lanes);
 

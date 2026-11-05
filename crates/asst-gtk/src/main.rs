@@ -9,6 +9,7 @@ mod daygrid;
 mod devel;
 mod dialogs;
 mod editor;
+mod events;
 mod find;
 mod model;
 mod motion;

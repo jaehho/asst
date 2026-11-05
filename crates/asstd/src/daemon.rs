@@ -555,6 +555,10 @@ impl Daemon {
     }
 
     /// Tracked (and later planned) spans overlapping [start, end).
+    pub fn events(&self, day: chrono::NaiveDate) -> Result<Vec<asst_core::api::EventView>> {
+        Ok(self.store().events_on(day)?)
+    }
+
     pub fn blocks(&self, start_ms: i64, end_ms: i64) -> Result<Vec<asst_core::store::Block>> {
         Ok(self.store().blocks_between(start_ms, end_ms)?)
     }
