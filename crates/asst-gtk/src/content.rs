@@ -27,6 +27,8 @@ pub struct Opts<'a> {
     pub events: &'a [asst_core::api::EventView],
     /// Placed slots, the tray and the now-line, for the Day view.
     pub plan: &'a DayPlan,
+    /// The week around the day on view, when Day shows the week.
+    pub week: Option<&'a [crate::week::WeekDay]>,
     /// The tray's No date section is unfolded.
     pub no_date_open: bool,
     /// Day-grid zoom in pixels per hour.
@@ -102,6 +104,9 @@ pub fn card(o: &Opts, add_card: &gtk::Box) -> gtk::Revealer {
 
 pub fn build(sections: &[Section], o: &Opts, add_card: &gtk::Box, tx: &Tx) -> Built {
     if o.nav == &Nav::Day {
+        if let Some(week) = o.week {
+            return crate::week::build_column(o, week, add_card, tx);
+        }
         return crate::day::build_column(o, sections, add_card, tx);
     }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);

@@ -132,6 +132,10 @@ pub enum Msg {
     Navigate(Nav),
     /// Step the Day view by whole days (−1 yesterday, +1 tomorrow).
     DayStep(i32),
+    /// Day shows the week around its day (true), or the one day.
+    DayWeek(bool),
+    /// Open this day in Day, from a date in the week.
+    DayOpen(chrono::NaiveDate),
     /// Change the day-grid zoom (pixels per hour). `hold` pins a minute at
     /// a y from the top of the viewport so the view does not jump.
     Zoom(f64, Option<(f64, f64)>),
@@ -470,10 +474,10 @@ pub struct Window {
     nav: Nav,
     /// Tracked blocks for the Day view.
     blocks: Vec<asst_core::api::BlockView>,
-    /// Calendar events, and the day they were asked for: a step to another
-    /// day draws none until that day's arrive.
-    events: Vec<asst_core::api::EventView>,
-    events_day: Option<chrono::NaiveDate>,
+    /// Calendar events by the day they were asked for. A day not loaded
+    /// yet draws none until its events arrive; one asked for again keeps
+    /// its last events until the new ones replace them.
+    events: HashMap<chrono::NaiveDate, Vec<asst_core::api::EventView>>,
     /// Which local day the Day view shows. Tracked blocks and plan slots
     /// both follow this cursor; slots are keyed by date, so this is just
     /// the day the grid is looking at.
@@ -1120,8 +1124,7 @@ impl Component for Window {
             open: Vec::new(),
             completed: None,
             blocks: Vec::new(),
-            events: Vec::new(),
-            events_day: None,
+            events: HashMap::new(),
             day_day: chrono::Local::now().date_naive(),
             no_date_open: false,
             status: None,
@@ -1219,6 +1222,23 @@ impl Component for Window {
                 if self.nav == Nav::Day && matches!(self.adding, Some(Target::Day(_))) {
                     self.adding = Some(Target::Day(day));
                     w.add_card.set_target(Target::Day(day));
+                }
+                self.reload_blocks(&sender, day);
+                self.shown = 0;
+            }
+            Msg::DayWeek(week) => {
+                if self.prefs.day_week != week {
+                    self.prefs.day_week = week;
+                    self.prefs.save();
+                    let day = self.day_day;
+                    self.reload_blocks(&sender, day);
+                    self.shown = 0;
+                }
+            }
+            Msg::DayOpen(day) => {
+                if self.prefs.day_week {
+                    self.prefs.day_week = false;
+                    self.prefs.save();
                 }
                 self.reload_blocks(&sender, day);
                 self.shown = 0;
@@ -2371,8 +2391,7 @@ impl Component for Window {
                 // method until it is restarted (#23), and the day still works.
                 match result {
                     Ok(events) => {
-                        self.events = events;
-                        self.events_day = Some(day);
+                        self.events.insert(day, events);
                     }
                     Err(e) => eprintln!("asst-gtk: events on {day}: {e}"),
                 }
@@ -2848,16 +2867,29 @@ impl Window {
         day
     }
 
-    /// The events to draw on `day`: none while that day's are on their way.
+    /// The events to draw on `day`: none until that day's have arrived.
     fn events_on(&self, day: chrono::NaiveDate) -> &[asst_core::api::EventView] {
-        if self.events_day == Some(day) {
-            &self.events
-        } else {
-            &[]
-        }
+        self.events.get(&day).map_or(&[], Vec::as_slice)
     }
 
-    /// Pull the day from ActivityWatch, then load `blocks` for the Day view.
+    /// The week around the day on view, each day's plan laid out around
+    /// its timed events, as Week draws it.
+    fn week_on_view(&self, open: &[TaskView], now: DateTime<Tz>) -> Vec<crate::week::WeekDay> {
+        model::week_days(self.day_day, self.prefs.sunday_first)
+            .into_iter()
+            .map(|d| {
+                let events = self.events_on(d).to_vec();
+                let mut plan = model::day_plan(open, &self.prefs.plan, now, d);
+                let timed = crate::events::timed(&events, d, now.timezone());
+                plan.beside_events(&crate::events::spans(&timed));
+                crate::week::WeekDay { plan, events }
+            })
+            .collect()
+    }
+
+    /// Load the events of the day on view, or of its week, then pull the
+    /// day from ActivityWatch and load its `blocks`. The week draws no
+    /// tracked time, so it asks ActivityWatch for nothing.
     fn reload_blocks(&mut self, sender: &ComponentSender<Self>, day: chrono::NaiveDate) {
         use asst_core::api::BlockRange;
         use asst_core::track::day_window;
@@ -2865,9 +2897,19 @@ impl Window {
         self.day_day = day;
         self.blocks_generation += 1;
         let generation = self.blocks_generation;
-        sender.oneshot_command(async move {
-            Cmd::EventsLoaded(generation, day, client::events(day).await)
-        });
+        let days = if self.prefs.day_week {
+            model::week_days(day, self.prefs.sunday_first).to_vec()
+        } else {
+            vec![day]
+        };
+        for d in days {
+            sender.oneshot_command(async move {
+                Cmd::EventsLoaded(generation, d, client::events(d).await)
+            });
+        }
+        if self.prefs.day_week {
+            return;
+        }
         sender.oneshot_command(async move {
             // Best effort: the window still shows whatever is already stored.
             if let Err(e) = client::track_ingest(&day.to_string()).await {
@@ -3537,6 +3579,7 @@ impl Window {
                 // A block with a slot is moved in time; any other task is
                 // stepped to, as `j` and `k` do.
                 let slotted = self.nav == Nav::Day
+                    && !self.prefs.day_week
                     && self
                         .cursor_task()
                         .is_some_and(|t| self.plan_slot(&t.href, self.day_day).is_some());
@@ -3551,7 +3594,7 @@ impl Window {
             }
             Key::PlanNudge(delta) => {
                 let Some(t) = self.cursor_task() else { return };
-                if self.nav != Nav::Day {
+                if self.nav != Nav::Day || self.prefs.day_week {
                     return;
                 }
                 let day = self.day_day;
@@ -3598,6 +3641,8 @@ impl Window {
         };
         let counts = Counts::new(&data, &self.prefs.plan, now);
         let day = self.day_on_view(&open, now);
+        let week =
+            (self.nav == Nav::Day && self.prefs.day_week).then(|| self.week_on_view(&open, now));
         if let Some(tray) = &w.tray {
             tray.set(tray::State {
                 overdue: counts.overdue,
@@ -3701,7 +3746,7 @@ impl Window {
                         self.nav.key().hash(h);
                         // Day steps change `day_day`, not the wall-clock date.
                         match self.nav {
-                            Nav::Day => self.day_day.hash(h),
+                            Nav::Day => (self.day_day, self.prefs.day_week).hash(h),
                             _ => now.date_naive().hash(h),
                         }
                     }),
@@ -3770,6 +3815,27 @@ impl Window {
                         }
                     }),
                 ));
+                if let Some(week) = &week {
+                    parts.push((
+                        "week",
+                        part(|h| {
+                            for d in week {
+                                d.plan.day.hash(h);
+                                for e in &d.events {
+                                    e.hash(h);
+                                }
+                                for b in &d.plan.blocks {
+                                    let running = d
+                                        .plan
+                                        .now_min
+                                        .is_some_and(|n| b.start <= n && n < b.start + b.duration);
+                                    (&b.task.href, b.start, b.duration, b.col, b.cols, running)
+                                        .hash(h);
+                                }
+                            }
+                        }),
+                    ));
+                }
                 parts.push((
                     "slots",
                     part(|h| {
@@ -3925,6 +3991,7 @@ impl Window {
                     blocks: &self.blocks,
                     events: self.events_on(day.day),
                     plan: &day,
+                    week: week.as_deref(),
                     no_date_open: self.no_date_open,
                     px_per_hour: self.prefs.day_zoom,
                     archived: self.nav_archived(),
@@ -4300,6 +4367,14 @@ impl Window {
             "daystep" => {
                 if let Ok(delta) = arg.trim().parse::<i32>() {
                     sender.input(Msg::DayStep(delta));
+                }
+            }
+            // `dayweek week` or `dayweek day`: the header's switch.
+            "dayweek" => sender.input(Msg::DayWeek(arg.trim() == "week")),
+            // `dayopen 2026-11-03`: a date in the week, clicked.
+            "dayopen" => {
+                if let Ok(d) = arg.trim().parse::<chrono::NaiveDate>() {
+                    sender.input(Msg::DayOpen(d));
                 }
             }
             // `zoom <px>` sets the scale; `zoomby <factor>` multiplies it.

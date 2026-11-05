@@ -10,6 +10,7 @@ use std::rc::Rc;
 use asst_core::api::BlockView;
 use chrono::{NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
+use relm4::adw;
 use relm4::gtk::{self, glib, prelude::*};
 
 use crate::model::{self, PLAN_HOUR_END, PLAN_HOUR_START, scroll_to_min};
@@ -112,11 +113,9 @@ fn rules(px_per_hour: f64, reflow: &Reflow) -> gtk::Box {
 /// rides. Only when `now` falls on `day`. The dot is a sized circle, not a
 /// glyph: a Label's box is not its ink. Sized: a 2px box measures to zero.
 /// The line is as wide as the grid, the dot sits at its left end, and both
-/// hang from the top, where `center_at` sets their margin.
-fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk::Box, f64)> {
-    if now.date_naive() != day {
-        return None;
-    }
+/// hang from the top, where `center_at` sets their margin. The caller
+/// draws it only when the grid shows `now`'s day.
+fn now_line(now: chrono::DateTime<Tz>) -> (gtk::Box, gtk::Box, f64) {
     let mins = f64::from(now.time().hour()) * 60.0
         + f64::from(now.time().minute())
         + f64::from(now.time().second()) / 60.0;
@@ -129,7 +128,7 @@ fn now_line(now: chrono::DateTime<Tz>, day: NaiveDate) -> Option<(gtk::Box, gtk:
     dot.set_size_request(DOT_SIZE as i32, DOT_SIZE as i32);
     dot.set_halign(gtk::Align::Start);
     dot.set_valign(gtk::Align::Start);
-    Some((line, dot, mins))
+    (line, dot, mins)
 }
 
 /// Place `child` on `grid` so its vertical center is `y`, using its
@@ -407,15 +406,20 @@ impl ReflowInner {
     }
 }
 
-fn lane() -> gtk::Overlay {
+/// A lane at least `min_w` wide: an Overlay the view adds its chips to.
+fn lane(min_w: i32) -> gtk::Overlay {
     let overlay = gtk::Overlay::new();
     overlay.set_hexpand(true);
     let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
     box_.set_hexpand(true);
-    box_.set_size_request(120, 1);
+    box_.set_size_request(min_w, 1);
     overlay.set_child(Some(&box_));
     overlay
 }
+
+/// A week lane's least width: seven of them and the gutter fit a window
+/// on half a laptop screen beside the sidebar.
+const WEEK_LANE_W: i32 = 40;
 
 /// The hour grid, now-line, and whatever the view draws on its two lanes.
 /// Rules sit under the view's overlays and span the full width (gutter
@@ -439,29 +443,79 @@ pub fn day_grid(
     reflow: &Reflow,
     content: impl FnOnce(&Lanes),
 ) -> gtk::Widget {
+    // Time on the left, the plan and the day's events on the right: one
+    // axis, two lanes.
+    let lanes = Lanes {
+        time: lane(120),
+        plan: lane(120),
+    };
+    content(&lanes);
+    timeline(
+        &[lanes.time, lanes.plan],
+        "day-lanes",
+        (now.date_naive() == day).then_some(now),
+        px_per_hour,
+        reflow,
+        None,
+    )
+}
+
+/// The week's grid: one lane per day of `days`, equal widths, on the same
+/// hour axis as the Day grid, with the now-line across it when one of
+/// them is today. `content` fills each day's lane. The hour gutter joins
+/// `gutter_size`, so a row above the grid can line up with the lanes.
+pub fn week_grid(
+    days: &[NaiveDate],
+    now: chrono::DateTime<Tz>,
+    px_per_hour: f64,
+    reflow: &Reflow,
+    gutter_size: &gtk::SizeGroup,
+    content: impl FnOnce(&[gtk::Overlay]),
+) -> gtk::Widget {
+    let lanes: Vec<gtk::Overlay> = days.iter().map(|_| lane(WEEK_LANE_W)).collect();
+    content(&lanes);
+    timeline(
+        &lanes,
+        "week-lanes",
+        days.contains(&now.date_naive()).then_some(now),
+        px_per_hour,
+        reflow,
+        Some(gutter_size),
+    )
+}
+
+/// Rules, the gutter and `lanes` in a row of class `row_class`, and the
+/// now-line at `now` when given. The gutter joins `gutter_size` if given.
+fn timeline(
+    lanes: &[gtk::Overlay],
+    row_class: &str,
+    now: Option<chrono::DateTime<Tz>>,
+    px_per_hour: f64,
+    reflow: &Reflow,
+    gutter_size: Option<&gtk::SizeGroup>,
+) -> gtk::Widget {
     reflow.apply(px_per_hour);
 
     // Rules under everything, including the gutter, so the hour ticks and
     // the now-line share one extent.
     let rules = rules(reflow.px(), reflow);
 
-    // Time on the left, the plan and the day's events on the right: one
-    // axis, two lanes.
-    let lanes = Lanes {
-        time: lane(),
-        plan: lane(),
-    };
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    row.add_css_class("day-lanes");
+    row.add_css_class(row_class);
     row.set_hexpand(true);
-    row.append(&lanes.time);
-    row.append(&lanes.plan);
-    content(&lanes);
+    row.set_homogeneous(true);
+    for lane in lanes {
+        row.append(lane);
+    }
 
     let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     column.add_css_class("time-planner");
     column.set_hexpand(true);
-    column.append(&gutter(reflow.px(), reflow));
+    let gutter = gutter(reflow.px(), reflow);
+    if let Some(group) = gutter_size {
+        group.add_widget(&gutter);
+    }
+    column.append(&gutter);
     column.append(&row);
 
     let grid = gtk::Overlay::new();
@@ -472,25 +526,55 @@ pub fn day_grid(
     reflow.sized(&rules);
     reflow.sized(&column);
     reflow.sized(&grid);
-    if let Some((line, dot, mins)) = now_line(now, day) {
+    if let Some(now) = now {
         // Both centers on the same y: the rule's and the dot's midpoints meet.
+        let (line, dot, mins) = now_line(now);
         reflow.now_line(&grid, &line, &dot, mins);
     }
     grid.upcast()
 }
 
-/// The one day cursor the header steps.
+/// What the header's arrows step: the day on view, or its week. Each keeps
+/// its own scroll place.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DayStep {
     Day,
+    Week,
 }
 
 impl DayStep {
+    /// The day cursor moved `delta` days or weeks.
     fn msg(self, delta: i32) -> Msg {
         match self {
             DayStep::Day => Msg::DayStep(delta),
+            DayStep::Week => Msg::DayStep(delta * 7),
         }
     }
+
+    /// The arrows' tooltips and the button that comes back to now.
+    fn words(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            DayStep::Day => ("Previous day", "Next day", "Today"),
+            DayStep::Week => ("Previous week", "Next week", "This week"),
+        }
+    }
+}
+
+/// The Day / Week switch both views wear in their header.
+pub fn span_switch(week: bool, tx: &Tx) -> adw::ToggleGroup {
+    let group = adw::ToggleGroup::new();
+    group.add_css_class("round");
+    group.add_css_class("day-span");
+    for (name, label) in [("day", "Day"), ("week", "Week")] {
+        group.add(adw::Toggle::builder().name(name).label(label).build());
+    }
+    group.set_active_name(Some(if week { "week" } else { "day" }));
+    let tx = tx.clone();
+    group.connect_active_name_notify(move |g| {
+        let week = g.active_name().is_some_and(|n| n == "week");
+        let _ = tx.send(Msg::DayWeek(week));
+    });
+    group
 }
 
 fn step_button(icon: &str, tip: &str, delta: i32, step: DayStep, tx: &Tx) -> gtk::Button {
@@ -507,63 +591,65 @@ fn step_button(icon: &str, tip: &str, delta: i32, step: DayStep, tx: &Tx) -> gtk
     b
 }
 
-/// The day header both views wear: title and date on the left, an optional
-/// action of the view's, prev/next and Today on the right, and the view's note line under them.
-pub fn day_header(
-    title: &str,
-    day: NaiveDate,
-    note: &str,
-    today: NaiveDate,
-    step: DayStep,
-    action: Option<gtk::Button>,
-    tx: &Tx,
-) -> gtk::Box {
+/// What a day header shows.
+pub struct Header<'a> {
+    pub title: &'a str,
+    /// The date or the week beside the title.
+    pub date: &'a str,
+    /// The line under the title.
+    pub note: &'a str,
+    /// The day on view, which Today steps back from.
+    pub day: NaiveDate,
+    pub today: NaiveDate,
+    pub step: DayStep,
+    /// The view's own controls, ahead of the stepping buttons.
+    pub actions: Vec<gtk::Widget>,
+}
+
+/// The header Day and Week wear: title and date on the left, the view's
+/// controls, prev/next and Today on the right, and the note under them.
+pub fn day_header(h: Header<'_>, tx: &Tx) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
     let head = gtk::CenterBox::new();
     head.add_css_class("time-head");
     let left = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title_lab = gtk::Label::new(Some(title));
+    let title_lab = gtk::Label::new(Some(h.title));
     title_lab.add_css_class("view-title");
     left.append(&title_lab);
-    let date_lab = gtk::Label::new(Some(&day.format("%A, %B %-d, %Y").to_string()));
+    let date_lab = gtk::Label::new(Some(h.date));
     date_lab.add_css_class("time-date");
     date_lab.set_xalign(0.0);
+    // The controls come first when the window is narrow.
+    date_lab.set_ellipsize(gtk::pango::EllipsizeMode::End);
     left.append(&date_lab);
     head.set_start_widget(Some(&left));
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     controls.add_css_class("time-controls");
-    // The view's own action, ahead of the stepping buttons.
-    if let Some(action) = action {
+    for action in h.actions {
         action.add_css_class("time-action");
         controls.append(&action);
     }
-    let today_btn = gtk::Button::with_label("Today");
+    let (prev, next, now) = h.step.words();
+    let today_btn = gtk::Button::with_label(now);
     today_btn.add_css_class("pill");
     {
         let tx = tx.clone();
-        let showing = day;
+        let delta = h.day.signed_duration_since(h.today).num_days() as i32;
         today_btn.connect_clicked(move |_| {
-            let delta = showing.signed_duration_since(today).num_days() as i32;
             if delta != 0 {
-                let _ = tx.send(step.msg(-delta));
+                let _ = tx.send(Msg::DayStep(-delta));
             }
         });
     }
-    controls.append(&step_button(
-        "go-previous-symbolic",
-        "Previous day",
-        -1,
-        step,
-        tx,
-    ));
-    controls.append(&step_button("go-next-symbolic", "Next day", 1, step, tx));
+    controls.append(&step_button("go-previous-symbolic", prev, -1, h.step, tx));
+    controls.append(&step_button("go-next-symbolic", next, 1, h.step, tx));
     controls.append(&today_btn);
     head.set_end_widget(Some(&controls));
     root.append(&head);
 
-    let note_lab = gtk::Label::new(Some(note));
+    let note_lab = gtk::Label::new(Some(h.note));
     note_lab.add_css_class("dim-label");
     note_lab.add_css_class("caption");
     note_lab.set_xalign(0.0);
@@ -943,8 +1029,11 @@ pub fn attach_zoom(scroll: &gtk::ScrolledWindow, tx: &Tx, px_per_hour: f64) {
 /// Where a day scroller rests on attach.
 pub struct ScrollRest {
     pub step: DayStep,
+    /// The day on view, or the week's first day: a rebuild of the same one
+    /// keeps the reader's place, another re-centers.
     pub day: NaiveDate,
-    pub today: NaiveDate,
+    /// The grid shows today, so a re-center goes to now.
+    pub shows_today: bool,
     pub now_min: Option<f64>,
     pub first_min: Option<f64>,
     pub fresh_view: bool,
@@ -959,7 +1048,7 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
     let ScrollRest {
         step,
         day,
-        today,
+        shows_today,
         now_min,
         first_min,
         fresh_view,
@@ -969,7 +1058,7 @@ pub fn attach_scroll(scroll: &gtk::ScrolledWindow, rest: ScrollRest) {
     let recenter = fresh_view || kept_day != Some(day);
     // Where the scroller rests in a viewport `view_h` tall.
     let rest_y = move |view_h: f64| {
-        if recenter && day == today {
+        if recenter && shows_today {
             now_min.map_or(0.0, |m| {
                 scroll_to_min(m as u32, HOUR_START, HOUR_END, view_h, px)
             })

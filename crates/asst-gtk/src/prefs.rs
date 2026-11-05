@@ -72,6 +72,9 @@ pub struct Prefs {
     /// Day-grid zoom in pixels per hour. Clamped to a usable range on load
     /// and on change. Window-only, like the rest of this file.
     pub day_zoom: f64,
+    /// The Day view shows the whole week around its day, seven columns of
+    /// events and planned tasks, rather than the one day.
+    pub day_week: bool,
     pub views: BTreeMap<String, ViewOpts>,
 }
 
@@ -102,6 +105,7 @@ impl Default for Prefs {
             migrated_from: None,
             plan: Vec::new(),
             day_zoom: crate::model::PLAN_PX_PER_HOUR,
+            day_week: false,
             views: BTreeMap::new(),
         }
     }
