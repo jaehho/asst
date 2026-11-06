@@ -49,7 +49,7 @@ fn natural_height(b: &PlanBlock, px_per_hour: f64) -> f64 {
     f64::from(b.duration) / 60.0 * px_per_hour
 }
 
-fn min_block_h(b: &PlanBlock) -> i32 {
+pub(crate) fn min_block_h(b: &PlanBlock) -> i32 {
     if b.duration < 30 {
         MIN_BLOCK_H_SHORT
     } else {
@@ -60,7 +60,7 @@ fn min_block_h(b: &PlanBlock) -> i32 {
 /// The chip body both a placed block and the drag ghost wear. The meta line
 /// is built either way and gated by height, so a zoom that grows the chip
 /// reveals it without a rebuild.
-fn block_chip(
+pub(crate) fn block_chip(
     b: &PlanBlock,
     now_min: Option<u32>,
     px_per_hour: f64,
@@ -92,6 +92,7 @@ fn block_chip(
         let meta = gtk::Label::new(Some(&asst_core::fmt::minutes(u64::from(b.duration))));
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
+        meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&meta);
         (chip, None)
     } else {
@@ -102,6 +103,9 @@ fn block_chip(
         )));
         meta.add_css_class("plan-block-meta");
         meta.set_xalign(0.0);
+        // Ellipsized, or its width is the chip's least and a block beside
+        // another runs into the next lane.
+        meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
         chip.append(&meta);
         meta.set_visible(block_height(b, px_per_hour) >= 36);
         (chip, Some(meta))
@@ -110,7 +114,7 @@ fn block_chip(
 
 /// The row a block's chip fills. The lane's `Columns` set its width, so the
 /// chip takes all of it.
-fn block_row(chip: &gtk::Box) -> gtk::Box {
+pub(crate) fn block_row(chip: &gtk::Box) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("plan-block-row");
     row.set_hexpand(true);

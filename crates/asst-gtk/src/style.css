@@ -1037,6 +1037,41 @@ button.pill {
   margin: 4px 0 6px 0;
 }
 
+/* Week: seven day lanes under a row of dates, a hairline between days in
+   the hour rules' color. Today's date takes the now-line's blue. */
+.week-lanes > overlay {
+  border-left: 1px solid alpha(@borders, 0.55);
+}
+
+.week-heads {
+  margin-top: 6px;
+}
+
+.week-day {
+  padding: 0 2px;
+}
+
+.week-day-head {
+  padding: 2px 4px;
+  border-radius: 8px;
+}
+
+.week-day-name {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.week-day-date {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.week-day-head.today .week-day-date,
+.week-day-head.today .week-day-name {
+  color: var(--now);
+  opacity: 1;
+}
+
 /* Day view: two lanes on one time axis, and the unscheduled tray. */
 .day-columns {
   min-height: 320px;

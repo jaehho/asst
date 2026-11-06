@@ -240,20 +240,53 @@ impl DueFilter {
             DueFilter::Any => true,
             DueFilter::NoDate => due.is_none(),
             DueFilter::Today => by(today),
-            DueFilter::Week => {
-                let first = if sunday_first {
-                    Weekday::Sun
-                } else {
-                    Weekday::Mon
-                };
-                let into =
-                    (7 + today.weekday().num_days_from_monday() - first.num_days_from_monday()) % 7;
-                by(today + Duration::days(6 - i64::from(into)))
-            }
+            DueFilter::Week => by(week_days(today, sunday_first)[6]),
             DueFilter::Seven => by(today + Duration::days(6)),
             DueFilter::Month => by(last_day(today.with_day(1).unwrap_or(today))),
         }
     }
+}
+
+/// The seven days of the week `day` falls in, Monday first or Sunday
+/// first.
+pub fn week_days(day: NaiveDate, sunday_first: bool) -> [NaiveDate; 7] {
+    let first = if sunday_first {
+        Weekday::Sun
+    } else {
+        Weekday::Mon
+    };
+    let into = (7 + day.weekday().num_days_from_monday() - first.num_days_from_monday()) % 7;
+    let start = day - Duration::days(i64::from(into));
+    std::array::from_fn(|i| start + Duration::days(i as i64))
+}
+
+/// The week from `first` to `last` as the Week header reads it: `November
+/// 2 – 8, 2026`, `October 26 – November 1, 2026`, and both years across
+/// New Year.
+pub fn week_label(first: NaiveDate, last: NaiveDate) -> String {
+    let (from, to) = if first.year() != last.year() {
+        ("%B %-d, %Y", "%B %-d, %Y")
+    } else if first.month() != last.month() {
+        ("%B %-d", "%B %-d, %Y")
+    } else {
+        ("%B %-d", "%-d, %Y")
+    };
+    format!("{} – {}", first.format(from), last.format(to))
+}
+
+/// The Week header's note: the planned total and the timed and all-day
+/// events, `3 h planned · 4 events`.
+pub fn week_note(planned_min: u32, events: usize) -> String {
+    let planned = match planned_min {
+        0 => "Nothing planned".to_string(),
+        m => format!("{} planned", asst_core::fmt::minutes(u64::from(m))),
+    };
+    let events = match events {
+        0 => "no events".to_string(),
+        1 => "1 event".to_string(),
+        n => format!("{n} events"),
+    };
+    format!("{planned} · {events}")
 }
 
 /// How one view is shown, remembered per view.
@@ -2859,6 +2892,39 @@ mod tests {
             names,
             ["Apple", "b", "Task 1", "task 2", "Task 02", "Task 10"]
         );
+    }
+
+    #[test]
+    fn a_week_reads_as_one_range() {
+        let d = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        assert_eq!(
+            week_label(d(2026, 11, 2), d(2026, 11, 8)),
+            "November 2 – 8, 2026"
+        );
+        assert_eq!(
+            week_label(d(2026, 10, 26), d(2026, 11, 1)),
+            "October 26 – November 1, 2026"
+        );
+        assert_eq!(
+            week_label(d(2026, 12, 28), d(2027, 1, 3)),
+            "December 28, 2026 – January 3, 2027"
+        );
+        assert_eq!(week_note(0, 0), "Nothing planned · no events");
+        assert_eq!(week_note(90, 1), "1 h 30 min planned · 1 event");
+        assert_eq!(week_note(180, 4), "3 h planned · 4 events");
+    }
+
+    #[test]
+    fn a_week_starts_on_monday_or_sunday() {
+        // 2026-09-16 is a Wednesday.
+        let mon = week_days(date(9, 16), false);
+        assert_eq!((mon[0], mon[6]), (date(9, 14), date(9, 20)));
+        let sun = week_days(date(9, 16), true);
+        assert_eq!((sun[0], sun[6]), (date(9, 13), date(9, 19)));
+        // The first day of a week is in it, not the week before.
+        assert_eq!(week_days(date(9, 14), false)[0], date(9, 14));
+        assert_eq!(week_days(date(9, 13), true)[0], date(9, 13));
+        assert_eq!(week_days(date(9, 13), false)[0], date(9, 7));
     }
 
     #[test]

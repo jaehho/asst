@@ -106,7 +106,21 @@ pub fn build_column(
         button.connect_clicked(move |_| tx.emit(crate::window::Msg::PlanCarry));
         button
     });
-    let header = daygrid::day_header("Day", day, &note, today, DayStep::Day, carry, tx);
+    let mut actions: Vec<gtk::Widget> = vec![daygrid::span_switch(false, tx).upcast()];
+    actions.extend(carry.map(|c| c.upcast()));
+    let date = day.format("%A, %B %-d, %Y").to_string();
+    let header = daygrid::day_header(
+        daygrid::Header {
+            title: "Day",
+            date: &date,
+            note: &note,
+            day,
+            today,
+            step: DayStep::Day,
+            actions,
+        },
+        tx,
+    );
     // The header's last child is the note line: it follows the tracked
     // total without the column being rebuilt.
     let note_label = header.last_child().and_downcast::<gtk::Label>();
@@ -225,7 +239,7 @@ pub fn build_column(
         daygrid::ScrollRest {
             step: DayStep::Day,
             day,
-            today,
+            shows_today: day == today,
             now_min,
             first_min,
             fresh_view: o.fresh.view,

@@ -26,6 +26,7 @@ mod steno;
 mod time;
 mod tray;
 mod ui;
+mod week;
 mod window;
 
 pub const CSS: &str = include_str!("style.css");
