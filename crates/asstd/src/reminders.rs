@@ -2,6 +2,10 @@
 //! and a Snooze… that snoozes the first length, then opens the window's
 //! chooser for any other time; a click on one opens its task in the window.
 //!
+//! A calendar event's alarms ring too (#33), with no buttons: a click opens
+//! its day in the window's Day view. Events are read-only, so nothing a
+//! reminder does reaches the server.
+//!
 //! Timers sleep at most a minute and re-read the wall clock, so an alarm
 //! that came due while the laptop was suspended fires on wake (monotonic
 //! sleeps stop during suspend).
@@ -11,10 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asst_core::config::first_snooze;
+use asst_core::event::EventView;
 use asst_core::fmt;
 use asst_core::store::Row;
 use asst_core::task::{Task, priority_level};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use futures_util::StreamExt;
 use zbus::zvariant::Value;
@@ -24,8 +29,12 @@ use crate::daemon::Daemon;
 /// An alarm missed by more than this (laptop off) is not worth a notification.
 const GRACE: chrono::Duration = chrono::Duration::hours(12);
 
-/// How much of a task's notes a notification carries.
+/// How much of a task's notes, or an event's place, a notification carries.
 const NOTE_CHARS: usize = 120;
+
+/// How far ahead a pass reads event alarms, to sleep until the next one.
+/// A pass is at most a minute from the last, so one ahead is enough.
+const LOOKAHEAD: chrono::Duration = chrono::Duration::minutes(1);
 
 #[zbus::proxy(
     interface = "org.freedesktop.Notifications",
@@ -59,11 +68,65 @@ trait Notifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
-type Shown = Arc<Mutex<HashMap<u32, String>>>;
+/// What a click on one of our notifications opens.
+#[derive(Debug, Clone, PartialEq)]
+enum Opens {
+    Task(String),
+    /// An event's day in the Day view. The href is the event's, so its
+    /// next alarm replaces this notification.
+    Day {
+        href: String,
+        day: NaiveDate,
+    },
+}
+
+impl Opens {
+    fn href(&self) -> &str {
+        match self {
+            Opens::Task(href) | Opens::Day { href, .. } => href,
+        }
+    }
+}
+
+type Shown = Arc<Mutex<HashMap<u32, Opens>>>;
+
+/// What a reminder is for.
+#[derive(Debug, Clone)]
+enum What {
+    Task(Row),
+    /// One occurrence of a calendar event.
+    Event(EventView),
+}
+
+impl What {
+    fn href(&self) -> &str {
+        match self {
+            What::Task(row) => &row.href,
+            What::Event(e) => &e.href,
+        }
+    }
+
+    fn opens(&self, zone: Tz) -> Opens {
+        match self {
+            What::Task(row) => Opens::Task(row.href.clone()),
+            What::Event(e) => Opens::Day {
+                href: e.href.clone(),
+                day: local(e.start, zone).date_naive(),
+            },
+        }
+    }
+}
+
+/// Epoch milliseconds as a local time.
+fn local(ms: i64, zone: Tz) -> DateTime<Tz> {
+    DateTime::from_timestamp_millis(ms)
+        .unwrap_or_default()
+        .with_timezone(&zone)
+}
 
 /// A reminder to show now.
 struct Ring {
-    row: Row,
+    what: What,
     /// When it was due.
     at: DateTime<Utc>,
     /// A snooze running out, not one of the task's own alarms.
@@ -112,9 +175,9 @@ pub async fn run(daemon: Arc<Daemon>, conn: zbus::Connection) {
     loop {
         let now = Utc::now();
         let (due, next) = collect(&daemon, now);
-        let notify = |row: Row, replaces| {
+        let notify = |what: What, replaces| {
             let (proxy, daemon) = (&proxy, &daemon);
-            async move { show(proxy, daemon, &row, replaces).await }
+            async move { show(proxy, daemon, &what, replaces).await }
         };
         ring(&daemon, due, &shown, &mut outage, started, notify).await;
         let wait = next
@@ -139,37 +202,38 @@ async fn ring<F>(
     shown: &Shown,
     outage: &mut Outage,
     started: DateTime<Utc>,
-    show: impl Fn(Row, u32) -> F,
+    show: impl Fn(What, u32) -> F,
 ) where
     F: Future<Output = zbus::Result<u32>>,
 {
-    for Ring { row, at, snoozed } in due {
-        // One notification per task: a new one replaces the last.
+    for Ring { what, at, snoozed } in due {
+        let href = what.href().to_string();
+        // One notification per task or event: a new one replaces the last.
         let replaces = shown
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .find(|(_, h)| **h == row.href)
+            .find(|(_, o)| o.href() == href)
             .map(|(id, _)| *id);
-        match show(row.clone(), replaces.unwrap_or(0)).await {
+        match show(what.clone(), replaces.unwrap_or(0)).await {
             Ok(id) => {
                 if outage.over() {
                     log::info!("the notification server is back; reminders show again");
                 }
                 {
                     let store = daemon.store();
-                    if let Err(e) = store.mark_fired(&row.href, at) {
+                    if let Err(e) = store.mark_fired(&href, at) {
                         log::warn!("recording a reminder: {e}");
                     }
                     if snoozed {
-                        let _ = store.unsnooze_at(&row.href, at);
+                        let _ = store.unsnooze_at(&href, at);
                     }
                 }
                 let mut s = shown.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(old) = replaces {
                     s.remove(&old);
                 }
-                s.insert(id, row.href.clone());
+                s.insert(id, what.opens(daemon.zone));
             }
             Err(e) => {
                 if outage.failed(&e) {
@@ -181,7 +245,7 @@ async fn ring<F>(
                 // it was due or asstd started, whichever is later.
                 if snoozed && Utc::now() - at.max(started) > GRACE {
                     log::warn!("dropping a snoozed reminder that would not show");
-                    let _ = daemon.store().unsnooze_at(&row.href, at);
+                    let _ = daemon.store().unsnooze_at(&href, at);
                 }
             }
         }
@@ -202,13 +266,32 @@ fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) 
                 let keep = due.get(&row.href).is_none_or(|prev| prev.at < at);
                 if keep {
                     let ring = Ring {
-                        row: row.clone(),
+                        what: What::Task(row.clone()),
                         at,
                         snoozed: false,
                     };
                     due.insert(row.href.clone(), ring);
                 }
             }
+        }
+    }
+    let rings = store
+        .event_alarms(now - GRACE, now + LOOKAHEAD)
+        .unwrap_or_default();
+    for ring in rings {
+        let (href, at) = (ring.event.href.clone(), ring.at);
+        if at > now {
+            later(at);
+        } else if !over(&ring.event, at, now)
+            && !store.fired(&href, at).unwrap_or(true)
+            && due.get(&href).is_none_or(|prev| prev.at < at)
+        {
+            let ring = Ring {
+                what: What::Event(ring.event),
+                at,
+                snoozed: false,
+            };
+            due.insert(href, ring);
         }
     }
     for (href, until) in store.snoozed().unwrap_or_default() {
@@ -222,7 +305,7 @@ fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) 
                 due.insert(
                     href,
                     Ring {
-                        row,
+                        what: What::Task(row),
                         at: until,
                         snoozed: true,
                     },
@@ -239,25 +322,40 @@ fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) 
     (due.into_values().collect(), next)
 }
 
+/// Whether an event's reminder comes too late to be worth showing: its
+/// occurrence is over (the laptop slept through it). An alarm set at or
+/// after the end still rings on time.
+fn over(event: &EventView, at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.timestamp_millis() >= event.end && now - at > chrono::Duration::minutes(1)
+}
+
 async fn show(
     proxy: &NotificationsProxy<'_>,
     daemon: &Daemon,
-    row: &Row,
+    what: &What,
     replaces: u32,
 ) -> zbus::Result<u32> {
     let now = Utc::now().with_timezone(&daemon.zone);
-    let list = daemon
-        .store()
-        .lists()
-        .ok()
-        .and_then(|ls| ls.into_iter().find(|l| l.href == row.list));
-    let body = body(&row.task, list.as_ref().map(|l| l.name.as_str()), now);
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
     hints.insert("desktop-entry", Value::from(asst_core::config::APP_ID));
-    if priority_level(row.task.priority) == 1 {
-        hints.insert("urgency", Value::U8(2));
-    }
-    let buttons = actions_for(&row.task.uid, &daemon.config().snooze);
+    let (summary, body, buttons) = match what {
+        What::Task(row) => {
+            let list = daemon
+                .store()
+                .lists()
+                .ok()
+                .and_then(|ls| ls.into_iter().find(|l| l.href == row.list));
+            if priority_level(row.task.priority) == 1 {
+                hints.insert("urgency", Value::U8(2));
+            }
+            (
+                row.task.summary.as_str(),
+                body(&row.task, list.as_ref().map(|l| l.name.as_str()), now),
+                actions_for(&row.task.uid, &daemon.config().snooze),
+            )
+        }
+        What::Event(e) => (e.summary.as_str(), event_body(e, now), event_actions()),
+    };
     let actions: Vec<&str> = buttons
         .iter()
         .flat_map(|(key, label)| [key.as_str(), label.as_str()])
@@ -267,7 +365,7 @@ async fn show(
             "asst",
             replaces,
             asst_core::config::APP_ID,
-            &row.task.summary,
+            summary,
             &body,
             &actions,
             hints,
@@ -305,15 +403,62 @@ fn body(task: &Task, list: Option<&str>, now: DateTime<Tz>) -> String {
         .as_deref()
         .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()));
     if let Some(line) = first {
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        body.extend(line.chars().take(NOTE_CHARS));
-        if line.chars().count() > NOTE_CHARS {
-            body.push('…');
-        }
+        push_line(&mut body, line);
     }
     body
+}
+
+/// `line` on a line of its own under `body`, cut at NOTE_CHARS.
+fn push_line(body: &mut String, line: &str) {
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.extend(line.chars().take(NOTE_CHARS));
+    if line.chars().count() > NOTE_CHARS {
+        body.push('…');
+    }
+}
+
+/// The lines under an event's title: how soon and when, then where. The
+/// place's lines (a name, then an address, as iOS writes it) run together.
+fn event_body(event: &EventView, now: DateTime<Tz>) -> String {
+    let zone = now.timezone();
+    let (start, end) = (local(event.start, zone), local(event.end, zone));
+    let soon = fmt::until_label(start, now).or_else(|| {
+        // An alarm at the start rings a moment after it: that is now.
+        (start <= now && now < end.max(start + chrono::Duration::minutes(1)))
+            .then(|| "now".to_string())
+    });
+    let span = fmt::span_label(start, end, now.date_naive());
+    let mut body = capitalized(&match soon {
+        Some(soon) => format!("{soon} · {span}"),
+        None => span,
+    });
+    let place: Vec<&str> = event
+        .location
+        .iter()
+        .flat_map(|l| l.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !place.is_empty() {
+        push_line(&mut body, &place.join(", "));
+    }
+    body
+}
+
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// An event's notification has no buttons: a click on it ("default")
+/// opens its day, and there is nothing to complete or snooze.
+fn event_actions() -> Vec<(String, String)> {
+    vec![("default".to_string(), "Open".to_string())]
 }
 
 /// A notification's actions as (key, label), in the order they show:
@@ -422,11 +567,11 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
             Some(signal) = actions.next() => {
                 let Ok(args) = signal.args() else { continue };
                 let Some(plan) = plan_action(args.action_key, &daemon.config().snooze) else { continue };
-                let href = match plan.uid {
-                    Some(uid) => href_of(&daemon, uid),
+                let opens = match plan.uid {
+                    Some(uid) => href_of(&daemon, uid).map(Opens::Task),
                     None => shown.lock().unwrap_or_else(|p| p.into_inner()).get(&args.id).cloned(),
                 };
-                let Some(href) = href else {
+                let Some(opens) = opens else {
                     // A click on a notification we cannot match to a task:
                     // another app's, or ours from before a restart. A
                     // button for a task that is gone closes its
@@ -438,25 +583,33 @@ async fn buttons(daemon: Arc<Daemon>, proxy: NotificationsProxy<'static>, shown:
                     continue;
                 };
                 let mut token = token.take().filter(|(id, _)| *id == args.id).map(|(_, t)| t);
+                let href = opens.href().to_string();
                 for step in plan.steps {
                     let conn = proxy.inner().connection();
-                    match step {
-                        Step::Open => {
+                    match (step, &opens) {
+                        (Step::Open, Opens::Day { day, .. }) => {
+                            if let Err(e) = asst_core::api::open_day_in_window(conn, *day, token.take()).await {
+                                log::info!("opening an event's day from its notification: {e}");
+                            }
+                        }
+                        // The buttons below are only on a task's.
+                        (_, Opens::Day { .. }) => {}
+                        (Step::Open, Opens::Task(_)) => {
                             if let Err(e) = asst_core::api::open_in_window(conn, &href, token.take()).await {
                                 log::info!("opening a task from its notification: {e}");
                             }
                         }
-                        Step::Chooser => {
+                        (Step::Chooser, _) => {
                             if let Err(e) = asst_core::api::snooze_in_window(conn, &href, token.take()).await {
                                 log::info!("opening the snooze chooser from a notification: {e}");
                             }
                         }
-                        Step::Complete => {
+                        (Step::Complete, _) => {
                             if let Err(e) = daemon.complete(&href) {
                                 log::warn!("{} from a notification: {e}", args.action_key);
                             }
                         }
-                        Step::Snooze(minutes) => {
+                        (Step::Snooze(minutes), _) => {
                             if let Err(e) = daemon.snooze(&href, minutes) {
                                 log::warn!("{} from a notification: {e}", args.action_key);
                             }
@@ -525,7 +678,7 @@ mod tests {
     ) -> usize {
         let (due, _) = collect(daemon, Utc::now());
         let count = due.len();
-        let notify = |_row: Row, _replaces| async move {
+        let notify = |_what: What, _replaces| async move {
             if server_up.get() {
                 Ok(7)
             } else {
@@ -558,7 +711,10 @@ mod tests {
         up.set(true);
         assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 1);
         assert!(daemon.store().fired(&href, at).unwrap());
-        assert_eq!(shown.lock().unwrap().get(&7), Some(&href));
+        assert_eq!(
+            shown.lock().unwrap().get(&7),
+            Some(&Opens::Task(href.clone()))
+        );
         assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 0);
     }
 
@@ -611,6 +767,109 @@ mod tests {
         daemon.store().snooze(&href, ago(1)).unwrap();
         assert_eq!(pass(&daemon, &up, &shown, &mut outage, long_ago).await, 1);
         assert_eq!(snoozed(), 1);
+    }
+
+    /// A daemon whose calendar holds one event from `start` to `end`
+    /// minutes from now, with an alarm `before` minutes ahead of its
+    /// start; and the event's href.
+    fn with_event(start: i64, end: i64, before: i64) -> (Arc<Daemon>, String) {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        store
+            .apply_calendars(&[RemoteList {
+                href: "/cal/personal/".into(),
+                name: "Personal".into(),
+                color: None,
+                order: None,
+                sync_token: Some("t1".into()),
+                ctag: None,
+                writable: false,
+            }])
+            .unwrap();
+        let stamp = |m: i64| ago(-m).format("%Y%m%dT%H%M%SZ").to_string();
+        let href = "/cal/personal/dentist.ics".to_string();
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:dentist\r\nSUMMARY:Dentist\r\n\
+DTSTART:{}\r\nDTEND:{}\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT{before}M\r\n\
+END:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            stamp(start),
+            stamp(end)
+        );
+        assert!(
+            store
+                .put_event("/cal/personal/", &href, "e1", &ics)
+                .unwrap()
+        );
+        let (daemon, _events) = Daemon::new(Config::default(), store, zone);
+        (daemon, href)
+    }
+
+    #[tokio::test]
+    async fn an_event_alarm_rings_once_and_its_click_opens_the_day() {
+        // Starts in 10 minutes, with an alarm 15 before: 5 minutes ago.
+        let (daemon, href) = with_event(10, 70, 15);
+        let (up, shown, mut outage) = (Cell::new(true), Shown::default(), Outage::default());
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, ago(60)).await, 1);
+        assert!(daemon.store().fired(&href, ago(5)).unwrap());
+        let day = ago(-10).with_timezone(&daemon.zone).date_naive();
+        assert_eq!(
+            shown.lock().unwrap().get(&7),
+            Some(&Opens::Day { href, day })
+        );
+        assert_eq!(pass(&daemon, &up, &shown, &mut outage, ago(60)).await, 0);
+    }
+
+    #[test]
+    fn an_event_alarm_waits_for_its_time_and_not_past_the_event() {
+        // An alarm half a minute out is the next wake-up, not due.
+        let (daemon, _) = with_event(15, 75, 15);
+        let (due, next) = collect(&daemon, Utc::now() - chrono::Duration::seconds(30));
+        assert!(due.is_empty());
+        assert!(next.is_some());
+        // The laptop slept through it: an hour-long event that ended
+        // ten minutes ago, its alarm 85 minutes back.
+        let (daemon, _) = with_event(-70, -10, 15);
+        assert!(collect(&daemon, Utc::now()).0.is_empty());
+        // Under way, it still rings, late.
+        let (daemon, _) = with_event(-20, 40, 15);
+        assert_eq!(collect(&daemon, Utc::now()).0.len(), 1);
+    }
+
+    #[test]
+    fn an_events_body_says_how_soon_when_and_where() {
+        let now = midnight_ish();
+        let event = |start: i64, end: i64, place: Option<&str>| EventView {
+            href: "/cal/personal/x.ics".into(),
+            calendar: "/cal/personal/".into(),
+            calendar_name: "Personal".into(),
+            color: None,
+            summary: "Dentist".into(),
+            location: place.map(str::to_string),
+            all_day: false,
+            start: (now + chrono::Duration::minutes(start)).timestamp_millis(),
+            end: (now + chrono::Duration::minutes(end)).timestamp_millis(),
+        };
+        let body = |e: EventView| event_body(&e, now);
+        assert_eq!(
+            body(event(15, 75, Some("Dr Kim\n12 Main St"))),
+            "In 15 min · 12:23am – 1:23am\nDr Kim, 12 Main St"
+        );
+        // An alarm at the start, or late while it is under way.
+        assert_eq!(body(event(0, 60, None)), "Now · 12:08am – 1:08am");
+        assert_eq!(
+            body(event(-30, 30, None)),
+            "Now · yesterday 11:38pm – 12:38am"
+        );
+        // A day ahead says which day; its end at midnight needs none.
+        assert_eq!(
+            body(event(24 * 60 + 52, 24 * 60 + 112, None)),
+            "Tomorrow 1am – 2am"
+        );
+        // Over, rung on time by an alarm at its end; a blank place is none.
+        assert_eq!(
+            body(event(-90, -30, Some("  "))),
+            "Yesterday 10:38pm – 11:38pm"
+        );
     }
 
     #[test]

@@ -251,6 +251,9 @@ pub enum Msg {
     /// Show the window at a task: the `open-task` action, as a reminder's
     /// notification sends it.
     OpenTask(String),
+    /// Show the window at a day in the Day view: the `open-day` action, as
+    /// an event's reminder sends it.
+    OpenDay(chrono::NaiveDate),
     /// The chooser for when to ring a task's reminder again: the
     /// `snooze-task` action, from a notification's Snooze….
     SnoozePrompt(String),
@@ -1044,6 +1047,16 @@ impl Component for Window {
                 }
             });
             relm4::main_application().add_action(&open);
+            // An event's reminder shows its day.
+            let day = gio::SimpleAction::new("open-day", Some(glib::VariantTy::STRING));
+            let day_tx = tx.clone();
+            day.connect_activate(move |_, date| {
+                let date = date.and_then(|v| v.str()).and_then(|d| d.parse().ok());
+                if let Some(date) = date {
+                    day_tx.emit(Msg::OpenDay(date));
+                }
+            });
+            relm4::main_application().add_action(&day);
             let snooze = gio::SimpleAction::new("snooze-task", Some(glib::VariantTy::STRING));
             let tx = tx.clone();
             snooze.connect_activate(move |_, id| {
@@ -2115,6 +2128,11 @@ impl Component for Window {
             Msg::OpenTask(id) => {
                 w.window.present();
                 sender.input(Msg::Reveal(id));
+            }
+            Msg::OpenDay(day) => {
+                w.window.present();
+                sender.input(Msg::Navigate(Nav::Day));
+                sender.input(Msg::DayOpen(day));
             }
             // Ask the daemon, not the window's copy: a window the bus just
             // started has not loaded yet.
