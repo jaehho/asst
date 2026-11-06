@@ -500,6 +500,16 @@ pub async fn open_in_window(
     activate_in_window(conn, "open-task", href, token).await
 }
 
+/// Show a day in the window's Day view (`open-day`, with the date as
+/// `YYYY-MM-DD`), started the same way: where an event's reminder goes.
+pub async fn open_day_in_window(
+    conn: &zbus::Connection,
+    day: chrono::NaiveDate,
+    token: Option<String>,
+) -> zbus::Result<()> {
+    activate_in_window(conn, "open-day", &day.format("%Y-%m-%d").to_string(), token).await
+}
+
 /// The window's chooser for when to ring a task's reminder again
 /// (`snooze-task`), started the same way. The caller snoozes the task
 /// first, so closing the chooser leaves the reminder ringing again.

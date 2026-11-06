@@ -88,6 +88,34 @@ pub fn until_label(at: DateTime<Tz>, now: DateTime<Tz>) -> Option<String> {
     })
 }
 
+/// `10am – 11am`, `tomorrow 9:30am – 10:30am`, `10pm – tomorrow 1am`: an
+/// event's times for a notification. The start names its day unless it is
+/// `today`; the end only when that differs from the start's and is not
+/// today, and not for the midnight after the start's day.
+pub fn span_label(start: DateTime<Tz>, end: DateTime<Tz>, today: NaiveDate) -> String {
+    let at = |t: DateTime<Tz>, with_day: bool| {
+        if with_day {
+            format!(
+                "{} {}",
+                day_label(t.date_naive(), today),
+                time_label(t.time())
+            )
+        } else {
+            time_label(t.time())
+        }
+    };
+    let first = at(start, start.date_naive() != today);
+    if end <= start {
+        return first;
+    }
+    let (from, to) = (start.date_naive(), end.date_naive());
+    let midnight = end.time() == NaiveTime::MIN && to == from + Duration::days(1);
+    format!(
+        "{first} – {}",
+        at(end, to != from && to != today && !midnight)
+    )
+}
+
 /// `daily`, `every 2 weeks`, `every Mon, Thu`, `monthly on the 15th`; the
 /// rule itself when it says something more unusual.
 pub fn repeat_label(rrule: &str) -> String {
@@ -267,6 +295,25 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+
+    #[test]
+    fn an_events_span_names_a_day_only_where_it_is_not_today() {
+        let ny: Tz = "America/New_York".parse().unwrap();
+        let at = |d, h, m| ny.with_ymd_and_hms(2026, 9, d, h, m, 0).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 14).unwrap();
+        let span = |a, b| span_label(a, b, today);
+        assert_eq!(span(at(14, 10, 0), at(14, 11, 0)), "10am – 11am");
+        assert_eq!(
+            span(at(15, 9, 30), at(15, 10, 30)),
+            "tomorrow 9:30am – 10:30am"
+        );
+        assert_eq!(span(at(14, 22, 0), at(15, 1, 0)), "10pm – tomorrow 1am");
+        assert_eq!(span(at(14, 23, 0), at(15, 0, 0)), "11pm – 12am");
+        assert_eq!(span(at(13, 23, 0), at(14, 1, 0)), "yesterday 11pm – 1am");
+        assert_eq!(span(at(15, 22, 0), at(16, 1, 0)), "tomorrow 10pm – Wed 1am");
+        // No length: the moment.
+        assert_eq!(span(at(14, 10, 0), at(14, 10, 0)), "10am");
+    }
 
     #[test]
     fn labels() {

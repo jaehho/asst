@@ -15,7 +15,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 
 use crate::caldav::RemoteList;
-use crate::event::{Event, EventView};
+use crate::event::{Event, EventRing, EventView, Occurrence};
 use crate::github::Pair;
 use crate::ical::Ical;
 use crate::task::{self, Edit, EditError, Task};
@@ -789,12 +789,64 @@ impl Store {
         let start = crate::time::resolve(self.zone, day.and_time(chrono::NaiveTime::MIN));
         let from = (start - chrono::Duration::days(2)).timestamp_millis();
         let to = (start + chrono::Duration::days(3)).timestamp_millis();
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT e.href, e.ics, c.href, c.name, c.color FROM events e
-             JOIN calendars c ON c.href = e.calendar
-             WHERE e.start_at < ?2 AND (e.end_at IS NULL OR e.end_at >= ?1)",
+        let rows = self.stored_events(
+            "e.start_at < ?2 AND (e.end_at IS NULL OR e.end_at >= ?1)",
+            params![from, to],
         )?;
-        let rows = stmt.query_map(params![from, to], |r| {
+        let mut out = Vec::new();
+        for (href, event, calendar) in rows {
+            out.extend(
+                event
+                    .on(day, self.zone)
+                    .into_iter()
+                    .map(|o| event_view(&href, &calendar, &event, o)),
+            );
+        }
+        out.sort_by(|a, b| {
+            (!a.all_day, a.start, &a.summary, &a.href)
+                .cmp(&(!b.all_day, b.start, &b.summary, &b.href))
+        });
+        Ok(out)
+    }
+
+    /// The event alarms that ring from `from` up to but not including
+    /// `to`, soonest first (`Event::alarms_between`).
+    pub fn event_alarms(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<EventRing>> {
+        // An alarm rings near its occurrence: one a week after an event
+        // ended is not worth reading every event for.
+        let ended = (from - chrono::Duration::days(7)).timestamp_millis();
+        let rows = self.stored_events(
+            "e.ics LIKE '%BEGIN:VALARM%' AND (e.end_at IS NULL OR e.end_at >= ?1)",
+            params![ended],
+        )?;
+        let mut out = Vec::new();
+        for (href, event, calendar) in rows {
+            out.extend(
+                event
+                    .alarms_between(from, to, self.zone)
+                    .into_iter()
+                    .map(|r| EventRing {
+                        at: r.at,
+                        event: event_view(&href, &calendar, &event, r.occurrence),
+                    }),
+            );
+        }
+        out.sort_by(|a, b| (a.at, &a.event.href).cmp(&(b.at, &b.event.href)));
+        Ok(out)
+    }
+
+    /// The stored events `filter` picks, with their calendars, read. One
+    /// that holds no event any more is left out.
+    fn stored_events(
+        &self,
+        filter: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<(String, Event, ListRow)>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT e.href, e.ics, c.href, c.name, c.color FROM events e
+             JOIN calendars c ON c.href = e.calendar WHERE {filter}"
+        ))?;
+        let rows = stmt.query_map(params, |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -811,25 +863,10 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (href, ics, calendar) = row?;
-            let Some(event) = Event::from_ical(&Ical::parse(&ics)) else {
-                continue;
-            };
-            out.extend(event.on(day, self.zone).into_iter().map(|o| EventView {
-                href: href.clone(),
-                calendar: calendar.href.clone(),
-                calendar_name: calendar.name.clone(),
-                color: calendar.color.clone(),
-                summary: event.summary.clone(),
-                location: event.location.clone(),
-                all_day: o.all_day,
-                start: o.start,
-                end: o.end,
-            }));
+            if let Some(event) = Event::from_ical(&Ical::parse(&ics)) {
+                out.push((href, event, calendar));
+            }
         }
-        out.sort_by(|a, b| {
-            (!a.all_day, a.start, &a.summary, &a.href)
-                .cmp(&(!b.all_day, b.start, &b.summary, &b.href))
-        });
         Ok(out)
     }
 
@@ -1674,6 +1711,21 @@ impl Store {
             "DELETE FROM blocks WHERE source LIKE ?1",
             params![format!("{prefix}%")],
         )?)
+    }
+}
+
+/// One occurrence of a stored event, as the window draws it.
+fn event_view(href: &str, calendar: &ListRow, event: &Event, o: Occurrence) -> EventView {
+    EventView {
+        href: href.to_string(),
+        calendar: calendar.href.clone(),
+        calendar_name: calendar.name.clone(),
+        color: calendar.color.clone(),
+        summary: event.summary.clone(),
+        location: event.location.clone(),
+        all_day: o.all_day,
+        start: o.start,
+        end: o.end,
     }
 }
 
@@ -3020,5 +3072,45 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
                 (links, pairs)
             );
         }
+    }
+
+    #[test]
+    fn an_event_alarm_comes_with_its_occurrence_and_calendar() {
+        let mut s = Store::in_memory(ny()).unwrap();
+        s.apply_calendars(&[list("/cal/personal/", "Personal", "t1")])
+            .unwrap();
+        let ics = |uid: &str, alarm: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:Dentist\r\nLOCATION:Main St\r\n\
+DTSTART:20260914T140000Z\r\nDTEND:20260914T150000Z\r\n{alarm}END:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        let alarm = "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n";
+        s.put_event(
+            "/cal/personal/",
+            "/cal/personal/a.ics",
+            "e1",
+            &ics("a", alarm),
+        )
+        .unwrap();
+        s.put_event("/cal/personal/", "/cal/personal/b.ics", "e1", &ics("b", ""))
+            .unwrap();
+        let at = |h, m| Utc.with_ymd_and_hms(2026, 9, 14, h, m, 0).unwrap();
+
+        let rings = s.event_alarms(at(13, 0), at(14, 0)).unwrap();
+        assert_eq!(rings.len(), 1, "only the event with an alarm");
+        assert_eq!(rings[0].at, at(13, 45));
+        let e = &rings[0].event;
+        assert_eq!(
+            (
+                e.href.as_str(),
+                e.summary.as_str(),
+                e.calendar_name.as_str()
+            ),
+            ("/cal/personal/a.ics", "Dentist", "Personal")
+        );
+        assert_eq!(e.location.as_deref(), Some("Main St"));
+        assert_eq!(e.start, at(14, 0).timestamp_millis());
+        assert!(s.event_alarms(at(13, 46), at(20, 0)).unwrap().is_empty());
     }
 }

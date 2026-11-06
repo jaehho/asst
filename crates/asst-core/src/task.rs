@@ -167,15 +167,7 @@ impl Task {
             alarms: todo
                 .components()
                 .filter(|c| c.is("VALARM"))
-                .filter_map(|a| {
-                    Some(Alarm {
-                        trigger: timed_trigger(a)?,
-                        acknowledged: a
-                            .property("ACKNOWLEDGED")
-                            .and_then(|p| parse_datetime(p.value().trim()))
-                            .map(|(at, _)| at.and_utc()),
-                    })
-                })
+                .filter_map(timed_alarm)
                 .collect(),
             location_alarms: todo
                 .components()
@@ -219,6 +211,18 @@ impl Task {
     fn alarm_instant(&self, a: &Alarm, local: Tz) -> Option<DateTime<Utc>> {
         trigger_instant(&a.trigger, self.due.as_ref(), local)
     }
+}
+
+/// A VALARM that goes off at a time, and when it was last acknowledged on
+/// any device. A task's alarms and an event's are read the same way.
+pub(crate) fn timed_alarm(alarm: &Component) -> Option<Alarm> {
+    Some(Alarm {
+        trigger: timed_trigger(alarm)?,
+        acknowledged: alarm
+            .property("ACKNOWLEDGED")
+            .and_then(|p| parse_datetime(p.value().trim()))
+            .map(|(at, _)| at.and_utc()),
+    })
 }
 
 /// A VALARM's trigger, when it goes off at a time: location alarms fire on
