@@ -116,6 +116,10 @@ enum Cmd {
         #[arg(value_name = "OWNER/REPO")]
         repo: String,
     },
+    /// Open an issue for a task another app filed into a public repo's
+    /// list, which is otherwise kept off it (`asst show` says so). The
+    /// issue is public, notes and all
+    Publish { id: String },
     /// What the ties to GitHub repos need: lists to rename, retired repos,
     /// old labels. Reads and proposes; changes nothing. `asst projects log`
     /// is what asstd did by itself
@@ -568,6 +572,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 row("source", s.clone());
             }
             row("origin", t.origin.to_string());
+            if let Some(repo) = &t.kept_off {
+                row(
+                    "github",
+                    format!(
+                        "no issue: {repo} is public (`asst publish {}` opens one)",
+                        t.id
+                    ),
+                );
+            }
             if t.pending {
                 row("sync", "waiting to be sent".into());
             }
@@ -713,6 +726,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !json {
                 println!("{} {repo}", style.dim("Unlinked:"));
+            }
+        }
+        Cmd::Publish { id } => {
+            let raw = proxy.publish(&id).await?;
+            if json {
+                return show_json(&raw);
+            }
+            let t: TaskView = serde_json::from_str(&raw)?;
+            match &t.issue {
+                Some(issue) => println!(
+                    "{} {} is #{}",
+                    style.dim("Already:"),
+                    t.task.summary,
+                    issue.number
+                ),
+                None => println!(
+                    "{} {} (on the next pass)",
+                    style.dim("Publishing:"),
+                    t.task.summary
+                ),
             }
         }
         Cmd::Projects { action: None } => {

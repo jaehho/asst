@@ -579,6 +579,7 @@ mod tests {
             list_name: "L".into(),
             pending: false,
             issue: None,
+            kept_off: None,
             origin: "asst".into(),
             task: Task {
                 uid: id.into(),

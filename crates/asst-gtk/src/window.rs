@@ -211,6 +211,8 @@ pub enum Msg {
     Unadd(String),
     /// Run the work command in the checkout of the task's issue's repo.
     StartWork(String),
+    /// Open an issue for a task kept off its list's public repo.
+    Publish(String),
     /// A link, in the browser.
     OpenUrl(String),
     /// The steno meeting a task came from, by its name, in steno.
@@ -1500,6 +1502,15 @@ impl Component for Window {
                         client::duplicate(&href)
                             .await
                             .map(|t| format!("Duplicated {}", quoted(&t.task.summary))),
+                    )
+                });
+            }
+            Msg::Publish(href) => {
+                sender.oneshot_command(async move {
+                    Cmd::Toast(
+                        client::publish(&href)
+                            .await
+                            .map(|t| format!("Opening an issue for {}", quoted(&t.task.summary))),
                     )
                 });
             }

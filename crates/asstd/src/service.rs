@@ -167,6 +167,10 @@ impl Service {
         self.daemon.unlink(repo).map_err(failed)
     }
 
+    async fn publish(&self, id: &str) -> fdo::Result<String> {
+        json(&self.daemon.publish(id).map_err(failed)?)
+    }
+
     async fn links(&self) -> fdo::Result<String> {
         json(&self.daemon.links(chrono::Utc::now()).map_err(failed)?)
     }

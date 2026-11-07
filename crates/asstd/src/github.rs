@@ -236,6 +236,10 @@ async fn identify(
     let baseline = row.archived.map(|t| t > 0);
     let verdict = github::judge(row.repo_id, repo, baseline, &seen);
     let gate = apply_verdict(daemon, memory, row, verdict, &seen, now)?;
+    // What the window says about a task kept off the repo comes from here
+    if gate == Gate::Go && matches!(seen, Observed::Record(..)) {
+        daemon.gh_visibility(repo, private);
+    }
     Ok((gate, private))
 }
 
@@ -684,9 +688,11 @@ async fn pass(
             })
             .collect();
         let pairs = store.gh_pairs(repo)?;
+        let anyway = daemon.gh_publish_anyway(repo);
         let held: HashSet<&str> = rows
             .iter()
             .filter(|r| !github::publishable(private, r.task.source.as_deref()))
+            .filter(|r| !anyway.contains(&r.task.uid))
             .map(|r| r.task.uid.as_str())
             .collect();
         let ops = github::plan_holding(&issues, &tasks, &pairs, &held);
@@ -698,7 +704,7 @@ async fn pass(
         if memory.held.insert(repo.to_string(), waiting).unwrap_or(0) != waiting && waiting > 0 {
             log::info!(
                 "{repo} is public: {waiting} task(s) another app filed into its list stay \
-                 tasks and open no issue"
+                 tasks and open no issue (`asst publish ID` opens one)"
             );
         }
         let hrefs: HashMap<String, String> =
@@ -1468,6 +1474,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_kept_off_says_so_and_can_be_published_on_purpose() {
+        let mut rig = Rig::new(&["jaehho/demo"]).await;
+        rig.publish(9, "jaehho/demo", false);
+        rig.take_new_issues("jaehho/demo");
+        rig.file("jaehho/demo", "Send the draft", Some(MEETING));
+        rig.file("jaehho/demo", "Fix the plot", None);
+        let uid = |rig: &Rig, source: Option<&str>| {
+            let list = rig.row("jaehho/demo").list;
+            let rows = rig.daemon.store().list_tasks(&list).unwrap();
+            let row = rows
+                .into_iter()
+                .find(|r| r.task.source.as_deref() == source);
+            row.expect("filed").task.uid
+        };
+        let (meeting, typed) = (uid(&rig, Some(MEETING)), uid(&rig, None));
+
+        // Before any look at the repo, nothing is said: it may be private
+        assert_eq!(rig.daemon.get(&meeting).unwrap().kept_off, None);
+        assert_eq!(rig.go().await, Round::Done);
+        let seen = rig.daemon.get(&meeting).unwrap();
+        assert_eq!(seen.kept_off.as_deref(), Some("jaehho/demo"));
+        assert_eq!(seen.issue, None);
+        let typed_view = rig.daemon.get(&typed).unwrap();
+        assert_eq!(typed_view.kept_off, None);
+        assert!(typed_view.issue.is_some());
+
+        // Asked for, it opens on the next pass and stays paired after
+        let asked = rig.daemon.publish(&meeting).unwrap();
+        assert_eq!(asked.kept_off, None);
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(
+            rig.opened("jaehho/demo"),
+            ["Fix the plot", "Send the draft"]
+        );
+        let published = rig.daemon.get(&meeting).unwrap();
+        assert_eq!(published.kept_off, None);
+        assert_eq!(published.issue.map(|i| i.number), Some(2));
+        rig.restart();
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.opened("jaehho/demo").len(), 2);
+        assert_eq!(rig.daemon.store().gh_pairs("jaehho/demo").unwrap().len(), 2);
+
+        // Only a task in a linked list, and an open one, can be asked for
+        let edits = [Edit::Summary("Buy milk".into())];
+        let inbox = rig.daemon.store().create(INBOX, &edits, rig.now).unwrap();
+        assert!(rig.daemon.publish(&inbox.task.uid).is_err());
+        rig.daemon.complete(&typed).unwrap();
+        assert!(rig.daemon.publish(&typed).is_err());
+    }
+
+    #[tokio::test]
     async fn a_private_repo_gets_every_task_as_before() {
         let mut rig = Rig::new(&["jaehho/notes"]).await;
         rig.publish_as(5, "jaehho/notes", false, true);
@@ -1480,6 +1539,8 @@ mod tests {
             rig.opened("jaehho/notes"),
             ["Fix the plot", "Send the draft"]
         );
+        let filed = rig.daemon.store().by_source(MEETING).unwrap().unwrap();
+        assert_eq!(rig.daemon.get(&filed.task.uid).unwrap().kept_off, None);
     }
 
     #[tokio::test]

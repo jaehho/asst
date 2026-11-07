@@ -72,6 +72,10 @@ pub trait Asst {
     fn link(&self, list: &str, repo: &str) -> zbus::Result<String>;
     /// `owner/repo` → whether there was a link to drop.
     fn unlink(&self, repo: &str) -> zbus::Result<bool>;
+    /// id → `TaskView`: a task kept off its list's public repo
+    /// (`TaskView::kept_off`) opens an issue there on the next pass, and is
+    /// paired with it from then on. A no-op for a task with an issue.
+    fn publish(&self, id: &str) -> zbus::Result<String>;
     /// → `[LinkView]`
     fn links(&self) -> zbus::Result<String>;
     /// `owner/repo` (any case; `""` for every repo), how many rows at most
@@ -256,6 +260,11 @@ pub struct TaskView {
     /// The paired GitHub issue, when the list is linked to a repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<IssueLink>,
+    /// The public repo (`owner/repo`) this open task opens no issue on,
+    /// because another app filed it into the repo's list
+    /// (`github::publishable`). `publish` opens one anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_off: Option<String>,
     /// Where the task came from: `steno`, `github`, `asst`, `phone`
     /// (another CalDAV client, no stamp), or `other` (a stamp of a kind
     /// not listed). Derived from `source` and the issue pair; not stored
@@ -275,6 +284,7 @@ impl TaskView {
             list_name,
             pending: row.pending,
             issue: None,
+            kept_off: None,
             origin,
             task: row.task,
         }

@@ -1,7 +1,7 @@
 //! The daemon's state and everything it does with it. The D-Bus service,
 //! notification buttons, and system events all come through here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
@@ -83,6 +83,12 @@ struct GhState {
     error: Option<String>,
     /// Why the repo's issues are not being read, for as long as it holds.
     hold: Option<Hold>,
+    /// Whether the last record GitHub gave says anyone can read the repo.
+    /// None until a look this run.
+    public: Option<bool>,
+    /// Tasks another app filed that the user asked to publish anyway
+    /// (`publish`). In memory: the pair the next pass makes is what lasts.
+    publish: HashSet<String>,
 }
 
 /// A finding that stops a link's pass until the repo is confirmed to be
@@ -512,6 +518,7 @@ impl Daemon {
             .map(|(repo, href)| (href, repo))
             .collect();
         let mut pairs: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        let gh_state = self.gh_state.lock().expect("not poisoned").clone();
         for repo in repos.values() {
             pairs.insert(
                 repo.clone(),
@@ -537,8 +544,18 @@ impl Daemon {
                         url: format!("https://github.com/{repo}/issues/{number}"),
                     })
                 });
+                let kept_off = repos.get(&r.list).filter(|repo| {
+                    let seen = gh_state.get(*repo);
+                    issue.is_none()
+                        && r.task.is_open()
+                        && seen.is_some_and(|s| s.public == Some(true))
+                        && !github::publishable(false, r.task.source.as_deref())
+                        && !seen.is_some_and(|s| s.publish.contains(&r.task.uid))
+                });
+                let kept_off = kept_off.cloned();
                 let mut view = TaskView::new(r, id, list_name);
                 view.set_issue(issue);
+                view.kept_off = kept_off;
                 view
             })
             .collect())
@@ -993,11 +1010,9 @@ impl Daemon {
         let entry = state.entry(repo.to_string()).or_default();
         match outcome {
             Ok(()) => {
-                *entry = GhState {
-                    synced: Some(Utc::now()),
-                    error: None,
-                    hold: None,
-                }
+                entry.synced = Some(Utc::now());
+                entry.error = None;
+                entry.hold = None;
             }
             Err(e) => entry.error = Some(e),
         }
@@ -1014,6 +1029,56 @@ impl Daemon {
             _ => now,
         };
         entry.hold = Some(Hold { state, note, since });
+    }
+
+    /// What the repo's record said about who can read it. The window is
+    /// told when that changes, since it decides which tasks are kept off.
+    pub fn gh_visibility(&self, repo: &str, private: bool) {
+        let was = {
+            let mut all = self.gh_state.lock().expect("not poisoned");
+            let entry = all.entry(repo.to_string()).or_default();
+            entry.public.replace(!private)
+        };
+        if was != Some(!private) {
+            self.emit(Event::Changed);
+        }
+    }
+
+    /// The tasks of `repo`'s list the user asked to publish anyway.
+    pub fn gh_publish_anyway(&self, repo: &str) -> HashSet<String> {
+        let all = self.gh_state.lock().expect("not poisoned");
+        all.get(repo).map(|s| s.publish.clone()).unwrap_or_default()
+    }
+
+    /// Open an issue for a task another app filed into a public repo's
+    /// list, which is otherwise kept off it (`github::publishable`). The
+    /// next pass opens it and pairs the two, and the pair keeps it synced.
+    /// Asking is kept in memory until then: a restart before that pass
+    /// forgets it.
+    pub fn publish(&self, id: &str) -> Result<TaskView> {
+        let store = self.store();
+        let row = store.find(id)?;
+        let Some((repo, _)) = store.gh_links()?.into_iter().find(|(_, l)| *l == row.list) else {
+            let name = store
+                .find_list(&row.list)
+                .map_or(row.list.clone(), |l| l.name);
+            return Err(Error::Invalid(format!(
+                "{name} is not linked to a GitHub repo"
+            )));
+        };
+        if !row.task.is_open() {
+            return Err(Error::Invalid("a completed task opens no issue".into()));
+        }
+        {
+            let mut all = self.gh_state.lock().expect("not poisoned");
+            let entry = all.entry(repo).or_default();
+            entry.publish.insert(row.task.uid.clone());
+        }
+        let view = self.view(&store, row)?;
+        drop(store);
+        self.emit(Event::Changed);
+        self.wake_github.notify_one();
+        Ok(view)
     }
 
     /// A look at the repo confirmed it is the one that was linked.

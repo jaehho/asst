@@ -62,19 +62,41 @@ pub type Dropped = std::rc::Rc<dyn Fn(&str, &str, bool)>;
 /// origin that tells the reader something is named (`steno`, `github`);
 /// `asst`, `phone` and `other` would sit on every row of an ordinary list.
 /// A paired issue's number rides on the same line (#18) whatever the
-/// origin: a task made in asst on a linked list has one too.
-fn origin_caption(origin: &str, issue: Option<u32>) -> Option<(String, &'static str)> {
+/// origin: a task made in asst on a linked list has one too. A task kept
+/// off its list's public repo says so, since it is the one open task there
+/// with no number.
+fn origin_caption(
+    origin: &str,
+    issue: Option<u32>,
+    kept_off: Option<&str>,
+) -> Option<(String, String)> {
     let (name, tip) = match origin {
         "steno" => (Some("steno"), "Filed from a Steno meeting"),
         "github" => (Some("github"), "GitHub issue"),
         _ => (None, "GitHub issue"),
     };
-    let parts: Vec<String> = name
+    let text: Vec<String> = name
         .map(str::to_string)
         .into_iter()
         .chain(issue.map(|n| format!("#{n}")))
         .collect();
-    (!parts.is_empty()).then(|| (parts.join(" "), tip))
+    let mut text = text.join(" ");
+    let tip = match kept_off {
+        Some(repo) => {
+            let from = name.map_or(String::new(), |_| format!("{tip}. "));
+            text = [text.as_str(), "not on GitHub"]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            format!(
+                "{from}{repo} is public, so a task another app filed opens no issue \
+                 there. Publish it from the ⋮ menu."
+            )
+        }
+        None => tip.to_string(),
+    };
+    (!text.is_empty()).then_some((text, tip))
 }
 
 /// The change a schedule picker's answer makes, or none.
@@ -192,14 +214,18 @@ pub fn task_row(t: &TaskView, o: &RowOpts, tx: &Tx) -> gtk::ListBoxRow {
         body.append(&i);
     }
     if !o.compact
-        && let Some((text, tip)) = origin_caption(&t.origin, t.issue.as_ref().map(|i| i.number))
+        && let Some((text, tip)) = origin_caption(
+            &t.origin,
+            t.issue.as_ref().map(|i| i.number),
+            t.kept_off.as_deref(),
+        )
     {
         // Grey caption, same weight as the list name — provenance is
         // context, not a state colour.
         let o = gtk::Label::builder().label(&text).build();
         o.add_css_class("caption");
         o.add_css_class("dim-label");
-        o.set_tooltip_text(Some(tip));
+        o.set_tooltip_text(Some(&tip));
         body.append(&o);
     }
     if o.show_list {
@@ -571,6 +597,9 @@ pub fn task_menu(
             .upcast(),
         );
     }
+    if let Some(repo) = &t.kept_off {
+        items.push(publish_item(repo, &t.href, tx));
+    }
     if let Some(session) = model::meeting_of(t, crate::steno::here()) {
         items.push(meeting_item(session, tx));
     }
@@ -609,6 +638,18 @@ pub fn task_menu(
     p
 }
 
+/// Publish a task kept off its list's public repo: it opens an issue there,
+/// notes and all. The same item in the row's menu and the open card's.
+pub fn publish_item(repo: &str, href: &str, tx: &Tx) -> gtk::Widget {
+    let (tx, href) = (tx.clone(), href.to_string());
+    Item::new(
+        Some("external-link-symbolic"),
+        &format!("Publish as an issue on {repo}"),
+    )
+    .build(move || tx.emit(Msg::Publish(href.clone())))
+    .upcast()
+}
+
 /// Open meeting: the steno meeting `session`, in steno. The same item in
 /// the row's menu and the open card's.
 pub fn meeting_item(session: String, tx: &Tx) -> gtk::Widget {
@@ -623,7 +664,7 @@ mod tests {
     use super::*;
 
     fn text(origin: &str, issue: Option<u32>) -> Option<String> {
-        origin_caption(origin, issue).map(|(text, _)| text)
+        origin_caption(origin, issue, None).map(|(text, _)| text)
     }
 
     #[test]
@@ -640,5 +681,18 @@ mod tests {
         assert_eq!(text("github", Some(18)).as_deref(), Some("github #18"));
         assert_eq!(text("steno", Some(4)).as_deref(), Some("steno #4"));
         assert_eq!(text("asst", Some(18)).as_deref(), Some("#18"));
+    }
+
+    #[test]
+    fn a_task_kept_off_a_public_repo_says_why_it_has_no_number() {
+        let (text, tip) = origin_caption("steno", None, Some("jaehho/demo")).unwrap();
+        assert_eq!(text, "steno · not on GitHub");
+        assert!(tip.starts_with("Filed from a Steno meeting. jaehho/demo is public"));
+        assert!(tip.ends_with("Publish it from the ⋮ menu."));
+        // Another app's stamp has no name of its own, so the reason stands
+        // alone
+        let (text, tip) = origin_caption("other", None, Some("jaehho/demo")).unwrap();
+        assert_eq!(text, "not on GitHub");
+        assert!(tip.starts_with("jaehho/demo is public"));
     }
 }
