@@ -2,7 +2,8 @@
 # An asst to try changes on, cut off from the real one: a private session bus
 # that cannot start the installed asstd, a dev asstd on it, and a local
 # Radicale as the server. The real config, cache, keyring and Nextcloud are
-# never touched.
+# never touched, and the dev instance never reads ActivityWatch: its
+# config.toml turns it off (`activitywatch = ""`), so no aw-server is asked.
 #
 #   scripts/dev up [--signed-out]  build, then Radicale, the bus and asstd (idempotent)
 #   scripts/dev run CMD...         a command on the private bus
@@ -346,10 +347,15 @@ case "${1:-}" in
     if [ -f "$DEV/bus" ] && (on_bus) 2>/dev/null; then exit 0; fi
     radicale_up
     mkdir -p "$DEV/config/asst" "$DEV/state" "$DEV/data"
-    if [ "${2:-}" = "--signed-out" ]; then
-      : > "$DEV/config/asst/config.toml"
-    else
-      cat > "$DEV/config/asst/config.toml" <<CONF
+    # Off, rather than an address nothing answers on: no one can promise a
+    # port stays closed, and with no address no request is made.
+    cat > "$DEV/config/asst/config.toml" <<'CONF'
+# A dev instance never reads ActivityWatch.
+activitywatch = ""
+CONF
+    if [ "${2:-}" != "--signed-out" ]; then
+      cat >> "$DEV/config/asst/config.toml" <<CONF
+
 [account]
 server = "http://127.0.0.1:5232"
 dav_url = "http://127.0.0.1:5232/"

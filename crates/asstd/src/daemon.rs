@@ -563,10 +563,18 @@ impl Daemon {
         Ok(self.store().blocks_between(start_ms, end_ms)?)
     }
 
-    /// Pull one local day of ActivityWatch time into `blocks`.
+    /// Pull one local day of ActivityWatch time into `blocks`, from the
+    /// aw-server config.toml names. With ActivityWatch off there, nothing
+    /// is asked and the day's stored blocks stay as they are: 0 blocks.
     pub fn track_ingest(&self, date: &str) -> Result<asst_core::api::TrackIngested> {
         use asst_core::track;
-        let client = track::AwClient::default();
+        let Some(client) = track::AwClient::from_address(&self.config().activitywatch)? else {
+            return Ok(asst_core::api::TrackIngested {
+                date: date.to_string(),
+                blocks: 0,
+                focused_seconds: 0.0,
+            });
+        };
         let report = track::collect_day(&client, date)?;
         let (_, start, end) = track::day_window(date)?;
         let start = chrono::DateTime::parse_from_rfc3339(&start)
@@ -1899,5 +1907,62 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), &mut woken)
             .await
             .expect("sync now wakes a github pass");
+    }
+
+    #[test]
+    fn with_activitywatch_off_an_ingest_asks_nothing_and_keeps_the_days_blocks() {
+        use asst_core::store::Block;
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let mut store = Store::in_memory(zone).unwrap();
+        let day = "2026-11-06";
+        let (_, start, end) = asst_core::track::day_window(day).unwrap();
+        let ms = |t: &str| DateTime::parse_from_rfc3339(t).unwrap().timestamp_millis();
+        let (start, end) = (ms(&start), ms(&end));
+        let hour = 3_600_000;
+        let tracked = Block {
+            id: None,
+            task_uid: None,
+            start: start + 9 * hour,
+            end: start + 10 * hour,
+            label: Some("dotfiles".into()),
+            detail: None,
+            composition: None,
+            planned: false,
+            source: Some("aw:1:dotfiles".into()),
+            created_at: 0,
+        };
+        // And one from the old import, which an ingest purges first
+        let legacy = Block {
+            start: start + 11 * hour,
+            end: start + 12 * hour,
+            source: Some("aw:e:1".into()),
+            ..tracked.clone()
+        };
+        store
+            .replace_actual_blocks(start, end, &[tracked, legacy])
+            .unwrap();
+        let stored = store.blocks_between(start, end).unwrap();
+        assert_eq!(stored.len(), 2);
+
+        let off = Config {
+            activitywatch: String::new(),
+            ..Config::default()
+        };
+        let (daemon, _events) = Daemon::new(off, store, zone);
+        let got = daemon.track_ingest(day).unwrap();
+        assert_eq!((got.date.as_str(), got.blocks), (day, 0));
+        assert_eq!(got.focused_seconds, 0.0);
+        assert_eq!(
+            daemon.store().blocks_between(start, end).unwrap(),
+            stored,
+            "nothing purged or replaced"
+        );
+
+        // The address is the daemon's config's: one that does not read is
+        // an error, and changes nothing either
+        daemon.config.write().unwrap().activitywatch = "127.0.0.1:5600".into();
+        let err = daemon.track_ingest(day).unwrap_err().to_string();
+        assert!(err.contains("activitywatch"), "{err}");
+        assert_eq!(daemon.store().blocks_between(start, end).unwrap(), stored);
     }
 }

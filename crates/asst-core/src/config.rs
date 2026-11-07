@@ -18,6 +18,9 @@ pub fn gui_app_id() -> &'static str {
     }
 }
 
+/// Where aw-server answers on a stock install.
+pub const DEFAULT_ACTIVITYWATCH: &str = "http://127.0.0.1:5600";
+
 /// A reminder's Snooze buttons, in minutes.
 pub const DEFAULT_SNOOZE: [u64; 3] = [10, 30, 60];
 /// As many Snooze buttons as a notification has room for, beside Complete.
@@ -50,6 +53,16 @@ pub struct Config {
     /// renames a list that is named exactly for the old repo, `off` only
     /// reports it. Either way the link follows the repo.
     pub follow_rename: FollowRename,
+    /// aw-server, as `http://host:port`, where the Day view and `asst
+    /// track` read tracked time. Empty turns ActivityWatch off: nothing
+    /// asks it anything (`scripts/dev`, so a dev asstd never reads the
+    /// real one). Left out of a saved file while it is the default.
+    #[serde(skip_serializing_if = "is_default_activitywatch")]
+    pub activitywatch: String,
+}
+
+fn is_default_activitywatch(address: &str) -> bool {
+    address == DEFAULT_ACTIVITYWATCH
 }
 
 impl Default for Config {
@@ -62,6 +75,7 @@ impl Default for Config {
             alarm_at_due: true,
             alarm_before: 0,
             follow_rename: FollowRename::List,
+            activitywatch: DEFAULT_ACTIVITYWATCH.into(),
         }
     }
 }
@@ -294,6 +308,29 @@ mod tests {
         let text = toml::to_string_pretty(&off).unwrap();
         assert!(text.contains("follow_rename = \"off\""), "{text}");
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), off);
+    }
+
+    #[test]
+    fn activitywatch_is_the_stock_server_unless_the_file_says_otherwise() {
+        let read = |s: &str| toml::from_str::<Config>(s).unwrap().activitywatch;
+        assert_eq!(read(""), "http://127.0.0.1:5600", "the default");
+        let other = "activitywatch = \"http://10.0.0.2:5666\"\n";
+        assert_eq!(read(other), "http://10.0.0.2:5666");
+        assert_eq!(read("activitywatch = \"\"\n"), "", "off");
+
+        // A save adds no line to a file that never named it
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("activitywatch"), "{text}");
+        // and keeps one that turns it off or points elsewhere
+        for address in ["", "http://10.0.0.2:5666"] {
+            let c = Config {
+                activitywatch: address.into(),
+                ..Config::default()
+            };
+            let text = toml::to_string_pretty(&c).unwrap();
+            assert!(text.contains("activitywatch = "), "{text}");
+            assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+        }
     }
 
     #[test]

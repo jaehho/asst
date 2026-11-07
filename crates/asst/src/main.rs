@@ -1137,9 +1137,13 @@ fn autostart_run(state: Option<OnOff>, as_json: bool) -> anyhow::Result<()> {
 
 /// `asst track` talks to aw-server and SQLite directly: a batch tool, not
 /// the daemon's D-Bus surface. asstd owns day-to-day task writes; this
-/// replaces a day's actual blocks in one transaction.
+/// replaces a day's actual blocks in one transaction. aw-server is the one
+/// config.toml names, as for asstd; with ActivityWatch off there, every
+/// subcommand refuses rather than report an empty day.
 fn track_run(cmd: TrackCmd, as_json: bool) -> anyhow::Result<()> {
-    let client = track::AwClient::default();
+    let config = asst_core::config::Config::load()?;
+    let client = track::AwClient::from_address(&config.activitywatch)?
+        .ok_or_else(|| anyhow!("ActivityWatch is off in config.toml"))?;
     match cmd {
         TrackCmd::Ingest { date, dry_run } => {
             let date = date.unwrap_or_else(track::today);
