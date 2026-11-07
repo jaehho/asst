@@ -1229,9 +1229,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{repo} is not linked"))
         }
 
+        /// The link as `asst link` shows it at the rig's time.
         fn link(&self, repo: &str) -> asst_core::api::LinkView {
             self.daemon
-                .links()
+                .links(self.now)
                 .unwrap()
                 .into_iter()
                 .find(|l| l.repo == repo)
@@ -1316,7 +1317,7 @@ mod tests {
                 .all(|r| !r.path().starts_with("/repositories/")),
             "no id was known to ask by"
         );
-        for link in rig.daemon.links().unwrap() {
+        for link in rig.daemon.links(rig.now).unwrap() {
             assert_eq!((link.state, &link.error), (None, &None));
             assert!(link.synced.is_some());
             assert!(link.repo_id.is_some());
@@ -1594,6 +1595,35 @@ mod tests {
         rig.later(1);
         rig.go().await;
         assert_eq!(rig.link("jaehho/x").state, None);
+    }
+
+    #[tokio::test]
+    async fn a_repo_github_cannot_find_for_two_weeks_says_how_to_unlink_it() {
+        // Two weeks on the rig's clock, whatever the real date (#31)
+        let mut rig = Rig::new(&["jaehho/x"]).await;
+        rig.publish(111, "jaehho/x", false);
+        rig.go().await;
+        rig.fake
+            .reply("GET", "/repositories/111", Reply::status(404));
+        rig.fake.reply("GET", "/repos/jaehho/x", Reply::status(404));
+        rig.go().await;
+        let lost = rig.now;
+        let note = "GitHub cannot find it: deleted, or the token cannot see it";
+
+        rig.later(13 * 24 * 60);
+        assert_eq!(rig.go().await, Round::Done);
+        let link = rig.link("jaehho/x");
+        assert_eq!(link.state, Some(asst_core::api::LinkState::Unreachable));
+        assert_eq!((link.note.as_deref(), link.since), (Some(note), Some(lost)));
+
+        rig.later(24 * 60);
+        assert_eq!(rig.go().await, Round::Done);
+        let link = rig.link("jaehho/x");
+        assert_eq!(link.since, Some(lost), "the same hold");
+        assert_eq!(
+            link.note.unwrap(),
+            format!("{note}; asst unlink jaehho/x if it is gone for good")
+        );
     }
 
     #[tokio::test]
@@ -2569,7 +2599,7 @@ mod tests {
             assert_eq!(ids.len(), after.links.len(), "ids are distinct");
             let looked: Vec<_> = rig
                 .daemon
-                .links()
+                .links(rig.now)
                 .unwrap()
                 .into_iter()
                 .filter(|l| l.state.is_some())

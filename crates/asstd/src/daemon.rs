@@ -926,11 +926,11 @@ impl Daemon {
 
     // -- linked GitHub repos ---------------------------------------------------
 
-    /// The links between repos and lists, as `asst link` shows them.
-    pub fn links(&self) -> Result<Vec<LinkView>> {
+    /// The links between repos and lists, as `asst link` shows them at
+    /// `now`, which decides how long a held link has been held.
+    pub fn links(&self, now: DateTime<Utc>) -> Result<Vec<LinkView>> {
         let store = self.store();
         let counts = store.counts()?;
-        let now = Utc::now();
         store
             .gh_link_rows()?
             .into_iter()
@@ -1612,8 +1612,9 @@ mod tests {
                  to another list"
             );
         }
+        let now = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
         assert_eq!(
-            daemon.links().unwrap().len(),
+            daemon.links(now).unwrap().len(),
             1,
             "the refused call changed no link"
         );
@@ -1624,7 +1625,7 @@ mod tests {
         );
         daemon.link("home", "jaehho/other").unwrap();
         let names: Vec<(String, String)> = daemon
-            .links()
+            .links(now)
             .unwrap()
             .into_iter()
             .map(|l| (l.name, l.repo))
@@ -1638,7 +1639,7 @@ mod tests {
         );
         assert!(daemon.unlink("jaehho/asst").unwrap());
         assert!(!daemon.unlink("jaehho/asst").unwrap());
-        assert_eq!(daemon.links().unwrap().len(), 1);
+        assert_eq!(daemon.links(now).unwrap().len(), 1);
     }
 
     fn two_lists() -> Arc<Daemon> {
@@ -1667,7 +1668,7 @@ mod tests {
         let daemon = two_lists();
         daemon.link("champalimaud", "jaehho/champalimaud").unwrap();
         let at = DateTime::from_timestamp(1_792_000_000, 0).unwrap();
-        let waiting = |daemon: &Daemon| daemon.links().unwrap().remove(0).pending_rename;
+        let waiting = |daemon: &Daemon| daemon.links(at).unwrap().remove(0).pending_rename;
         assert_eq!(waiting(&daemon), None);
 
         // Seen by the daemon: the link has moved, the list has not
@@ -1675,7 +1676,7 @@ mod tests {
             .store()
             .gh_rename("jaehho/champalimaud", "jaehho/lab", Some(at), None)
             .unwrap();
-        let link = daemon.links().unwrap().remove(0);
+        let link = daemon.links(at).unwrap().remove(0);
         assert_eq!(link.repo, "jaehho/lab");
         assert_eq!(link.state, Some(LinkState::Renamed));
         assert_eq!(
@@ -1688,7 +1689,7 @@ mod tests {
 
         // Held for another reason, it is still a rename the list waits on
         daemon.gh_hold("jaehho/lab", LinkState::Conflict, "two links".into(), at);
-        let link = daemon.links().unwrap().remove(0);
+        let link = daemon.links(at).unwrap().remove(0);
         assert_eq!(link.state, Some(LinkState::Conflict));
         assert!(link.pending_rename.is_some());
 
