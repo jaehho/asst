@@ -1345,6 +1345,44 @@ impl Default for AwClient {
 }
 
 impl AwClient {
+    /// The client for config.toml's `activitywatch`: `http://host:port`,
+    /// a trailing `/` allowed, port 80 when none is given. Empty is
+    /// ActivityWatch off, `None`, and the caller asks it nothing. Anything
+    /// else is an error, so a typo is never taken for off.
+    pub fn from_address(address: &str) -> Result<Option<AwClient>> {
+        let address = address.trim();
+        if address.is_empty() {
+            return Ok(None);
+        }
+        let bad = || {
+            TrackError::Msg(format!(
+                "activitywatch = {address:?} in config.toml is not an http://host:port address"
+            ))
+        };
+        let authority = address.strip_prefix("http://").ok_or_else(bad)?;
+        let authority = authority.strip_suffix('/').unwrap_or(authority);
+        // `[::1]:5600` keeps its brackets, since they go back into the URL.
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !port.ends_with(']') => (host, Some(port)),
+            _ => (authority, None),
+        };
+        let port = match port {
+            None => 80,
+            Some(port) => port.parse().map_err(|_| bad())?,
+        };
+        let bracketed = host.starts_with('[') && host.ends_with(']');
+        if host.is_empty()
+            || host.contains(['/', '@', '?', '#', ' '])
+            || (host.contains(':') && !bracketed)
+        {
+            return Err(bad());
+        }
+        Ok(Some(AwClient {
+            host: host.into(),
+            port,
+        }))
+    }
+
     fn get_json(&self, path: &str) -> Result<serde_json::Value> {
         let url = format!("http://{}:{}{}", self.host, self.port, path);
         let resp = ureq::get(&url).call().map_err(http_err)?;
@@ -2211,5 +2249,69 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label.as_deref(), Some("dotfiles"));
         assert!(!rows[0].planned);
+    }
+
+    #[test]
+    fn an_address_is_http_host_and_port_empty_is_off_and_the_rest_an_error() {
+        let at = |s: &str| AwClient::from_address(s).unwrap().map(|c| (c.host, c.port));
+        let stock = AwClient::default();
+        assert_eq!(
+            at(config::DEFAULT_ACTIVITYWATCH),
+            Some((stock.host, stock.port))
+        );
+        assert_eq!(at("http://10.0.0.2:5666"), Some(("10.0.0.2".into(), 5666)));
+        assert_eq!(at("http://aw.local:5600/"), Some(("aw.local".into(), 5600)));
+        assert_eq!(at("http://[::1]:5600"), Some(("[::1]".into(), 5600)));
+        assert_eq!(at("http://localhost"), Some(("localhost".into(), 80)));
+        assert_eq!(at(""), None, "off");
+        assert_eq!(at("  "), None, "off");
+        for bad in [
+            "off",
+            "127.0.0.1:5600",
+            "https://127.0.0.1:5600",
+            "http://",
+            "http://:5600",
+            "http://localhost:",
+            "http://localhost:port",
+            "http://localhost:70000",
+            "http://localhost:5600/aw",
+            "http://me@localhost:5600",
+            "http://::1:5600",
+        ] {
+            let err = AwClient::from_address(bad).unwrap_err().to_string();
+            assert!(err.contains("not an http://host:port"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_client_from_an_address_asks_that_host_and_port() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut header = String::new();
+            while reader.read_line(&mut header).unwrap() > 2 {
+                header.clear();
+            }
+            let body = r#"{"aw-watcher-window_fake": {}}"#;
+            write!(
+                &stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let client = AwClient::from_address(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.bucket_ids().unwrap(), ["aw-watcher-window_fake"]);
+        let request = server.join().unwrap();
+        assert_eq!(request.trim_end(), "GET /api/0/buckets HTTP/1.1");
     }
 }
