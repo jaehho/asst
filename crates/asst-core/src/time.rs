@@ -268,12 +268,45 @@ pub fn format_duration(d: Duration) -> String {
     out
 }
 
+/// Windows zone names, as Outlook and Exchange write them in a TZID, to
+/// the IANA zone CLDR's windowsZones.xml maps each to (territory 001).
+/// The common ones only; an unlisted name still falls back to local.
+const WINDOWS_ZONES: &[(&str, &str)] = &[
+    ("Hawaiian Standard Time", "Pacific/Honolulu"),
+    ("Alaskan Standard Time", "America/Anchorage"),
+    ("Pacific Standard Time", "America/Los_Angeles"),
+    ("US Mountain Standard Time", "America/Phoenix"),
+    ("Mountain Standard Time", "America/Denver"),
+    ("Central Standard Time", "America/Chicago"),
+    ("Eastern Standard Time", "America/New_York"),
+    ("Atlantic Standard Time", "America/Halifax"),
+    ("E. South America Standard Time", "America/Sao_Paulo"),
+    ("UTC", "Etc/UTC"),
+    ("GMT Standard Time", "Europe/London"),
+    ("Greenwich Standard Time", "Atlantic/Reykjavik"),
+    ("W. Europe Standard Time", "Europe/Berlin"),
+    ("Central Europe Standard Time", "Europe/Budapest"),
+    ("Romance Standard Time", "Europe/Paris"),
+    ("Central European Standard Time", "Europe/Warsaw"),
+    ("GTB Standard Time", "Europe/Bucharest"),
+    ("Israel Standard Time", "Asia/Jerusalem"),
+    ("India Standard Time", "Asia/Kolkata"),
+    ("China Standard Time", "Asia/Shanghai"),
+    ("Singapore Standard Time", "Asia/Singapore"),
+    ("Tokyo Standard Time", "Asia/Tokyo"),
+    ("Korea Standard Time", "Asia/Seoul"),
+    ("AUS Eastern Standard Time", "Australia/Sydney"),
+];
+
 /// A TZID as an IANA zone. Accepts the `/vendor/prefix/Area/City` form some
-/// clients write.
+/// clients write, and the Windows names Outlook writes.
 pub fn resolve_tzid(tzid: &str) -> Option<Tz> {
     let tzid = tzid.trim().trim_matches('"');
     if let Ok(tz) = Tz::from_str(tzid) {
         return Some(tz);
+    }
+    if let Some((_, iana)) = WINDOWS_ZONES.iter().find(|(w, _)| *w == tzid) {
+        return Tz::from_str(iana).ok();
     }
     let parts: Vec<&str> = tzid.split('/').filter(|s| !s.is_empty()).collect();
     (1..=parts.len().min(3))
@@ -477,6 +510,36 @@ mod tests {
             out.push_str(&Ical::new(cal).to_string());
             assert!(out.contains(&format!("{line}\r\n")), "{line} -> {out}");
         }
+    }
+
+    #[test]
+    fn outlook_zone_names_resolve() {
+        for (windows, iana) in [
+            ("Eastern Standard Time", "America/New_York"),
+            ("GMT Standard Time", "Europe/London"),
+            ("W. Europe Standard Time", "Europe/Berlin"),
+        ] {
+            assert_eq!(resolve_tzid(windows).map(|t| t.name()), Some(iana));
+        }
+    }
+
+    #[test]
+    fn every_listed_windows_zone_is_a_known_iana_zone() {
+        for (windows, iana) in WINDOWS_ZONES {
+            assert!(Tz::from_str(iana).is_ok(), "{windows} -> {iana}");
+        }
+    }
+
+    #[test]
+    fn an_outlook_invite_is_read_in_its_own_zone_not_the_machines() {
+        // Exchange writes Windows zone names: 10:00 in New York is
+        // 15:00 UTC, wherever the laptop is.
+        let invite = prop("DTSTART;TZID=Eastern Standard Time:20261112T100000");
+        let lisbon: Tz = "Europe/Lisbon".parse().unwrap();
+        assert_eq!(
+            When::from_property(&invite).unwrap().instant(lisbon),
+            Utc.with_ymd_and_hms(2026, 11, 12, 15, 0, 0).unwrap()
+        );
     }
 
     #[test]
