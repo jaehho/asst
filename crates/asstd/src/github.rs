@@ -7,7 +7,7 @@
 //! followed its repo to a new name then hands its list to `follow`, which may
 //! rename the list to match.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +56,9 @@ struct Memory {
     waits: HashMap<String, DateTime<Utc>>,
     /// repo → when its name was last asked for after its id was not found
     lookups: HashMap<String, DateTime<Utc>>,
+    /// repo → how many of its list's tasks were last kept off it, so the
+    /// journal says so when the number changes, not every pass
+    held: HashMap<String, usize>,
 }
 
 /// How a round ended.
@@ -189,9 +192,9 @@ async fn link_round(
     row: &GhLinkRow,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    let gate = identify(daemon, gh, memory, row, now).await?;
+    let (gate, private) = identify(daemon, gh, memory, row, now).await?;
     let synced = match gate {
-        Gate::Go => pass(daemon, gh, memory, row).await,
+        Gate::Go => pass(daemon, gh, memory, row, private).await,
         Gate::Moved | Gate::Stop => Ok(()),
     };
     // The list's name is not the issues' business: a listing that fails
@@ -209,27 +212,31 @@ async fn link_round(
 /// Look at the link's repo and judge it against what is stored. Nothing is
 /// read from a repo that is not confirmed to be the linked one: a repo made
 /// again under an old name would otherwise have its issues merged with the
-/// old tasks, and the tasks whose numbers it lacks completed.
+/// old tasks, and the tasks whose numbers it lacks completed. Also whether
+/// the record says the repo is private; a look without a record says it is
+/// not, which only keeps more off the repo.
 async fn identify(
     daemon: &Daemon,
     gh: &GitHub,
     memory: &mut Memory,
     row: &GhLinkRow,
     now: DateTime<Utc>,
-) -> Result<Gate> {
+) -> Result<(Gate, bool)> {
     let repo = row.repo.as_str();
     // A wait is never longer than LONGEST_WAIT: one that seems to be is from
     // before the clock was set back, and is over
     if (memory.waits.get(repo)).is_some_and(|until| now < *until && *until - now <= LONGEST_WAIT) {
-        return Ok(Gate::Stop);
+        return Ok((Gate::Stop, false));
     }
     memory.waits.remove(repo);
     let Some(seen) = look(gh, memory, row, now).await? else {
-        return Ok(Gate::Stop);
+        return Ok((Gate::Stop, false));
     };
+    let private = matches!(&seen, Observed::Record(info, _) if info.private);
     let baseline = row.archived.map(|t| t > 0);
     let verdict = github::judge(row.repo_id, repo, baseline, &seen);
-    apply_verdict(daemon, memory, row, verdict, &seen, now)
+    let gate = apply_verdict(daemon, memory, row, verdict, &seen, now)?;
+    Ok((gate, private))
 }
 
 /// Do what a verdict calls for, and say whether the link's issues may be
@@ -615,8 +622,16 @@ fn log_once(store: &Store, row: &NewLog) -> Result<bool> {
 }
 
 /// One repo against its list. An op that fails is logged and left for the
-/// next pass, its pair as it was; a lost connection stops the pass.
-async fn pass(daemon: &Daemon, gh: &GitHub, memory: &mut Memory, row: &GhLinkRow) -> Result<()> {
+/// next pass, its pair as it was; a lost connection stops the pass. On a
+/// repo that is not `private`, a task another app filed opens no issue
+/// (`github::publishable`).
+async fn pass(
+    daemon: &Daemon,
+    gh: &GitHub,
+    memory: &mut Memory,
+    row: &GhLinkRow,
+    private: bool,
+) -> Result<()> {
     let (repo, list) = (row.repo.as_str(), row.list.as_str());
     let etag = memory.issues.get(repo).map(|(e, _)| e.as_str());
     let fetched = match gh.issues(repo, etag).await {
@@ -668,9 +683,27 @@ async fn pass(daemon: &Daemon, gh: &GitHub, memory: &mut Memory, row: &GhLinkRow
                 labels: Vec::new(),
             })
             .collect();
+        let pairs = store.gh_pairs(repo)?;
+        let held: HashSet<&str> = rows
+            .iter()
+            .filter(|r| !github::publishable(private, r.task.source.as_deref()))
+            .map(|r| r.task.uid.as_str())
+            .collect();
+        let ops = github::plan_holding(&issues, &tasks, &pairs, &held);
+        let waiting = tasks
+            .iter()
+            .filter(|t| t.open && held.contains(t.id.as_str()))
+            .filter(|t| !pairs.iter().any(|p| p.uid == t.id))
+            .count();
+        if memory.held.insert(repo.to_string(), waiting).unwrap_or(0) != waiting && waiting > 0 {
+            log::info!(
+                "{repo} is public: {waiting} task(s) another app filed into its list stay \
+                 tasks and open no issue"
+            );
+        }
         let hrefs: HashMap<String, String> =
             rows.into_iter().map(|r| (r.task.uid, r.href)).collect();
-        (github::plan(&issues, &tasks, &store.gh_pairs(repo)?), hrefs)
+        (ops, hrefs)
     };
     if ops.is_empty() {
         return Ok(());
@@ -879,8 +912,15 @@ mod tests {
     }
 
     /// A repository record as GitHub gives it, cut to what asst reads.
+    /// Public: `record_as` makes a private one.
     fn record(id: u64, name: &str, archived: bool) -> String {
-        format!(r#"{{"id":{id},"full_name":"{name}","archived":{archived},"disabled":false}}"#)
+        record_as(id, name, archived, false)
+    }
+
+    fn record_as(id: u64, name: &str, archived: bool, private: bool) -> String {
+        format!(
+            r#"{{"id":{id},"full_name":"{name}","archived":{archived},"disabled":false,"private":{private}}}"#
+        )
     }
 
     /// A record's ETag changes with what the record says.
@@ -1129,10 +1169,71 @@ mod tests {
 
         /// GitHub has the repo `name` as `id`, found by either.
         fn publish(&self, id: u64, name: &str, archived: bool) {
-            let (tag, body) = (etag(id, name, archived), record(id, name, archived));
+            self.publish_as(id, name, archived, false);
+        }
+
+        /// `publish`, private or public.
+        fn publish_as(&self, id: u64, name: &str, archived: bool, private: bool) {
+            let tag = match private {
+                true => format!("{}:private", etag(id, name, archived)),
+                false => etag(id, name, archived),
+            };
+            let body = record_as(id, name, archived, private);
             self.fake.etagged(&format!("/repos/{name}"), &tag, &body);
             self.fake
                 .etagged(&format!("/repositories/{id}"), &tag, &body);
+        }
+
+        /// A task in `repo`'s list, filed by `source` (None: typed on the
+        /// phone) with a note.
+        fn file(&self, repo: &str, title: &str, source: Option<&str>) {
+            let list = self.row(repo).list;
+            let edits = [
+                Edit::Summary(title.into()),
+                Edit::Description(Some("From Vendor call, March 14, 2025.".into())),
+                Edit::Source(source.map(str::to_string)),
+            ];
+            self.daemon.store().create(&list, &edits, self.now).unwrap();
+        }
+
+        /// GitHub opens each issue asked for as the next number, and lists
+        /// it from then on.
+        fn take_new_issues(&self, repo: &str) {
+            let opened = Arc::new(Mutex::new(Vec::<String>::new()));
+            let listing = opened.clone();
+            self.fake
+                .on("POST", &format!("/repos/{repo}/issues"), move |req| {
+                    let sent: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+                    let mut all = opened.lock().unwrap();
+                    let issue = serde_json::json!({
+                        "number": all.len() + 1,
+                        "title": sent["title"],
+                        "state": "open",
+                        "body": sent.get("body"),
+                        "labels": [],
+                    });
+                    all.push(issue.to_string());
+                    Reply::json(201, &issue.to_string())
+                });
+            self.fake
+                .on("GET", &format!("/repos/{repo}/issues"), move |_| {
+                    Reply::json(200, &format!("[{}]", listing.lock().unwrap().join(",")))
+                });
+        }
+
+        /// The titles of the issues asked for, sorted: a pass takes a
+        /// list's tasks in no set order.
+        fn opened(&self, repo: &str) -> Vec<String> {
+            let path = format!("/repos/{repo}/issues");
+            let mut titles: Vec<String> = (self.fake.seen().iter())
+                .filter(|r| r.method == "POST" && r.path() == path)
+                .map(|r| {
+                    let sent: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+                    sent["title"].as_str().unwrap().to_string()
+                })
+                .collect();
+            titles.sort();
+            titles
         }
 
         /// GitHub renames the repo: the old name redirects to the id, and
@@ -1322,6 +1423,80 @@ mod tests {
             assert!(link.synced.is_some());
             assert!(link.repo_id.is_some());
         }
+    }
+
+    /// A steno to-do's stamp in these tests: a made-up meeting.
+    const MEETING: &str = "steno:20250314-093000/send-draft";
+
+    #[tokio::test]
+    async fn a_public_repo_gets_no_issue_for_a_meeting_to_do() {
+        let mut rig = Rig::new(&["jaehho/demo"]).await;
+        rig.publish(9, "jaehho/demo", false);
+        rig.take_new_issues("jaehho/demo");
+        rig.file("jaehho/demo", "Send the draft", Some(MEETING));
+        rig.file("jaehho/demo", "Fix the plot", None);
+        rig.file("jaehho/demo", "Tidy the README", Some("asst:abc123"));
+
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(
+            rig.opened("jaehho/demo"),
+            ["Fix the plot", "Tidy the README"]
+        );
+        let mut paired: Vec<String> = (rig.daemon.store().gh_pairs("jaehho/demo").unwrap())
+            .into_iter()
+            .map(|p| p.title)
+            .collect();
+        paired.sort();
+        assert_eq!(paired, ["Fix the plot", "Tidy the README"]);
+        let list = rig.row("jaehho/demo").list;
+        let held = rig
+            .daemon
+            .store()
+            .by_source(MEETING)
+            .unwrap()
+            .expect("still a task");
+        assert!(held.task.is_open() && held.list == list);
+
+        // Every round after holds it back again, a 304 on the record too
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        rig.restart();
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.opened("jaehho/demo").len(), 2);
+        assert_eq!(rig.daemon.store().gh_pairs("jaehho/demo").unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_private_repo_gets_every_task_as_before() {
+        let mut rig = Rig::new(&["jaehho/notes"]).await;
+        rig.publish_as(5, "jaehho/notes", false, true);
+        rig.take_new_issues("jaehho/notes");
+        rig.file("jaehho/notes", "Send the draft", Some(MEETING));
+        rig.file("jaehho/notes", "Fix the plot", None);
+
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(
+            rig.opened("jaehho/notes"),
+            ["Fix the plot", "Send the draft"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repo_made_public_stops_taking_meeting_to_dos() {
+        let mut rig = Rig::new(&["jaehho/notes"]).await;
+        rig.publish_as(5, "jaehho/notes", false, true);
+        rig.take_new_issues("jaehho/notes");
+        rig.file("jaehho/notes", "Before", Some("steno:a/before"));
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.opened("jaehho/notes"), ["Before"]);
+
+        // Flipped to public on GitHub: the record's ETag changes with it
+        rig.publish_as(5, "jaehho/notes", false, false);
+        rig.file("jaehho/notes", "After", Some("steno:b/after"));
+        rig.later(5);
+        assert_eq!(rig.go().await, Round::Done);
+        assert_eq!(rig.opened("jaehho/notes"), ["Before"]);
     }
 
     #[tokio::test]
