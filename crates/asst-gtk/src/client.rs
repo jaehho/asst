@@ -174,6 +174,10 @@ pub async fn duplicate(id: &str) -> Result<TaskView> {
     json(proxy().await?.duplicate(id).await)
 }
 
+pub async fn publish(id: &str) -> Result<TaskView> {
+    json(proxy().await?.publish(id).await)
+}
+
 pub async fn create_list(spec: &ListSpec) -> Result<ListView> {
     json(
         proxy()

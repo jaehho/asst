@@ -5,6 +5,7 @@
 //! failed is simply found again next time. `plan` decides, the daemon does.
 //! `judge` and `follow_list_name` decide the same way about the repo itself:
 //! whether it is still the one linked, and whether its list follows a rename.
+//! `publishable` decides what a repo anyone can read may be given.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -142,9 +143,35 @@ pub enum Op {
     },
 }
 
+/// Whether a task may be published as an issue on the repo. A private repo
+/// takes every task. A repo anyone can read takes only what was typed into
+/// the list (in asst, on the phone, or an issue's own task): a task another
+/// app filed there, such as a meeting's to-do from steno, chose the list
+/// for its project, not for where the list is published.
+pub fn publishable(private: bool, source: Option<&str>) -> bool {
+    private
+        || matches!(
+            crate::api::origin_of(source, false),
+            "asst" | "phone" | "github"
+        )
+}
+
 /// Everything one pass changes, from every issue of the repo (a full
 /// listing, pull requests left out), every task of the list, and the pairs.
 pub fn plan(issues: &[Issue], tasks: &[Ref], pairs: &[Pair]) -> Vec<Op> {
+    plan_holding(issues, tasks, pairs, &HashSet::new())
+}
+
+/// `plan`, keeping the tasks in `held` off the repo: none of them opens an
+/// issue or is paired with one by title, so nothing of theirs is
+/// published, and each stays a task. A pair made before is kept and merged
+/// as before; holding a task back never closes or unpairs anything.
+pub fn plan_holding(
+    issues: &[Issue],
+    tasks: &[Ref],
+    pairs: &[Pair],
+    held: &HashSet<&str>,
+) -> Vec<Op> {
     let mut ops = Vec::new();
     let paired_numbers: HashSet<u32> = pairs.iter().map(|p| p.number).collect();
     let paired_uids: HashSet<&str> = pairs.iter().map(|p| p.uid.as_str()).collect();
@@ -164,7 +191,7 @@ pub fn plan(issues: &[Issue], tasks: &[Ref], pairs: &[Pair]) -> Vec<Op> {
     }
     let mut free: Vec<&Ref> = tasks
         .iter()
-        .filter(|t| t.open && !paired_uids.contains(t.id.as_str()))
+        .filter(|t| t.open && !paired_uids.contains(t.id.as_str()) && !held.contains(t.id.as_str()))
         .collect();
     for i in issues
         .iter()
@@ -475,6 +502,9 @@ pub struct RepoInfo {
     pub full_name: String,
     pub archived: bool,
     pub disabled: bool,
+    /// GitHub's `private`: readable only by those let in. False is
+    /// public, and anyone can read its issues.
+    pub private: bool,
 }
 
 /// One look at a repository: what GitHub answered, not what it means (that
@@ -507,6 +537,9 @@ struct RawRepo {
     // and a missing flag read as `false` would look like an un-archive.
     archived: bool,
     disabled: bool,
+    // Required too: a record that does not say is no verdict, rather than
+    // a guess either way about who can read the issues.
+    private: bool,
 }
 
 #[derive(Deserialize)]
@@ -801,6 +834,7 @@ fn observe(
                     full_name: r.full_name,
                     archived: r.archived,
                     disabled: r.disabled,
+                    private: r.private,
                 },
                 header(headers, "etag").map(str::to_string),
             ),
@@ -1156,6 +1190,79 @@ mod tests {
     }
 
     #[test]
+    fn a_public_repo_takes_only_what_was_typed_into_the_list() {
+        // (repo is private, the task's source, may it open an issue)
+        for (private, source, may) in [
+            (true, Some("steno:20250314-093000/send-draft"), true),
+            (true, None, true),
+            (false, None, true),                // typed on the phone
+            (false, Some("asst:abc123"), true), // typed in asst
+            (false, Some("gh:7"), true),        // an issue's own task
+            (false, Some("steno:20250314-093000/send-draft"), false),
+            (false, Some("learn:neuro/42"), false), // any other app
+            (false, Some("steno"), false),
+        ] {
+            assert_eq!(publishable(private, source), may, "{private} {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_task_opens_no_issue_and_is_not_adopted() {
+        let tasks = [
+            task("meeting", "Send the draft", true),
+            task("typed", "Fix the plot", true),
+        ];
+        let held = HashSet::from(["meeting"]);
+        // Only the typed task opens an issue
+        assert_eq!(
+            plan_holding(&[], &tasks, &[], &held),
+            [Op::NewIssue {
+                uid: "typed".into(),
+                title: "Fix the plot".into(),
+                body: None,
+                priority: 0,
+            }]
+        );
+        // An issue that happens to share its title is not paired with it:
+        // a pair would carry the task's notes to the issue next pass. The
+        // issue gets a task of its own instead.
+        assert_eq!(
+            plan_holding(&[issue(4, "Send the draft", true)], &tasks[..1], &[], &held),
+            [Op::NewTask {
+                number: 4,
+                title: "Send the draft".into(),
+                body: None,
+                priority: 0,
+            }]
+        );
+        // Held back again on every pass: nothing is remembered
+        assert_eq!(plan_holding(&[], &tasks[..1], &[], &held), []);
+        // Unheld, it is published as before
+        assert_eq!(plan(&[], &tasks[..1], &[]).len(), 1);
+    }
+
+    #[test]
+    fn holding_back_never_undoes_a_pair() {
+        // Paired before the gate: it keeps syncing, and is not closed as
+        // if the task had left the list.
+        let base = [pair(1, "a", "Send the draft", true)];
+        let held = HashSet::from(["a"]);
+        let issues = [issue(1, "Send the draft", true)];
+        let open = [task("a", "Send the draft", true)];
+        assert_eq!(plan_holding(&issues, &open, &base, &held), []);
+        let done = [task("a", "Send the draft", false)];
+        assert_eq!(
+            plan_holding(&issues, &done, &base, &held),
+            [merged(
+                Change::default(),
+                state(false),
+                "Send the draft",
+                false
+            )]
+        );
+    }
+
+    #[test]
     fn repo_names() {
         for good in ["jaehho/asst", "a-b/c.d_e", "o/.github"] {
             assert!(valid_repo(good), "{good}");
@@ -1238,6 +1345,7 @@ mod repo_tests {
             full_name: "jaehho/lab".into(),
             archived: false,
             disabled: false,
+            private: true,
         }
     }
 
@@ -1278,6 +1386,7 @@ mod repo_tests {
                 full_name: "jaehho/mail-digest".into(),
                 archived: true,
                 disabled: false,
+                private: true,
             }
         );
         // The old name answers with a redirect to the id, nothing more
@@ -1312,6 +1421,8 @@ mod repo_tests {
             r#"{"id":1,"full_name":"jaehho/lab","disabled":false}"#,
             r#"{"id":1,"full_name":"lab","archived":false,"disabled":false}"#,
             r#"{"id":"1","full_name":"jaehho/lab","archived":false,"disabled":false}"#,
+            // Says nothing about who can read it
+            r#"{"id":1,"full_name":"jaehho/lab","archived":false,"disabled":false}"#,
         ] {
             assert_eq!(
                 answer(200, &[], body, 0).unwrap(),
@@ -1320,11 +1431,12 @@ mod repo_tests {
             );
         }
         // Disabled counts as a flag of its own
-        let disabled = r#"{"id":1,"full_name":"a/b","archived":false,"disabled":true}"#;
+        let disabled =
+            r#"{"id":1,"full_name":"a/b","archived":false,"disabled":true,"private":false}"#;
         let Observed::Record(info, etag) = answer(200, &[], disabled, 0).unwrap() else {
             panic!("a record");
         };
-        assert!(info.disabled && !info.archived && etag.is_none());
+        assert!(info.disabled && !info.archived && !info.private && etag.is_none());
     }
 
     #[test]
@@ -1589,6 +1701,7 @@ mod identity_tests {
                 full_name: name.into(),
                 archived,
                 disabled,
+                private: false,
             },
             None,
         )

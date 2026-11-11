@@ -573,6 +573,9 @@ impl Editor {
                 .upcast(),
             );
         }
+        if let Some(repo) = &t.kept_off {
+            items.push(crate::row::publish_item(repo, &t.href, &tx));
+        }
         if let Some(session) = model::meeting_of(t, crate::steno::here()) {
             items.push(crate::row::meeting_item(session, &tx));
         }
@@ -845,7 +848,14 @@ impl Editor {
             }
             None => {
                 self.work.set_visible(false);
-                self.issue.set_visible(false);
+                self.issue.set_visible(t.kept_off.is_some());
+                if let Some(repo) = &t.kept_off {
+                    self.issue.set_text("not on GitHub");
+                    self.issue.set_tooltip_text(Some(&format!(
+                        "{repo} is public, so a task another app filed opens no issue \
+                         there. Publish it from the ⋮ menu."
+                    )));
+                }
             }
         }
 
