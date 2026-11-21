@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, RwLock};
 
 use asst_core::api::ListView;
 use asst_core::fmt;
@@ -21,9 +21,16 @@ use relm4::gtk::{self, glib, pango};
 use crate::model::{self, End, Freq, REPEAT_PRESETS, Repeat, WEEK, capitalize};
 use crate::ui::{self, Item};
 
+/// The zone the window reads and writes times in: the machine's when it
+/// starts, and again whenever timedated says it changed (#34).
+static ZONE: LazyLock<RwLock<Tz>> = LazyLock::new(|| RwLock::new(asst_core::time::local_zone()));
+
 pub fn zone() -> Tz {
-    static ZONE: OnceLock<Tz> = OnceLock::new();
-    *ZONE.get_or_init(asst_core::time::local_zone)
+    *ZONE.read().unwrap_or_else(|p| p.into_inner())
+}
+
+pub fn set_zone(zone: Tz) {
+    *ZONE.write().unwrap_or_else(|p| p.into_inner()) = zone;
 }
 
 pub fn now() -> DateTime<Tz> {
@@ -1505,5 +1512,28 @@ pub fn fill_places(list: &gtk::ListBox, places: &[Place], picked: &Rc<dyn Fn(Pla
         let (picked, place) = (picked.clone(), place.clone());
         button.connect_clicked(move |_| picked(place.clone()));
         list.append(&gtk::ListBoxRow::builder().child(&button).build());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #34: after timedated says the machine moved to Lisbon, a 9am picked
+    /// for a task with no time is saved as 9am `Europe/Lisbon`.
+    #[test]
+    fn a_time_picked_after_a_move_is_in_the_new_zone() {
+        let lisbon: Tz = "Europe/Lisbon".parse().unwrap();
+        set_zone(lisbon);
+        let now = now();
+        assert_eq!(now.timezone(), lisbon);
+        let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert_eq!(
+            model::at_time(None, nine, now.date_naive(), now.timezone()),
+            When::Zoned {
+                at: now.date_naive().and_time(nine),
+                tzid: "Europe/Lisbon".into(),
+            }
+        );
     }
 }
