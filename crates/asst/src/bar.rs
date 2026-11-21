@@ -6,7 +6,7 @@ use std::time::Duration;
 use asst_core::api::{AsstProxy, StatusView, SyncState, TaskView, query};
 use asst_core::fmt;
 use asst_core::store::View;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -35,14 +35,24 @@ fn print(line: &Line) {
     }
 }
 
-async fn render(proxy: &AsstProxy<'_>, zone: Tz) -> anyhow::Result<Line> {
+async fn render(proxy: &AsstProxy<'_>) -> anyhow::Result<Line> {
     let tasks: Vec<TaskView> = serde_json::from_str(
         &proxy
             .tasks(&serde_json::to_string(&query(View::Today))?)
             .await?,
     )?;
     let status: StatusView = serde_json::from_str(&proxy.status().await?)?;
-    let now = Utc::now().with_timezone(&zone);
+    let fallback = asst_core::time::local_zone();
+    Ok(line(&tasks, &status, Utc::now(), fallback))
+}
+
+/// The module's line for Today's `tasks`. Overdue and the labels are read
+/// in the daemon's zone (`status.zone`), the one its Today was worked out
+/// in, so all three move together when the machine does (#34);
+/// `fallback` stands in for a zone name this build cannot read.
+fn line(tasks: &[TaskView], status: &StatusView, now: DateTime<Utc>, fallback: Tz) -> Line {
+    let zone = status.zone.parse().unwrap_or(fallback);
+    let now = now.with_timezone(&zone);
     let overdue = tasks
         .iter()
         .filter(|t| t.task.due.as_ref().is_some_and(|d| fmt::is_overdue(d, now)))
@@ -82,7 +92,7 @@ async fn render(proxy: &AsstProxy<'_>, zone: Tz) -> anyhow::Result<Line> {
         }
         _ => {}
     }
-    Ok(Line {
+    Line {
         // Empty text hides the module when nothing is due.
         text: if tasks.is_empty() {
             String::new()
@@ -92,13 +102,12 @@ async fn render(proxy: &AsstProxy<'_>, zone: Tz) -> anyhow::Result<Line> {
         alt: class,
         class,
         tooltip: tooltip.join("\n"),
-    })
+    }
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    let zone = asst_core::time::local_zone();
     loop {
-        if let Err(e) = follow(zone).await {
+        if let Err(e) = follow().await {
             print(&Line {
                 text: String::new(),
                 alt: "offline",
@@ -110,7 +119,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-async fn follow(zone: Tz) -> anyhow::Result<()> {
+async fn follow() -> anyhow::Result<()> {
     let conn = zbus::Connection::session().await?;
     let proxy = AsstProxy::new(&conn).await?;
     let mut changed = proxy.receive_changed().await?;
@@ -118,7 +127,7 @@ async fn follow(zone: Tz) -> anyhow::Result<()> {
     let mut owner = proxy.inner().receive_owner_changed().await?;
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
-        print(&render(&proxy, zone).await?);
+        print(&render(&proxy).await?);
         tokio::select! {
             Some(_) = changed.next() => {}
             Some(_) = status.next() => {}
@@ -127,5 +136,60 @@ async fn follow(zone: Tz) -> anyhow::Result<()> {
         }
         // Coalesce a burst of signals.
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(zone: &str) -> StatusView {
+        StatusView {
+            state: SyncState::Idle,
+            message: None,
+            server: None,
+            username: None,
+            last_sync: None,
+            pending: 0,
+            zone: zone.into(),
+            location: None,
+        }
+    }
+
+    fn nine_am_floating() -> TaskView {
+        serde_json::from_value(serde_json::json!({
+            "id": "a1b2",
+            "href": "/cal/work/a1b2.ics",
+            "list": "/cal/work/",
+            "list_name": "Work",
+            "pending": false,
+            "origin": "phone",
+            "uid": "a1b2",
+            "summary": "Call the bank",
+            "status": "needs-action",
+            "priority": 0,
+            "due": {"kind": "floating", "at": "2026-11-21T09:00:00"},
+        }))
+        .unwrap()
+    }
+
+    /// #34: the machine has moved from New York to Lisbon, where it is
+    /// 10:00 (05:00 in New York). asstd's Today holds a floating 9am, due
+    /// on Lisbon's day; the bar, started in New York, reads it in Lisbon
+    /// too, as the daemon's status says.
+    #[test]
+    fn the_bar_reads_today_in_the_daemons_zone() {
+        let ny: Tz = "America/New_York".parse().unwrap();
+        let ten_in_lisbon = "2026-11-21T10:00:00Z".parse().unwrap();
+        let tasks = [nine_am_floating()];
+
+        let moved = line(&tasks, &status("Europe/Lisbon"), ten_in_lisbon, ny);
+        assert_eq!(moved.class, "overdue", "9am has passed in Lisbon");
+
+        let stayed = line(&tasks, &status("America/New_York"), ten_in_lisbon, ny);
+        assert_eq!(stayed.class, "due", "not yet in New York");
+
+        let unread = line(&tasks, &status("Mars/Olympus"), ten_in_lisbon, ny);
+        assert_eq!(unread.class, "due", "a name it cannot read: the fallback");
     }
 }
