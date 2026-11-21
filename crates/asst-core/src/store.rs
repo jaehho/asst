@@ -447,17 +447,25 @@ impl Store {
             conn.execute_batch("ALTER TABLE blocks ADD COLUMN composition TEXT;")?;
         }
         let mut store = Store { conn, zone };
-        let stored: Option<String> = store.meta("zone")?;
-        if stored.as_deref() != Some(zone.name()) {
-            // Due dates are stored as local days; a new zone moves them.
-            store.reindex()?;
-            store.set_meta("zone", zone.name())?;
-        }
+        store.set_zone(zone)?;
         Ok(store)
     }
 
     pub fn zone(&self) -> Tz {
         self.zone
+    }
+
+    /// Read times in `zone` from now on: at start, and when the machine
+    /// moves to another zone while asstd runs (#34).
+    pub fn set_zone(&mut self, zone: Tz) -> Result<()> {
+        self.zone = zone;
+        let stored: Option<String> = self.meta("zone")?;
+        if stored.as_deref() != Some(zone.name()) {
+            // Due dates are stored as local days; a new zone moves them.
+            self.reindex()?;
+            self.set_meta("zone", zone.name())?;
+        }
+        Ok(())
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -2282,6 +2290,24 @@ UID:ABC-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260914\r\nX-APPLE-SORT-ORDER
             "11:30 on the 15th in Seoul"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same move without a restart: timedated says the zone changed
+    /// while asstd runs (#34).
+    #[test]
+    fn a_zone_change_while_open_moves_local_due_dates() {
+        let mut s = store();
+        let late = SERVER.replace("DUE;VALUE=DATE:20260914", "DUE:20260915T023000Z");
+        s.put_server("/cal/inbox/", "/cal/inbox/a.ics", "\"e1\"", &late, now())
+            .unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 14).unwrap();
+        let q = crate::api::query(View::Today);
+        assert_eq!(s.query(&q, today).unwrap().len(), 1, "22:30 in New York");
+
+        s.set_zone("Asia/Seoul".parse().unwrap()).unwrap();
+        assert_eq!(s.zone().name(), "Asia/Seoul");
+        assert_eq!(s.query(&q, today).unwrap().len(), 0, "the 15th in Seoul");
+        assert_eq!(s.meta("zone").unwrap().as_deref(), Some("Asia/Seoul"));
     }
 
     #[test]

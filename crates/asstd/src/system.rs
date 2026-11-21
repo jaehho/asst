@@ -1,4 +1,5 @@
-//! Sync when the machine wakes up or gets back online.
+//! Sync when the machine wakes up or gets back online, and follow it to
+//! another time zone.
 
 use std::sync::Arc;
 
@@ -45,6 +46,13 @@ pub async fn run(daemon: Arc<Daemon>) {
         Ok(p) => p.receive_state_changed().await.ok(),
         Err(_) => None,
     };
+    let mut timedate = match asst_core::timedate::changes(&system).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log::info!("not following time zone changes: {e}");
+            None
+        }
+    };
     loop {
         tokio::select! {
             Some(signal) = async { sleep.as_mut()?.next().await } => {
@@ -58,6 +66,11 @@ pub async fn run(daemon: Arc<Daemon>) {
                 if signal.args().is_ok_and(|a| a.state == CONNECTED) {
                     log::info!("back online; syncing");
                     daemon.request_sync();
+                }
+            }
+            Some(signal) = async { timedate.as_mut()?.next().await } => {
+                if signal.args().is_ok_and(|a| asst_core::timedate::moves_zone(&a)) {
+                    daemon.set_zone(asst_core::time::local_zone());
                 }
             }
             else => break,

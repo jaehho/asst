@@ -233,7 +233,7 @@ async fn ring<F>(
                 if let Some(old) = replaces {
                     s.remove(&old);
                 }
-                s.insert(id, what.opens(daemon.zone));
+                s.insert(id, what.opens(daemon.zone()));
             }
             Err(e) => {
                 if outage.failed(&e) {
@@ -254,12 +254,13 @@ async fn ring<F>(
 
 /// Alarms due now, and when the next one is.
 fn collect(daemon: &Daemon, now: DateTime<Utc>) -> (Due, Option<DateTime<Utc>>) {
+    let zone = daemon.zone();
     let store = daemon.store();
     let mut due: HashMap<String, Ring> = HashMap::new();
     let mut next: Option<DateTime<Utc>> = None;
     let mut later = |at: DateTime<Utc>| next = Some(next.map_or(at, |n| n.min(at)));
     for row in store.with_alarms().unwrap_or_default() {
-        for at in row.task.unacknowledged_alarms(daemon.zone) {
+        for at in row.task.unacknowledged_alarms(zone) {
             if at > now {
                 later(at);
             } else if now - at <= GRACE && !store.fired(&row.href, at).unwrap_or(true) {
@@ -335,7 +336,7 @@ async fn show(
     what: &What,
     replaces: u32,
 ) -> zbus::Result<u32> {
-    let now = Utc::now().with_timezone(&daemon.zone);
+    let now = Utc::now().with_timezone(&daemon.zone());
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
     hints.insert("desktop-entry", Value::from(asst_core::config::APP_ID));
     let (summary, body, buttons) = match what {
@@ -718,6 +719,31 @@ mod tests {
         assert_eq!(pass(&daemon, &up, &shown, &mut outage, started).await, 0);
     }
 
+    /// #34: a floating 9am added in New York, with a reminder at its time,
+    /// rings at 9am in Lisbon once the machine is there, without a restart.
+    #[test]
+    fn a_floating_times_reminder_moves_to_the_new_zone() {
+        let (daemon, href) = with_task(vec![Trigger::Relative {
+            offset: chrono::Duration::zero(),
+            from_due: true,
+        }]);
+        let day = (Utc::now() + chrono::Duration::days(3)).date_naive();
+        let nine = day.and_hms_opt(9, 0, 0).unwrap();
+        let due = asst_core::api::Change {
+            due: Some(Some(asst_core::time::When::Floating { at: nine })),
+            ..asst_core::api::Change::default()
+        };
+        daemon.edit(&href, &due).unwrap();
+        let ny: Tz = "America/New_York".parse().unwrap();
+        let (_, next) = collect(&daemon, Utc::now());
+        assert_eq!(next, Some(asst_core::time::resolve(ny, nine)));
+
+        let lisbon: Tz = "Europe/Lisbon".parse().unwrap();
+        daemon.set_zone(lisbon);
+        let (_, next) = collect(&daemon, Utc::now());
+        assert_eq!(next, Some(asst_core::time::resolve(lisbon, nine)));
+    }
+
     #[tokio::test]
     async fn an_alarm_older_than_the_grace_is_not_retried() {
         let at = Utc::now() - GRACE - chrono::Duration::minutes(1);
@@ -811,7 +837,7 @@ END:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         let (up, shown, mut outage) = (Cell::new(true), Shown::default(), Outage::default());
         assert_eq!(pass(&daemon, &up, &shown, &mut outage, ago(60)).await, 1);
         assert!(daemon.store().fired(&href, ago(5)).unwrap());
-        let day = ago(-10).with_timezone(&daemon.zone).date_naive();
+        let day = ago(-10).with_timezone(&daemon.zone()).date_naive();
         assert_eq!(
             shown.lock().unwrap().get(&7),
             Some(&Opens::Day { href, day })

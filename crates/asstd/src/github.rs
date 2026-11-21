@@ -594,7 +594,7 @@ fn unsettled(
                 .map_or(REFUSED_WAIT, |d| d.min(LONGEST_WAIT));
             let until = now + wait;
             memory.waits.insert(repo.to_string(), until);
-            let at = until.with_timezone(&daemon.zone).format("%H:%M");
+            let at = until.with_timezone(&daemon.zone()).format("%H:%M");
             daemon.gh_pass_done(
                 repo,
                 Err(format!(
