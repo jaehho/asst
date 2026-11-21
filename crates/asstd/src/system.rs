@@ -47,7 +47,12 @@ pub async fn run(daemon: Arc<Daemon>) {
         Err(_) => None,
     };
     let mut timedate = match asst_core::timedate::changes(&system).await {
-        Ok(s) => Some(s),
+        Ok(s) => {
+            // main read the zone before this match existed, so a move in
+            // between went unheard; read it again now that one would not.
+            daemon.set_zone(asst_core::time::local_zone());
+            Some(s)
+        }
         Err(e) => {
             log::info!("not following time zone changes: {e}");
             None
