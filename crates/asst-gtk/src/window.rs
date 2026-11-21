@@ -1149,6 +1149,9 @@ impl Component for Window {
                             return;
                         }
                     };
+                    // The window read the zone before this match existed,
+                    // so a move in between went unheard; read it again.
+                    out.emit(Cmd::Zone);
                     while let Some(signal) = changes.next().await {
                         if signal
                             .args()
@@ -2460,10 +2463,7 @@ impl Component for Window {
             }
             Cmd::Zone => {
                 // Read again, as the CLI does for each command.
-                let zone = asst_core::time::local_zone();
-                if zone != self.zone {
-                    pickers::set_zone(zone);
-                    self.zone = zone;
+                if pickers::follow_zone(&mut self.zone, asst_core::time::local_zone()) {
                     // Every date and time on screen is read in it.
                     self.shown = 0;
                 }
