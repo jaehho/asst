@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, RwLock};
 
 use asst_core::api::ListView;
 use asst_core::fmt;
@@ -21,9 +21,24 @@ use relm4::gtk::{self, glib, pango};
 use crate::model::{self, End, Freq, REPEAT_PRESETS, Repeat, WEEK, capitalize};
 use crate::ui::{self, Item};
 
+/// The zone the window reads and writes times in: the machine's when it
+/// starts, and again whenever timedated says it changed (#34).
+static ZONE: LazyLock<RwLock<Tz>> = LazyLock::new(|| RwLock::new(asst_core::time::local_zone()));
+
 pub fn zone() -> Tz {
-    static ZONE: OnceLock<Tz> = OnceLock::new();
-    *ZONE.get_or_init(asst_core::time::local_zone)
+    *ZONE.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Move the window to `read`, the zone just read from the machine: the
+/// pickers here and `window_zone`, the window's own copy, together.
+/// Whether it moved, so the window draws its dates again.
+pub fn follow_zone(window_zone: &mut Tz, read: Tz) -> bool {
+    if read == *window_zone {
+        return false;
+    }
+    *ZONE.write().unwrap_or_else(|p| p.into_inner()) = read;
+    *window_zone = read;
+    true
 }
 
 pub fn now() -> DateTime<Tz> {
@@ -1505,5 +1520,41 @@ pub fn fill_places(list: &gtk::ListBox, places: &[Place], picked: &Rc<dyn Fn(Pla
         let (picked, place) = (picked.clone(), place.clone());
         button.connect_clicked(move |_| picked(place.clone()));
         list.append(&gtk::ListBoxRow::builder().child(&button).build());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #34: what the window does when timedated says the machine moved
+    /// (`Cmd::Zone`): both copies of the zone follow, and a 9am the date
+    /// popover then picks for a task with no time, read through `now()` as
+    /// the popover reads it, is saved as 9am `Europe/Lisbon`. The only test
+    /// that sets `ZONE`, so no other test races it.
+    #[test]
+    fn a_time_picked_after_a_move_is_in_the_new_zone() {
+        let ny: Tz = "America/New_York".parse().unwrap();
+        let lisbon: Tz = "Europe/Lisbon".parse().unwrap();
+        *ZONE.write().unwrap() = ny;
+        let mut window_zone = ny;
+
+        assert!(follow_zone(&mut window_zone, lisbon));
+        assert_eq!(window_zone, lisbon);
+        let now = now();
+        assert_eq!(now.timezone(), lisbon, "the pickers moved too");
+        let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert_eq!(
+            model::at_time(None, nine, now.date_naive(), now.timezone()),
+            When::Zoned {
+                at: now.date_naive().and_time(nine),
+                tzid: "Europe/Lisbon".into(),
+            }
+        );
+
+        assert!(
+            !follow_zone(&mut window_zone, lisbon),
+            "the same zone again draws nothing"
+        );
     }
 }

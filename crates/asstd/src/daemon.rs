@@ -58,7 +58,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Daemon {
     store: Mutex<Store>,
     config: RwLock<Config>,
-    pub zone: Tz,
+    /// The machine's zone: what counts as today, and when a floating time
+    /// is. timedated says when it changes (`set_zone`).
+    zone: RwLock<Tz>,
     remote: tokio::sync::Mutex<Option<Arc<CalDav>>>,
     status: Mutex<StatusView>,
     wake_sync: Notify,
@@ -218,7 +220,7 @@ impl Daemon {
         let daemon = Daemon {
             store: Mutex::new(store),
             config: RwLock::new(config),
-            zone,
+            zone: RwLock::new(zone),
             remote: tokio::sync::Mutex::new(None),
             status: Mutex::new(status),
             wake_sync: Notify::new(),
@@ -244,8 +246,34 @@ impl Daemon {
             .clone()
     }
 
+    pub fn zone(&self) -> Tz {
+        *self.zone.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The machine moved to `zone` (#34). What counts as today, the due
+    /// dates the store keeps as local days and the reminders of floating
+    /// times all move with it, as a restart would have moved them, and
+    /// clients hear of it.
+    pub fn set_zone(&self, zone: Tz) {
+        if self.zone() == zone {
+            return;
+        }
+        if let Err(e) = self.store().set_zone(zone) {
+            log::warn!("moving due dates to {}: {e}", zone.name());
+        }
+        *self.zone.write().unwrap_or_else(|p| p.into_inner()) = zone;
+        log::info!("the time zone is now {}", zone.name());
+        {
+            let mut s = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            s.zone = zone.name().to_string();
+            self.emit(Event::Status(s.clone()));
+        }
+        self.emit(Event::Changed);
+        self.wake_reminders.notify_one();
+    }
+
     fn now_local(&self) -> DateTime<Tz> {
-        Utc::now().with_timezone(&self.zone)
+        Utc::now().with_timezone(&self.zone())
     }
 
     fn emit(&self, e: Event) {
@@ -681,7 +709,7 @@ impl Daemon {
         let cfg = self.config();
         cfg.alarm_at_due.then(|| match cfg.alarm_before {
             0 => Trigger::Absolute {
-                at: due.instant(self.zone),
+                at: due.instant(self.zone()),
             },
             // Relative, as quick add's `!30m` is, so it moves with the date.
             minutes => Trigger::Relative {
@@ -972,7 +1000,7 @@ impl Daemon {
                     .cloned()
                     .unwrap_or_default();
                 let open = counts.get(&row.list).map_or(0, |(open, _)| *open);
-                let found = link_condition(&row, &name, seen.hold.as_ref(), open, self.zone, now);
+                let found = link_condition(&row, &name, seen.hold.as_ref(), open, self.zone(), now);
                 let waiting = pending_rename(&row);
                 Ok(LinkView {
                     repo_id: row.repo_id,
@@ -2029,5 +2057,84 @@ mod tests {
         let err = daemon.track_ingest(day).unwrap_err().to_string();
         assert!(err.contains("activitywatch"), "{err}");
         assert_eq!(daemon.store().blocks_between(start, end).unwrap(), stored);
+    }
+
+    /// A daemon in `zone` with a Work list, and what it tells clients.
+    fn in_zone(zone: Tz) -> (Arc<Daemon>, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        let mut store = Store::in_memory(zone).unwrap();
+        store
+            .apply_lists(&[caldav::RemoteList {
+                href: "/cal/work/".into(),
+                name: "Work".into(),
+                color: None,
+                order: None,
+                sync_token: Some("t1".into()),
+                ctag: None,
+                writable: true,
+            }])
+            .unwrap();
+        Daemon::new(Config::default(), store, zone)
+    }
+
+    /// #34: after `timedatectl set-timezone Europe/Lisbon`, with no
+    /// restart, a floating 9am gets its reminder at 9am in Lisbon.
+    #[test]
+    fn a_new_zone_gives_a_floating_nine_am_its_reminder_at_nine_there() {
+        let lisbon: Tz = "Europe/Lisbon".parse().unwrap();
+        let (daemon, mut events) = in_zone("America/New_York".parse().unwrap());
+
+        daemon.set_zone(lisbon);
+        assert_eq!(daemon.zone(), lisbon);
+        assert_eq!(daemon.store().zone(), lisbon);
+        let mut told = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            told.push(e);
+        }
+        assert!(
+            told.iter()
+                .any(|e| matches!(e, Event::Status(s) if s.zone == "Europe/Lisbon")),
+            "the status names the new zone"
+        );
+        assert!(told.iter().any(|e| matches!(e, Event::Changed)));
+
+        let day = (Utc::now() + chrono::Duration::days(3)).date_naive();
+        let nine = day.and_hms_opt(9, 0, 0).unwrap();
+        let spec = AddSpec {
+            text: "Call the bank".into(),
+            list: Some("work".into()),
+            due: Some(When::Floating { at: nine }),
+            ..AddSpec::default()
+        };
+        let task = daemon.add(&spec).unwrap().task.task;
+        let at = asst_core::time::resolve(lisbon, nine);
+        assert_eq!(task.unacknowledged_alarms(daemon.zone()), vec![at]);
+
+        while events.try_recv().is_ok() {}
+        daemon.set_zone(lisbon);
+        assert!(events.try_recv().is_err(), "the same zone again is no news");
+    }
+
+    /// What counts as today follows the zone. These two are 25 hours
+    /// apart, so a day is today in one and still ahead in the other
+    /// whenever the test runs.
+    #[test]
+    fn today_is_the_new_zones_today() {
+        let behind: Tz = "Pacific/Pago_Pago".parse().unwrap();
+        let ahead: Tz = "Pacific/Kiritimati".parse().unwrap();
+        let (daemon, _events) = in_zone(behind);
+        let spec = AddSpec {
+            text: "Water the plants".into(),
+            list: Some("work".into()),
+            due: Some(When::Date {
+                date: Utc::now().with_timezone(&ahead).date_naive(),
+            }),
+            ..AddSpec::default()
+        };
+        daemon.add(&spec).unwrap();
+        let today = asst_core::api::query(asst_core::store::View::Today);
+        assert!(daemon.tasks(&today).unwrap().is_empty(), "tomorrow here");
+
+        daemon.set_zone(ahead);
+        assert_eq!(daemon.tasks(&today).unwrap().len(), 1, "today there");
     }
 }

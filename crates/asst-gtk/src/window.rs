@@ -407,6 +407,8 @@ pub enum Cmd {
         client::Result<Vec<asst_core::api::EventView>>,
     ),
     Changed,
+    /// timedated says the machine's time zone changed.
+    Zone,
     Status(StatusView),
     LoginDone(bool, String),
     LoginUrl(client::Result<String>),
@@ -1127,6 +1129,36 @@ impl Component for Window {
                             }
                         }
                         tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                })
+                .drop_on_shutdown()
+        });
+
+        // Follow the machine to another time zone (#34).
+        sender.command(|out, shutdown| {
+            shutdown
+                .register(async move {
+                    let changes = match zbus::Connection::system().await {
+                        Ok(system) => asst_core::timedate::changes(&system).await,
+                        Err(e) => Err(e),
+                    };
+                    let mut changes = match changes {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("asst-gtk: not following time zone changes: {e}");
+                            return;
+                        }
+                    };
+                    // The window read the zone before this match existed,
+                    // so a move in between went unheard; read it again.
+                    out.emit(Cmd::Zone);
+                    while let Some(signal) = changes.next().await {
+                        if signal
+                            .args()
+                            .is_ok_and(|a| asst_core::timedate::moves_zone(&a))
+                        {
+                            out.emit(Cmd::Zone);
+                        }
                     }
                 })
                 .drop_on_shutdown()
@@ -2428,6 +2460,13 @@ impl Component for Window {
             Cmd::Changed => {
                 self.reload(&sender);
                 return;
+            }
+            Cmd::Zone => {
+                // Read again, as the CLI does for each command.
+                if pickers::follow_zone(&mut self.zone, asst_core::time::local_zone()) {
+                    // Every date and time on screen is read in it.
+                    self.shown = 0;
+                }
             }
             Cmd::Status(s) => {
                 let was_signed_out = self
